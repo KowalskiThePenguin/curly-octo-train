@@ -553,8 +553,12 @@ async def index():
         </button>
       </header>
 
+      <!-- ========================================== -->
       <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
+      <!-- ========================================== -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
+        
+        <!-- Блок создания поручения -->
         <div class="bg-slate-900 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl">
           <h2 class="text-base font-bold text-white">Голосовое поручение</h2>
           
@@ -582,10 +586,21 @@ async def index():
           </div>
         </div>
 
+        <!-- Синхронные 4 вкладки воронки у Шефа -->
+        <div class="grid grid-cols-4 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
+          <button @click="ownerTab = 'inbox'" :class="ownerTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
+          <button @click="ownerTab = 'active'" :class="ownerTab === 'active' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">В работе ({{ activeTasks.length }})</button>
+          <button @click="ownerTab = 'review'" :class="ownerTab === 'review' ? 'bg-amber-600 text-white font-bold animate-pulse' : 'text-amber-400 font-bold'" class="py-1.5 rounded-lg text-center">Сдано ({{ reviewTasks.length }})</button>
+          <button @click="ownerTab = 'archive'" :class="ownerTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Архив ({{ archiveTasks.length }})</button>
+        </div>
+
+        <!-- Список задач Шефа -->
         <div class="space-y-3">
-          <h3 class="text-xs font-bold text-slate-400 uppercase px-1">Все поручения ({{ tasks.length }}):</h3>
-          
-          <div v-for="t in tasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-2.5 shadow">
+          <div v-if="displayedOwnerTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
+            В этом разделе пока нет задач.
+          </div>
+
+          <div v-for="t in displayedOwnerTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-2.5 shadow">
             <div class="flex justify-between items-start gap-2">
               <div class="flex flex-wrap items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
@@ -606,6 +621,11 @@ async def index():
             <p class="text-xs text-slate-300 bg-slate-950/70 p-2.5 rounded-xl border border-slate-800"><strong>ТЗ:</strong> {{ t.ai_summary }}</p>
             <p v-if="t.lead_name" class="text-xs text-indigo-300 font-semibold px-1">👤 Исполнитель: {{ t.lead_name }}</p>
 
+            <div v-if="t.status === 'REVIEW'" class="p-2.5 bg-amber-950/30 rounded-xl border border-amber-800/60 text-xs space-y-1">
+              <span class="text-amber-300 font-bold block">📝 Сданный отчет исполнителя:</span>
+              <p class="text-slate-200 whitespace-pre-wrap">{{ t.result_report }}</p>
+            </div>
+
             <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
               <i class="fa-solid fa-comments"></i>
               <span>Чат по задаче</span>
@@ -615,7 +635,9 @@ async def index():
         </div>
       </div>
 
+      <!-- ========================================== -->
       <!-- 2. КАБИНЕТ ДИРЕКТОРА (ЖАМОЛИДДИН) -->
+      <!-- ========================================== -->
       <div v-if="currentUser.role === 'DEPUTY'" class="space-y-4">
         <div class="grid grid-cols-4 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
           <button @click="deputyTab = 'inbox'" :class="deputyTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
@@ -625,6 +647,10 @@ async def index():
         </div>
 
         <div class="space-y-3">
+          <div v-if="displayedDeputyTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
+            В этом разделе пока нет задач.
+          </div>
+
           <div v-for="t in displayedDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-3 shadow">
             
             <div class="flex justify-between items-start gap-2">
@@ -711,7 +737,9 @@ async def index():
         </div>
       </div>
 
+      <!-- ========================================== -->
       <!-- 3. ЛИЧНЫЙ КАБИНЕТ ИСПОЛНИТЕЛЯ (МАРАТ, САГЫНАЙ, ИБРОХИМ) -->
+      <!-- ========================================== -->
       <div v-if="currentUser.role === 'EMPLOYEE'" class="space-y-4">
         <div class="bg-gradient-to-r from-slate-900 to-indigo-950 border border-indigo-800/50 p-4 rounded-3xl space-y-3 shadow-xl">
           <div class="flex items-center gap-3">
@@ -876,6 +904,7 @@ async def index():
         const loginForm = ref({ username: '', password: '' });
         const isLoggingIn = ref(false);
 
+        const ownerTab = ref('inbox');
         const deputyTab = ref('inbox');
         const empTab = ref('active');
         const isRecording = ref(false);
@@ -907,6 +936,29 @@ async def index():
 
         const employeesOnly = computed(() => users.value.filter(u => u.role === 'EMPLOYEE'));
 
+        // Базовые списки по статусам
+        const inboxTasks = computed(() => tasks.value.filter(t => t.status === 'DRAFT'));
+        const activeTasks = computed(() => tasks.value.filter(t => t.status === 'IN_PROGRESS'));
+        const reviewTasks = computed(() => tasks.value.filter(t => t.status === 'REVIEW'));
+        const archiveTasks = computed(() => tasks.value.filter(t => t.status === 'ARCHIVED'));
+
+        // Задачи Шефа (Хуршид)
+        const displayedOwnerTasks = computed(() => {
+          if (ownerTab.value === 'inbox') return inboxTasks.value;
+          if (ownerTab.value === 'active') return activeTasks.value;
+          if (ownerTab.value === 'review') return reviewTasks.value;
+          return archiveTasks.value;
+        });
+
+        // Задачи Директора (Жамолиддин)
+        const displayedDeputyTasks = computed(() => {
+          if (deputyTab.value === 'inbox') return inboxTasks.value;
+          if (deputyTab.value === 'active') return activeTasks.value;
+          if (deputyTab.value === 'review') return reviewTasks.value;
+          return archiveTasks.value;
+        });
+
+        // Задачи исполнителя (Марат / Сагынай / Иброхим)
         const myTasks = computed(() => tasks.value.filter(t => t.lead_user_id === currentUser.value?.id));
         const myActiveTasks = computed(() => myTasks.value.filter(t => t.status === 'IN_PROGRESS'));
         const myReviewTasks = computed(() => myTasks.value.filter(t => t.status === 'REVIEW'));
@@ -916,18 +968,6 @@ async def index():
           if (empTab.value === 'active') return myActiveTasks.value;
           if (empTab.value === 'review') return myReviewTasks.value;
           return myArchiveTasks.value;
-        });
-
-        const inboxTasks = computed(() => tasks.value.filter(t => t.status === 'DRAFT'));
-        const activeTasks = computed(() => tasks.value.filter(t => t.status === 'IN_PROGRESS'));
-        const reviewTasks = computed(() => tasks.value.filter(t => t.status === 'REVIEW'));
-        const archiveTasks = computed(() => tasks.value.filter(t => t.status === 'ARCHIVED'));
-
-        const displayedDeputyTasks = computed(() => {
-          if (deputyTab.value === 'inbox') return inboxTasks.value;
-          if (deputyTab.value === 'active') return activeTasks.value;
-          if (deputyTab.value === 'review') return reviewTasks.value;
-          return archiveTasks.value;
         });
 
         const isMyMessage = (m) => {
@@ -1248,9 +1288,10 @@ async def index():
         });
 
         return {
-          currentUser, loginForm, isLoggingIn, deputyTab, empTab, isRecording, isProcessing,
+          currentUser, loginForm, isLoggingIn, ownerTab, deputyTab, empTab, isRecording, isProcessing,
           recordSeconds, textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
-          inboxTasks, activeTasks, reviewTasks, archiveTasks, displayedDeputyTasks,
+          inboxTasks, activeTasks, reviewTasks, archiveTasks,
+          displayedOwnerTasks, displayedDeputyTasks,
           myActiveTasks, myReviewTasks, myArchiveTasks, displayedEmpTasks, isMyMessage,
           activeChatTask, chatMessages, chatInput, isChatRecording,
           handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, submitTaskForReview, rejectTask,
@@ -1263,3 +1304,4 @@ async def index():
   </script>
 </body>
 </html>"""
+
