@@ -3,26 +3,22 @@ import json
 import base64
 import re
 import traceback
+import urllib.request
+import urllib.error
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse
 import asyncpg
-import google.generativeai as genai
 
 app = FastAPI()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-
 db_pool = None
 
 async def get_db():
     global db_pool
     if db_pool is None:
-        # statement_cache_size=0 обязателен для работы через Supabase Pooler
         db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             statement_cache_size=0,
@@ -33,24 +29,40 @@ async def get_db():
 
 SYSTEM_PROMPT = """
 Ты — операционный директор. Преврати поручение владельца в четкое техническое задание для Замдиректора.
-Верни ТОЛЬКО валидный JSON в таком формате (без markdown и лишних слов):
+Верни ТОЛЬКО валидный JSON (без лишних слов и без ```json):
 {
-  "title": "Краткий заголовок (до 6 слов)",
+  "title": "Краткий заголовок задачи (до 6 слов)",
   "ai_summary": "Суть задачи в 2 предложениях",
-  "definition_of_done": "1. Первый результат\\n2. Второй результат",
+  "definition_of_done": "1. Первый пункт\\n2. Второй пункт",
   "task_type": "SOLO",
   "is_urgent": false
 }
 """
 
-def parse_ai_json(text: str) -> dict:
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
-        return json.loads(match.group(0))
+def query_gemini_direct(parts_list: list) -> dict:
+    models = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-2.0-flash"]
+    
+    for model_name in models:
+        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_name}:generateContent?key={GEMINI_API_KEY}"
+        payload = {"contents": [{"parts": parts_list}]}
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                res_json = json.loads(resp.read().decode("utf-8"))
+                raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                if match:
+                    return json.loads(match.group(0))
+        except Exception as err:
+            print(f"Попытка с моделью {model_name} не удалась: {err}")
+            continue
+
     return {
         "title": "Новое поручение",
-        "ai_summary": text[:200],
-        "definition_of_done": "1. Выполнить поставленную задачу",
+        "ai_summary": "Поручение принято и передано Замдиректора",
+        "definition_of_done": "1. Выполнить поручение в срок",
         "task_type": "SOLO",
         "is_urgent": False
     }
@@ -89,14 +101,14 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         if "octet-stream" in mime:
             mime = "audio/webm"
 
-        # Универсальный запрос к Gemini
-        response = gemini_model.generate_content([
-            {"mime_type": mime, "data": audio_bytes},
-            SYSTEM_PROMPT
-        ])
+        b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
         
-        parsed = parse_ai_json(response.text)
-        audio_b64 = f"data:{mime};base64," + base64.b64encode(audio_bytes).decode('utf-8')
+        parts = [
+            {"inlineData": {"mimeType": mime, "data": b64_audio}},
+            {"text": SYSTEM_PROMPT}
+        ]
+        parsed = query_gemini_direct(parts)
+        audio_b64 = f"data:{mime};base64," + b64_audio
 
         pool = await get_db()
         async with pool.acquire() as conn:
@@ -119,11 +131,8 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
 @app.post("/api/tasks/create-text")
 async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
     try:
-        response = gemini_model.generate_content([
-            f"Поручение шефа: {text}",
-            SYSTEM_PROMPT
-        ])
-        parsed = parse_ai_json(response.text)
+        parts = [{"text": f"Поручение шефа: {text}\n{SYSTEM_PROMPT}"}]
+        parsed = query_gemini_direct(parts)
 
         pool = await get_db()
         async with pool.acquire() as conn:
@@ -202,9 +211,9 @@ async def index():
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
       <title>Task Control Core</title>
-      <script src="https://cdn.tailwindcss.com"></script>
-      <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+      <script src="[https://cdn.tailwindcss.com](https://cdn.tailwindcss.com)"></script>
+      <script src="[https://unpkg.com/vue@3/dist/vue.global.js](https://unpkg.com/vue@3/dist/vue.global.js)"></script>
+      <link rel="stylesheet" href="[https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css](https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css)">
       <style>[v-cloak] { display: none; }</style>
     </head>
     <body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
@@ -244,7 +253,7 @@ async def index():
             <div class="pt-3 border-t border-slate-800 text-left space-y-2">
               <span class="text-[10px] font-bold text-slate-400 uppercase">Или введите текстом:</span>
               <div class="flex gap-2">
-                <input v-model="textInput" placeholder="Например: Проверить остатки на складе..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2.5 rounded-xl text-white">
+                <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Например: Узнать цену напитка..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2.5 rounded-xl text-white">
                 <button @click="sendTextTask" class="bg-indigo-600 hover:bg-indigo-500 px-3.5 rounded-xl text-white font-bold text-xs">
                   <i class="fa-solid fa-paper-plane"></i>
                 </button>
@@ -389,7 +398,7 @@ async def index():
                   if (!assignLeadId.value[t.id]) assignLeadId.value[t.id] = rUsers[0]?.id || 1;
                 });
               } catch (e) {
-                console.error("Ошибка загрузки данных:", e);
+                console.error("Ошибка загрузки:", e);
               }
             };
 
@@ -429,7 +438,7 @@ async def index():
                   mediaRecorder.start();
                   isRecording.value = true;
                 } catch (err) {
-                  alert('Разрешите доступ к микрофону в браузере!');
+                  alert('Разрешите доступ к микрофону в настройках браузера!');
                 }
               } else {
                 mediaRecorder.stop();
