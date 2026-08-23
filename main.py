@@ -29,7 +29,7 @@ async def get_db():
 
 SYSTEM_PROMPT = """
 Ты — операционный директор компании. Преврати поручение владельца в четкое техническое задание для Замдиректора.
-Верни ТОЛЬКО чистый валидный JSON без кавычек markdown и лишнего текста:
+Верни ТОЛЬКО чистый JSON без оформления markdown:
 {
   "title": "Краткий заголовок (до 6 слов)",
   "ai_summary": "Суть задачи в 2 предложениях",
@@ -40,7 +40,7 @@ SYSTEM_PROMPT = """
 """
 
 def query_gemini_direct(parts_list: list) -> dict:
-    models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     
     for model_name in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
@@ -52,24 +52,19 @@ def query_gemini_direct(parts_list: list) -> dict:
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         
         try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 res_json = json.loads(resp.read().decode("utf-8"))
                 raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
                 match = re.search(r'\{.*\}', raw_text, re.DOTALL)
                 if match:
                     return json.loads(match.group(0))
-        except urllib.error.HTTPError as e:
-            error_msg = e.read().decode('utf-8', errors='ignore')
-            print(f"Ошибка Gemini ({model_name}): {e.code} - {error_msg}")
-            continue
         except Exception as err:
-            print(f"Ошибка вызова {model_name}: {err}")
             continue
 
     return {
         "title": "Новое поручение",
-        "ai_summary": "Поручение принято и передано Замдиректора",
-        "definition_of_done": "1. Выполнить поручение в срок",
+        "ai_summary": "Поручение передано в работу",
+        "definition_of_done": "1. Выполнить задачу по регламенту",
         "task_type": "SOLO",
         "is_urgent": False
     }
@@ -109,7 +104,6 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
             mime = "audio/webm"
 
         b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-        
         parts = [
             {"inlineData": {"mimeType": mime, "data": b64_audio}},
             {"text": SYSTEM_PROMPT}
@@ -123,7 +117,7 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, created_by, is_urgent)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7)
                 RETURNING id
-            """, parsed.get("title", "Новое поручение"), "Voice message", parsed.get("ai_summary", ""), parsed.get("definition_of_done", ""), parsed.get("task_type", "SOLO"), user_id, parsed.get("is_urgent", False))
+            """, parsed.get("title", "Голосовое поручение"), "Голосовая аудиозапись Шефа", parsed.get("ai_summary", ""), parsed.get("definition_of_done", ""), parsed.get("task_type", "SOLO"), user_id, parsed.get("is_urgent", False))
 
             await conn.execute("""
                 INSERT INTO media_attachments (task_id, sender_id, attachment_type, file_url, transcript)
@@ -155,21 +149,36 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 @app.post("/api/tasks/{task_id}/assign")
-async def assign_task(task_id: int, lead_id: int = Form(...), deadline: str = Form(...)):
-    pool = await get_db()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE tasks 
-            SET lead_user_id = $1, deadline = $2::timestamptz, status = 'IN_PROGRESS'
-            WHERE id = $3
-        """, lead_id, deadline, task_id)
-        
-        await conn.execute("DELETE FROM task_checkpoints WHERE task_id = $1", task_id)
-        await conn.execute("""
-            INSERT INTO task_checkpoints (task_id, cp_type, status)
-            VALUES ($1, '30_PERCENT', 'PENDING'), ($1, '70_PERCENT', 'PENDING')
-        """, task_id)
-    return {"status": "assigned"}
+async def assign_task(
+    task_id: int, 
+    lead_id: int = Form(...), 
+    title: str = Form(None),
+    ai_summary: str = Form(None),
+    definition_of_done: str = Form(None)
+):
+    try:
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE tasks 
+                SET lead_user_id = $1, 
+                    title = COALESCE($2, title),
+                    ai_summary = COALESCE($3, ai_summary),
+                    definition_of_done = COALESCE($4, definition_of_done),
+                    deadline = NOW() + INTERVAL '24 hours',
+                    status = 'IN_PROGRESS'
+                WHERE id = $5
+            """, lead_id, title, ai_summary, definition_of_done, task_id)
+            
+            await conn.execute("DELETE FROM task_checkpoints WHERE task_id = $1", task_id)
+            await conn.execute("""
+                INSERT INTO task_checkpoints (task_id, cp_type, status)
+                VALUES ($1, '30_PERCENT', 'PENDING'), ($1, '70_PERCENT', 'PENDING')
+            """, task_id)
+        return {"status": "ok"}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 @app.post("/api/tasks/{task_id}/approve-checkpoint")
 async def approve_checkpoint(task_id: int, cp_type: str = Form(...)):
@@ -277,9 +286,16 @@ async def index():
             </div>
             <span class="text-[10px] font-bold px-2 py-1 rounded" :class="badgeClass(t.status)">{{ badgeText(t.status) }}</span>
           </div>
+
           <div v-if="t.voice_url" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
             <audio :src="t.voice_url" controls class="w-full h-8"></audio>
           </div>
+
+          <!-- Исходный текст -->
+          <p class="text-[11px] text-amber-300/90 bg-amber-950/30 p-2 rounded-xl border border-amber-900/40">
+            <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
+          </p>
+
           <p class="text-xs text-slate-300 bg-slate-950/60 p-2 rounded-xl border border-slate-800/40"><strong>ТЗ:</strong> {{ t.ai_summary }}</p>
         </div>
       </div>
@@ -295,43 +311,69 @@ async def index():
 
       <div class="space-y-3">
         <div v-for="t in displayedDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
+          
           <div class="flex justify-between items-start">
-            <div>
-              <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-2 py-0.5 rounded">#{{ t.id }}</span>
-              <h4 class="text-sm font-bold text-white mt-1">{{ t.title }}</h4>
-            </div>
+            <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-2 py-0.5 rounded">#{{ t.id }}</span>
             <span class="text-[10px] font-bold px-2 py-1 rounded" :class="badgeClass(t.status)">{{ badgeText(t.status) }}</span>
           </div>
 
-          <div v-if="t.voice_url" class="bg-slate-950 p-2.5 rounded-xl border border-slate-800 space-y-1">
+          <!-- Исходник голоса или текста Шефа -->
+          <div v-if="t.voice_url" class="bg-slate-950 p-2 rounded-xl border border-slate-800 space-y-1">
             <span class="text-[10px] text-slate-400 font-bold block">🎙 Аудио Шефа:</span>
             <audio :src="t.voice_url" controls class="w-full h-8"></audio>
           </div>
-
-          <div class="bg-slate-950/70 p-2.5 rounded-xl border border-slate-800 text-xs space-y-1">
-            <p class="text-slate-300"><strong>ТЗ:</strong> {{ t.ai_summary }}</p>
-            <p class="text-slate-400 whitespace-pre-line"><strong>Критерии сдачи:</strong><br>{{ t.definition_of_done }}</p>
+          <div class="p-2.5 bg-amber-950/20 border border-amber-900/40 rounded-xl text-xs text-amber-300/90">
+            <strong>🗣 Исходный запрос Шефа:</strong> {{ t.raw_input_text }}
           </div>
 
-          <div v-if="t.status === 'DRAFT'" class="pt-2 border-t border-slate-800 space-y-2">
-            <label class="block text-[11px] font-bold text-slate-300">Назначить сотрудника:</label>
-            <select v-model="assignLeadId[t.id]" class="w-full bg-slate-950 border border-slate-700 text-xs p-2.5 rounded-xl text-white">
-              <option v-for="u in users" :key="u.id" :value="u.id">{{ u.full_name }} ({{ u.department }})</option>
-            </select>
-            <button @click="assignTask(t.id)" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 rounded-xl text-xs shadow">
-              🚀 Отправить Лиду в работу
-            </button>
+          <!-- ФОРМА РЕДАКТИРОВАНИЯ ТЗ И НАЗНАЧЕНИЯ (ДЛЯ ВХОДЯЩИХ) -->
+          <div v-if="t.status === 'DRAFT'" class="space-y-2.5 pt-1">
+            <div>
+              <label class="block text-[10px] font-bold text-slate-400 mb-1">Заголовок задачи:</label>
+              <input v-model="editDrafts[t.id].title" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold">
+            </div>
+
+            <div>
+              <label class="block text-[10px] font-bold text-slate-400 mb-1">Суть задачи (ТЗ):</label>
+              <textarea v-model="editDrafts[t.id].ai_summary" rows="2" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200"></textarea>
+            </div>
+
+            <div>
+              <label class="block text-[10px] font-bold text-slate-400 mb-1">Критерии сдачи (DoD):</label>
+              <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200"></textarea>
+            </div>
+
+            <div class="pt-2 border-t border-slate-800 space-y-2">
+              <label class="block text-[11px] font-bold text-indigo-300">Назначить сотрудника:</label>
+              <select v-model="editDrafts[t.id].lead_id" class="w-full bg-slate-950 border border-slate-700 text-xs p-2.5 rounded-xl text-white">
+                <option v-for="u in employeesOnly" :key="u.id" :value="u.id">{{ u.full_name }} ({{ u.department }})</option>
+              </select>
+
+              <button @click="assignTask(t.id)" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 rounded-xl text-xs shadow transition">
+                🚀 Отправить Лиду в работу
+              </button>
+            </div>
           </div>
 
-          <div v-if="t.status === 'IN_PROGRESS'" class="pt-2 border-t border-slate-800 space-y-2">
-            <div class="grid grid-cols-2 gap-2">
+          <!-- БЛОК КОНТРОЛЯ В РАБОТЕ -->
+          <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2.5 pt-1">
+            <h4 class="text-sm font-bold text-white">{{ t.title }}</h4>
+            <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-xs space-y-1">
+              <p class="text-slate-300"><strong>ТЗ:</strong> {{ t.ai_summary }}</p>
+              <p class="text-slate-400 whitespace-pre-line"><strong>Критерии:</strong><br>{{ t.definition_of_done }}</p>
+              <p class="text-indigo-300 pt-1"><strong>Исполнитель:</strong> {{ t.lead_name }}</p>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2 pt-1">
               <button @click="approveCp(t.id, '30_PERCENT')" class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-bold py-2 rounded-xl">✅ Подтвердить 30%</button>
               <button @click="approveCp(t.id, '70_PERCENT')" class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-bold py-2 rounded-xl">✅ Подтвердить 70%</button>
             </div>
+
             <button @click="completeTask(t.id)" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2.5 rounded-xl text-xs shadow">
               🏁 Принять и закрыть в архив
             </button>
           </div>
+
         </div>
       </div>
     </div>
@@ -339,14 +381,18 @@ async def index():
     <!-- 3. ЭКРАН СОТРУДНИКА -->
     <div v-if="role === 'EMPLOYEE'" class="space-y-4">
       <div class="bg-indigo-950/40 border border-indigo-800/40 p-3 rounded-2xl text-xs text-indigo-300">
-        👋 Личный кабинет сотрудника. Ниже задачи в работе:
+        👋 Задачи, находящиеся у вас в работе:
       </div>
 
       <div class="space-y-3">
         <div v-for="t in tasks.filter(x => x.status === 'IN_PROGRESS')" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2.5 shadow">
-          <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-2 py-0.5 rounded">#{{ t.id }}</span>
+          <div class="flex justify-between items-start">
+            <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-2 py-0.5 rounded">#{{ t.id }}</span>
+            <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-950 text-blue-300">В работе</span>
+          </div>
           <h4 class="text-sm font-bold text-white">{{ t.title }}</h4>
           <p class="text-xs text-slate-300 bg-slate-950 p-2.5 rounded-xl border border-slate-800">{{ t.ai_summary }}</p>
+          <p class="text-xs text-slate-400 whitespace-pre-line px-1"><strong>Критерии приемки:</strong><br>{{ t.definition_of_done }}</p>
 
           <div class="grid grid-cols-2 gap-2 pt-2 border-t border-slate-800">
             <button @click="sendReport(t.id, '30_PERCENT')" class="bg-slate-800 border border-slate-700 text-xs font-bold py-2 rounded-xl">📝 Сдать 30%</button>
@@ -369,7 +415,7 @@ async def index():
         const isProcessing = ref(false);
         const recordSeconds = ref(0);
         const textInput = ref('');
-        const assignLeadId = ref({});
+        const editDrafts = ref({});
         let timerInterval = null;
 
         const tasks = ref([]);
@@ -382,6 +428,9 @@ async def index():
           if (role.value === 'DEPUTY') return 'Замдиректора';
           return 'Сотрудник (Лид)';
         });
+
+        // Только сотрудники (без Шефа и Зама)
+        const employeesOnly = computed(() => users.value.filter(u => u.role === 'EMPLOYEE'));
 
         const inboxTasks = computed(() => tasks.value.filter(t => t.status === 'DRAFT'));
         const activeTasks = computed(() => tasks.value.filter(t => t.status === 'IN_PROGRESS'));
@@ -400,8 +449,20 @@ async def index():
             ]);
             tasks.value = rTasks;
             users.value = rUsers;
+            
+            // Инициализация редактируемых полей
+            const empList = rUsers.filter(u => u.role === 'EMPLOYEE');
+            const defaultEmpId = empList.length > 0 ? empList[0].id : (rUsers[0]?.id || 1);
+
             rTasks.forEach(t => {
-              if (!assignLeadId.value[t.id]) assignLeadId.value[t.id] = rUsers[0]?.id || 1;
+              if (!editDrafts.value[t.id]) {
+                editDrafts.value[t.id] = {
+                  title: t.title,
+                  ai_summary: t.ai_summary,
+                  definition_of_done: t.definition_of_done,
+                  lead_id: defaultEmpId
+                };
+              }
             });
           } catch (e) {
             console.error("Ошибка загрузки:", e);
@@ -428,10 +489,7 @@ async def index():
 
                 try {
                   const res = await fetch('/api/tasks/create-voice', { method: 'POST', body: fd });
-                  if (!res.ok) {
-                    const err = await res.json();
-                    throw new Error(err.detail || 'Ошибка сервера');
-                  }
+                  if (!res.ok) throw new Error('Ошибка сервера');
                   await loadData();
                   alert('✅ Поручение создано и передано Заму!');
                 } catch (err) {
@@ -444,7 +502,7 @@ async def index():
               mediaRecorder.start();
               isRecording.value = true;
             } catch (err) {
-              alert('Разрешите доступ к микрофону в настройках браузера!');
+              alert('Разрешите доступ к микрофону в браузере!');
             }
           } else {
             mediaRecorder.stop();
@@ -460,10 +518,7 @@ async def index():
           fd.append('user_id', 1);
           try {
             const res = await fetch('/api/tasks/create-text', { method: 'POST', body: fd });
-            if (!res.ok) {
-              const err = await res.json();
-              throw new Error(err.detail || 'Ошибка создания');
-            }
+            if (!res.ok) throw new Error('Ошибка создания');
             textInput.value = '';
             await loadData();
             alert('✅ Задача создана!');
@@ -475,12 +530,23 @@ async def index():
         };
 
         const assignTask = async (id) => {
+          const draft = editDrafts.value[id] || {};
           const fd = new FormData();
-          fd.append('lead_id', assignLeadId.value[id] || 1);
-          fd.append('deadline', new Date(Date.now() + 86400000).toISOString());
-          await fetch(`/api/tasks/${id}/assign`, { method: 'POST', body: fd });
-          await loadData();
-          alert('Задача переведена в работу!');
+          fd.append('lead_id', draft.lead_id || employeesOnly.value[0]?.id || 1);
+          fd.append('title', draft.title || '');
+          fd.append('ai_summary', draft.ai_summary || '');
+          fd.append('definition_of_done', draft.definition_of_done || '');
+
+          try {
+            const res = await fetch(`/api/tasks/${id}/assign`, { method: 'POST', body: fd });
+            if (!res.ok) throw new Error('Ошибка назначения');
+            await loadData();
+            // Автоматически переключаем на вкладку "В работе"
+            deputyTab.value = 'active';
+            alert('🚀 Задача утверждена и переведена в работу!');
+          } catch (e) {
+            alert('❌ ' + e.message);
+          }
         };
 
         const approveCp = async (id, type) => {
@@ -529,7 +595,7 @@ async def index():
 
         return {
           role, deputyTab, isRecording, isProcessing, recordSeconds, textInput,
-          tasks, users, assignLeadId, roleTitle, inboxTasks, activeTasks, archiveTasks,
+          tasks, users, employeesOnly, editDrafts, roleTitle, inboxTasks, activeTasks, archiveTasks,
           displayedDeputyTasks, toggleRecord, sendTextTask, assignTask, approveCp,
           sendReport, sendRedFlag, completeTask, formatTime, badgeClass, badgeText
         };
