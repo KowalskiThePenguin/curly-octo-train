@@ -1,9 +1,10 @@
 import os
 import json
 import base64
+import re
 import traceback
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 import asyncpg
 import google.generativeai as genai
 
@@ -21,15 +22,11 @@ db_pool = None
 @app.on_event("startup")
 async def startup():
     global db_pool
-    try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL)
-        print("✅ Подключение к базе данных Supabase успешно!")
-    except Exception as e:
-        print(f"❌ Ошибка подключения к БД: {e}")
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
 
 SYSTEM_PROMPT = """
 Ты — операционный директор компании. Преврати поручение владельца в четкое техническое задание для Замдиректора.
-Верни ТОЛЬКО чистый валидный JSON без markdown-кавычек:
+Верни ТОЛЬКО чистый валидный JSON без лишнего текста:
 {
   "title": "Краткий заголовок задачи (до 6 слов)",
   "ai_summary": "Суть задачи в 2 предложениях",
@@ -38,6 +35,10 @@ SYSTEM_PROMPT = """
   "is_urgent": false
 }
 """
+
+def extract_json(text: str) -> dict:
+    cleaned = re.sub(r"```(?:json)?", "", text).strip()
+    return json.loads(cleaned)
 
 @app.get("/api/users")
 async def get_users():
@@ -55,7 +56,6 @@ async def get_tasks():
             LEFT JOIN users u ON u.id = t.lead_user_id
             ORDER BY t.id DESC
         """)
-        
         result = []
         for t in tasks:
             td = dict(t)
@@ -64,7 +64,6 @@ async def get_tasks():
             result.append(td)
         return result
 
-# Создание задачи через голос
 @app.post("/api/tasks/create-voice")
 async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1)):
     try:
@@ -73,13 +72,12 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         if "octet-stream" in mime:
             mime = "audio/webm"
 
-        # Запрос к Gemini
         response = gemini_model.generate_content([
             {"mime_type": mime, "data": audio_bytes},
             SYSTEM_PROMPT
-        ], generation_config={"response_mime_type": "application/json"})
+        ])
         
-        parsed = json.loads(response.text)
+        parsed = extract_json(response.text)
         audio_b64 = f"data:{mime};base64," + base64.b64encode(audio_bytes).decode('utf-8')
 
         async with db_pool.acquire() as conn:
@@ -99,16 +97,14 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
 
-# Создание задачи через текст
 @app.post("/api/tasks/create-text")
 async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
     try:
         response = gemini_model.generate_content([
             f"Текст поручения шефа: {text}",
             SYSTEM_PROMPT
-        ], generation_config={"response_mime_type": "application/json"})
-        
-        parsed = json.loads(response.text)
+        ])
+        parsed = extract_json(response.text)
 
         async with db_pool.acquire() as conn:
             task_id = await conn.fetchval("""
@@ -181,15 +177,14 @@ async def index():
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
       <title>Task Control Core</title>
-      <script src="https://cdn.tailwindcss.com"></script>
-      <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+      <script src="[https://cdn.tailwindcss.com](https://cdn.tailwindcss.com)"></script>
+      <script src="[https://unpkg.com/vue@3/dist/vue.global.js](https://unpkg.com/vue@3/dist/vue.global.js)"></script>
+      <link rel="stylesheet" href="[https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css](https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css)">
       <style>[v-cloak] { display: none; }</style>
     </head>
     <body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
       <div id="app" v-cloak class="max-w-md mx-auto p-4 pb-24">
         
-        <!-- Верхний переключатель ролей -->
         <header class="bg-slate-900 border border-slate-800 p-3 rounded-2xl mb-4 shadow-md">
           <div class="flex justify-between items-center mb-2.5">
             <span class="text-[11px] font-black tracking-wider text-slate-400">TASK CORE SYSTEM</span>
@@ -204,7 +199,6 @@ async def index():
 
         <!-- 1. ЭКРАН ШЕФА -->
         <div v-if="role === 'OWNER'" class="space-y-4">
-          
           <div class="bg-slate-900 border border-slate-800 p-6 rounded-3xl text-center space-y-4 shadow-xl">
             <h2 class="text-base font-bold text-white">Голосовое поручение</h2>
             
@@ -222,7 +216,6 @@ async def index():
               {{ isRecording ? 'Идет запись... Нажмите для отправки' : 'Нажмите микрофон и говорите' }}
             </p>
 
-            <!-- Альтернатива: ввод текстом -->
             <div class="pt-3 border-t border-slate-800 text-left space-y-2">
               <span class="text-[10px] font-bold text-slate-400 uppercase">Или введите текстом:</span>
               <div class="flex gap-2">
@@ -234,7 +227,6 @@ async def index():
             </div>
           </div>
 
-          <!-- Список поручений Шефа -->
           <div class="space-y-2">
             <h3 class="text-xs font-bold text-slate-400 uppercase px-1">Созданные поручения ({{ tasks.length }})</h3>
             <div v-for="t in tasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2.5 shadow">
@@ -271,7 +263,7 @@ async def index():
                 <span class="text-[10px] font-bold px-2 py-1 rounded" :class="badgeClass(t.status)">{{ badgeText(t.status) }}</span>
               </div>
 
-              <div v-if="t.voice_url" class="bg-slate-950 p-2 rounded-xl border border-slate-800 space-y-1">
+              <div v-if="t.voice_url" class="bg-slate-950 p-2.5 rounded-xl border border-slate-800 space-y-1">
                 <span class="text-[10px] text-slate-400 font-bold block">🎙 Аудио Шефа:</span>
                 <audio :src="t.voice_url" controls class="w-full h-8"></audio>
               </div>
@@ -281,7 +273,6 @@ async def index():
                 <p class="text-slate-400 whitespace-pre-line"><strong>Критерии сдачи:</strong><br>{{ t.definition_of_done }}</p>
               </div>
 
-              <!-- Назначение -->
               <div v-if="t.status === 'DRAFT'" class="pt-2 border-t border-slate-800 space-y-2">
                 <label class="block text-[11px] font-bold text-slate-300">Назначить сотрудника:</label>
                 <select v-model="assignLeadId[t.id]" class="w-full bg-slate-950 border border-slate-700 text-xs p-2.5 rounded-xl text-white">
@@ -292,7 +283,6 @@ async def index():
                 </button>
               </div>
 
-              <!-- Контроль -->
               <div v-if="t.status === 'IN_PROGRESS'" class="pt-2 border-t border-slate-800 space-y-2">
                 <div class="grid grid-cols-2 gap-2">
                   <button @click="approveCp(t.id, '30_PERCENT')" class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-bold py-2 rounded-xl">✅ Подтвердить 30%</button>
@@ -430,7 +420,10 @@ async def index():
               fd.append('user_id', 1);
               try {
                 const res = await fetch('/api/tasks/create-text', { method: 'POST', body: fd });
-                if (!res.ok) throw new Error('Ошибка создания');
+                if (!res.ok) {
+                  const err = await res.json();
+                  throw new Error(err.detail || 'Ошибка создания');
+                }
                 textInput.value = '';
                 await loadData();
                 alert('✅ Задача создана!');
@@ -506,4 +499,3 @@ async def index():
     </body>
     </html>
     """
-
