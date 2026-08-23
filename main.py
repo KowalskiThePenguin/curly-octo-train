@@ -5,7 +5,7 @@ import re
 import traceback
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse
 import asyncpg
@@ -30,7 +30,6 @@ async def get_db():
 
 @app.on_event("startup")
 async def startup():
-    # Автоматическое создание таблиц чата и колонок приоритета
     pool = await get_db()
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -102,10 +101,6 @@ async def get_users():
 async def get_tasks():
     pool = await get_db()
     async with pool.acquire() as conn:
-        # Умная сортировка:
-        # 1. Активные перед архивными
-        # 2. По приоритету: URGENT (Оперативно) -> NORMAL (Умеренно) -> FUTURE (На будущее)
-        # 3. По ID
         tasks = await conn.fetch("""
             SELECT t.*, m.file_url as voice_url, u.full_name as lead_name,
                    (SELECT COUNT(*) FROM task_messages msg WHERE msg.task_id = t.id AND msg.is_read = FALSE) as unread_count
@@ -188,21 +183,31 @@ async def assign_task(
     definition_of_done: str = Form(None)
 ):
     try:
+        # Корректное преобразование строки в объект datetime для PostgreSQL
+        dt_deadline = None
+        if deadline:
+            try:
+                clean_dl = deadline.replace("Z", "+00:00")
+                dt_deadline = datetime.fromisoformat(clean_dl)
+            except Exception:
+                dt_deadline = datetime.now(timezone.utc) + timedelta(days=1)
+        else:
+            dt_deadline = datetime.now(timezone.utc) + timedelta(days=1)
+
         pool = await get_db()
         async with pool.acquire() as conn:
             await conn.execute("""
                 UPDATE tasks 
                 SET lead_user_id = $1, 
                     priority = $2,
-                    deadline = $3::timestamptz,
+                    deadline = $3,
                     title = COALESCE($4, title),
                     ai_summary = COALESCE($5, ai_summary),
                     definition_of_done = COALESCE($6, definition_of_done),
                     status = 'IN_PROGRESS'
                 WHERE id = $7
-            """, lead_id, priority, deadline, title, ai_summary, definition_of_done, task_id)
+            """, lead_id, priority, dt_deadline, title, ai_summary, definition_of_done, task_id)
 
-            # Системное сообщение в чат
             await conn.execute("""
                 INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content)
                 VALUES ($1, 2, 'DEPUTY', 'Замдиректора', 'SYSTEM', '🚀 Задача утверждена и передана в работу')
@@ -213,12 +218,10 @@ async def assign_task(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# ЧАТ: Получить сообщения и отметить прочитанными
 @app.get("/api/tasks/{task_id}/messages")
 async def get_messages(task_id: int, viewer_role: str = "OWNER"):
     pool = await get_db()
     async with pool.acquire() as conn:
-        # Отмечаем прочитанными сообщения, отправленные другими ролями
         await conn.execute("""
             UPDATE task_messages 
             SET is_read = TRUE 
@@ -234,7 +237,6 @@ async def get_messages(task_id: int, viewer_role: str = "OWNER"):
         """, task_id)
         return [dict(r) for r in rows]
 
-# ЧАТ: Отправить текст
 @app.post("/api/tasks/{task_id}/messages/text")
 async def send_text_msg(task_id: int, sender_role: str = Form(...), sender_name: str = Form(...), content: str = Form(...)):
     pool = await get_db()
@@ -245,7 +247,6 @@ async def send_text_msg(task_id: int, sender_role: str = Form(...), sender_name:
         """, task_id, sender_role, sender_name, content)
     return {"status": "ok"}
 
-# ЧАТ: Отправить голос
 @app.post("/api/tasks/{task_id}/messages/voice")
 async def send_voice_msg(task_id: int, sender_role: str = Form(...), sender_name: str = Form(...), audio: UploadFile = File(...)):
     audio_bytes = await audio.read()
@@ -259,7 +260,6 @@ async def send_voice_msg(task_id: int, sender_role: str = Form(...), sender_name
         """, task_id, sender_role, sender_name, audio_b64)
     return {"status": "ok"}
 
-# ЧАТ: Отправить фото/файл
 @app.post("/api/tasks/{task_id}/messages/image")
 async def send_image_msg(task_id: int, sender_role: str = Form(...), sender_name: str = Form(...), file: UploadFile = File(...)):
     file_bytes = await file.read()
@@ -281,7 +281,6 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_name: str = For
             UPDATE tasks SET priority = 'URGENT', is_urgent = TRUE, risks_notes = $1 WHERE id = $2
         """, f"🚨 RED FLAG: {reason}", task_id)
         
-        # Системное оповещение в чат
         await conn.execute("""
             INSERT INTO task_messages (task_id, sender_role, sender_name, message_type, content)
             VALUES ($1, 'EMPLOYEE', $2, 'REDFLAG', $3)
@@ -382,7 +381,6 @@ async def index():
 
           <p class="text-xs text-slate-300 bg-slate-950/70 p-2.5 rounded-xl border border-slate-800"><strong>ТЗ:</strong> {{ t.ai_summary }}</p>
 
-          <!-- Кнопка открыть чат задачи -->
           <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
             <i class="fa-solid fa-comments"></i>
             <span>Чат по задаче</span>
@@ -414,7 +412,6 @@ async def index():
             <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="statusBadge(t.status)">{{ statusLabel(t.status) }}</span>
           </div>
 
-          <!-- Исходный голос Шефа -->
           <div v-if="t.voice_url" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
             <audio :src="t.voice_url" controls class="w-full h-8"></audio>
           </div>
@@ -429,7 +426,6 @@ async def index():
             <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" placeholder="Критерии сдачи (DoD)" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200"></textarea>
 
             <div class="grid grid-cols-2 gap-2 pt-1">
-              <!-- Степень важности -->
               <div>
                 <label class="block text-[10px] font-bold text-slate-400 mb-1">Важность:</label>
                 <select v-model="editDrafts[t.id].priority" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white">
@@ -439,7 +435,6 @@ async def index():
                 </select>
               </div>
 
-              <!-- Назначить сотрудника -->
               <div>
                 <label class="block text-[10px] font-bold text-slate-400 mb-1">Исполнитель:</label>
                 <select v-model="editDrafts[t.id].lead_id" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white">
@@ -448,7 +443,6 @@ async def index():
               </div>
             </div>
 
-            <!-- Дедлайн -->
             <div>
               <label class="block text-[10px] font-bold text-slate-400 mb-1">Дедлайн выполнения:</label>
               <input v-model="editDrafts[t.id].deadline" type="datetime-local" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white">
@@ -472,7 +466,7 @@ async def index():
               <button @click="openChat(t)" class="bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 border border-slate-700">
                 <i class="fa-solid fa-comments"></i> Чат задачи
               </button>
-              <button @click="completeTask(t.id)" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 rounded-xl text-xs shadow">
+              <button @click="completeTask(t.id)" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2.5 rounded-xl text-xs shadow">
                 🏁 Закрыть в архив
               </button>
             </div>
@@ -517,13 +511,10 @@ async def index():
       </div>
     </div>
 
-    <!-- ========================================== -->
-    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (TELEGRAM-СТИЛЬ) -->
-    <!-- ========================================== -->
+    <!-- МОДАЛЬНОЕ ОКНО ЧАТА -->
     <div v-if="activeChatTask" class="fixed inset-0 bg-slate-950/90 backdrop-blur-md z-50 flex flex-col justify-end">
       <div class="bg-slate-900 border-t border-slate-800 rounded-t-3xl h-[85vh] flex flex-col max-w-md w-full mx-auto shadow-2xl">
         
-        <!-- Шапка чата -->
         <div class="p-3.5 border-b border-slate-800 flex justify-between items-center bg-slate-900/80">
           <div>
             <span class="text-[10px] font-bold text-indigo-400 uppercase">Чат по задаче #{{ activeChatTask.id }}</span>
@@ -534,7 +525,6 @@ async def index():
           </button>
         </div>
 
-        <!-- Лента сообщений -->
         <div ref="chatContainer" class="flex-1 overflow-y-auto p-3.5 space-y-2.5 bg-slate-950/40">
           <div v-if="chatMessages.length === 0" class="text-center text-slate-500 text-xs py-8">
             Сообщений пока нет. Напишите или надиктуйте ответ ниже!
@@ -548,20 +538,16 @@ async def index():
                 <span>{{ m.time_str }}</span>
               </div>
 
-              <!-- Текст -->
-              <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
+              <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
 
-              <!-- Голосовое -->
               <div v-if="m.message_type === 'VOICE'" class="py-1">
                 <audio :src="m.media_url" controls class="h-8 w-48"></audio>
               </div>
 
-              <!-- Фото -->
               <div v-if="m.message_type === 'IMAGE'" class="py-1">
                 <img :src="m.media_url" class="rounded-lg max-h-44 object-cover">
               </div>
 
-              <!-- Галочки прочтения в стиле Telegram -->
               <div class="text-right text-[10px] leading-none pt-0.5">
                 <span v-if="m.sender_role === role" :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
                   {{ m.is_read ? '✓✓' : '✓' }}
@@ -571,25 +557,19 @@ async def index():
           </div>
         </div>
 
-        <!-- Панель ввода сообщений -->
         <div class="p-2.5 border-t border-slate-800 bg-slate-900 space-y-2">
-          
           <div class="flex items-center gap-1.5">
-            <!-- Кнопка фото -->
             <label class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 flex items-center justify-center cursor-pointer hover:bg-slate-700 text-sm">
               <i class="fa-solid fa-paperclip"></i>
               <input type="file" accept="image/*" @change="uploadChatImage" class="hidden">
             </label>
 
-            <!-- Кнопка аудиокружка -->
             <button @click="toggleChatVoice" :class="isChatRecording ? 'bg-red-500 animate-pulse text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'" class="w-9 h-9 rounded-xl flex items-center justify-center text-sm">
               <i :class="isChatRecording ? 'fa-solid fa-stop' : 'fa-solid fa-microphone'"></i>
             </button>
 
-            <!-- Текстовое поле -->
             <input v-model="chatInput" @keyup.enter="sendChatMessage" placeholder="Сообщение..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white">
 
-            <!-- Кнопка отправить -->
             <button @click="sendChatMessage" class="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center text-sm hover:bg-indigo-500">
               <i class="fa-solid fa-paper-plane"></i>
             </button>
@@ -602,7 +582,7 @@ async def index():
   </div>
 
   <script>
-    const { createApp, ref, computed, onMounted, nextTick } = Vue;
+    const { createApp, ref, computed, onMounted } = Vue;
     createApp({
       setup() {
         const role = ref('OWNER');
@@ -619,7 +599,6 @@ async def index():
         let mediaRecorder = null;
         let audioChunks = [];
 
-        // ЧАТ переменные
         const activeChatTask = ref(null);
         const chatMessages = ref([]);
         const chatInput = ref('');
@@ -766,7 +745,6 @@ async def index():
           }
         };
 
-        // ЧАТ ЛОГИКА
         const openChat = async (task) => {
           activeChatTask.value = task;
           await loadMessages();
@@ -846,7 +824,6 @@ async def index():
           await loadData();
         };
 
-        // ТАЙМЕР И БЕЙДЖИ
         const getDeadlineCountdown = (dlStr) => {
           if (!dlStr) return 'Без срока';
           const diff = new Date(dlStr) - new Date();
@@ -899,3 +876,4 @@ async def index():
   </script>
 </body>
 </html>"""
+
