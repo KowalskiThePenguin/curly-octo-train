@@ -76,6 +76,7 @@ async def startup():
             ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(50);
             ALTER TABLE users ADD COLUMN IF NOT EXISTS password VARCHAR(100);
             ALTER TABLE users ALTER COLUMN phone_or_login DROP NOT NULL;
+            
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority VARCHAR(30) DEFAULT 'NORMAL';
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline TIMESTAMPTZ;
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
@@ -199,14 +200,17 @@ async def get_users():
         users = await conn.fetch("SELECT id, full_name, role, department, username FROM users WHERE is_active = TRUE ORDER BY id ASC")
         return [dict(u) for u in users]
 
+# Получение задач со строгим ISO-форматом UTC времени
 @app.get("/api/tasks")
 async def get_tasks():
     pool = await get_db()
     async with pool.acquire() as conn:
         tasks = await conn.fetch("""
             SELECT t.id, t.title, t.raw_input_text, t.ai_summary, t.definition_of_done,
-                   t.task_type, t.status, t.priority, t.deadline, t.created_at, t.completed_at,
-                   t.lead_user_id, t.result_report,
+                   t.task_type, t.status, t.priority, t.lead_user_id, t.result_report,
+                   to_char(t.deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as deadline,
+                   to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
+                   to_char(t.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as completed_at,
                    u.full_name as lead_name,
                    (EXISTS(SELECT 1 FROM media_attachments m WHERE m.task_id = t.id AND m.attachment_type = 'VOICE_ORIGINAL')) as has_voice,
                    (SELECT COUNT(*) FROM task_messages msg WHERE msg.task_id = t.id AND msg.is_read = FALSE) as unread_count
@@ -400,12 +404,18 @@ async def get_messages(task_id: int, viewer_role: str = "OWNER", viewer_user_id:
 
         rows = await conn.fetch("""
             SELECT id, task_id, sender_id, sender_role, sender_name, message_type, content, media_url, is_read,
-                   created_at
+                   to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at
             FROM task_messages 
             WHERE task_id = $1 
             ORDER BY id ASC
         """, task_id)
         return [dict(r) for r in rows]
+
+# ПРОВЕРКА: Блокировка отправки сообщений, если задача в архиве
+async def check_task_not_archived(conn, task_id: int):
+    status = await conn.fetchval("SELECT status FROM tasks WHERE id = $1", task_id)
+    if status == 'ARCHIVED':
+        raise HTTPException(status_code=400, detail="Задача находится в архиве. Чат заблокирован.")
 
 @app.post("/api/tasks/{task_id}/messages/text")
 async def send_text_msg(
@@ -417,6 +427,7 @@ async def send_text_msg(
 ):
     pool = await get_db()
     async with pool.acquire() as conn:
+        await check_task_not_archived(conn, task_id)
         await conn.execute("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
             VALUES ($1, $2, $3, $4, 'TEXT', $5, NOW())
@@ -432,11 +443,12 @@ async def send_voice_msg(
     sender_name: str = Form(...), 
     audio: UploadFile = File(...)
 ):
-    audio_bytes = await audio.read()
-    mime = audio.content_type or "audio/webm"
-    audio_b64 = f"data:{mime};base64," + base64.b64encode(audio_bytes).decode('utf-8')
     pool = await get_db()
     async with pool.acquire() as conn:
+        await check_task_not_archived(conn, task_id)
+        audio_bytes = await audio.read()
+        mime = audio.content_type or "audio/webm"
+        audio_b64 = f"data:{mime};base64," + base64.b64encode(audio_bytes).decode('utf-8')
         await conn.execute("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, media_url, content, created_at)
             VALUES ($1, $2, $3, $4, 'VOICE', $5, 'Голосовое сообщение', NOW())
@@ -452,11 +464,12 @@ async def send_image_msg(
     sender_name: str = Form(...), 
     file: UploadFile = File(...)
 ):
-    file_bytes = await file.read()
-    mime = file.content_type or "image/jpeg"
-    file_b64 = f"data:{mime};base64," + base64.b64encode(file_bytes).decode('utf-8')
     pool = await get_db()
     async with pool.acquire() as conn:
+        await check_task_not_archived(conn, task_id)
+        file_bytes = await file.read()
+        mime = file.content_type or "image/jpeg"
+        file_b64 = f"data:{mime};base64," + base64.b64encode(file_bytes).decode('utf-8')
         await conn.execute("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, media_url, content, created_at)
             VALUES ($1, $2, $3, $4, 'IMAGE', $5, 'Прикрепленное фото', NOW())
@@ -539,7 +552,7 @@ async def index():
       </div>
     </div>
 
-    <!-- ОСНОВНОЙ ИНТЕРФЕЙС АВТОРИЗОВАННОГО ПОЛЬЗОВАТЕЛЯ -->
+    <!-- ОСНОВНОЙ ИНТЕРФЕЙС -->
     <div v-else class="space-y-4">
       
       <!-- ХЕДЕР -->
@@ -596,12 +609,13 @@ async def index():
           <button @click="ownerTab = 'archive'" :class="ownerTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Архив ({{ archiveTasks.length }})</button>
         </div>
 
+        <!-- Список задач Шефа (100% идентичная структура карточки) -->
         <div class="space-y-3">
           <div v-if="displayedOwnerTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
             В этом разделе пока нет задач.
           </div>
 
-          <div v-for="t in displayedOwnerTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-2.5 shadow">
+          <div v-for="t in displayedOwnerTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
             
             <div class="flex justify-between items-start gap-2">
               <div class="flex flex-wrap items-center gap-1.5">
@@ -624,11 +638,19 @@ async def index():
               <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
             </p>
 
-            <p class="text-xs text-slate-300 bg-slate-950/70 p-2.5 rounded-xl border border-slate-800"><strong>ТЗ от ИИ:</strong> {{ t.ai_summary }}</p>
-            <p v-if="t.lead_name" class="text-xs text-indigo-300 font-semibold px-1">👤 Исполнитель: {{ t.lead_name }}</p>
+            <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-xs space-y-1.5">
+              <p class="text-slate-300"><strong>Суть задачи:</strong> {{ t.ai_summary }}</p>
+              <div class="text-slate-400 pt-1 border-t border-slate-800/80 whitespace-pre-line">
+                <strong class="text-indigo-300">Критерии сдачи (DoD):</strong><br>{{ t.definition_of_done }}
+              </div>
+            </div>
+
+            <p class="text-xs text-indigo-300 font-semibold px-1">
+              👤 Исполнитель: {{ t.lead_name || 'Не назначен' }}
+            </p>
 
             <!-- ДАТЫ И ЧАСЫ НА КАРТОЧКЕ -->
-            <div class="pt-1 text-[10px] text-slate-400 space-y-0.5 border-t border-slate-800/80">
+            <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
                 <span>📅 Создано:</span>
                 <span class="text-slate-200 font-mono">{{ formatLocalDT(t.created_at) }}</span>
@@ -648,6 +670,7 @@ async def index():
               <p class="text-slate-200 whitespace-pre-wrap">{{ t.result_report }}</p>
             </div>
 
+            <!-- КНОПКА ЧАТА -->
             <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
               <i class="fa-solid fa-comments"></i>
               <span>Чат по задаче</span>
@@ -673,7 +696,7 @@ async def index():
             В этом разделе пока нет задач.
           </div>
 
-          <div v-for="t in displayedDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-3 shadow">
+          <div v-for="t in displayedDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
             
             <div class="flex justify-between items-start gap-2">
               <div class="flex flex-wrap items-center gap-1.5">
@@ -686,15 +709,28 @@ async def index():
               <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="statusBadge(t.status)">{{ statusLabel(t.status) }}</span>
             </div>
 
+            <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
+
             <div v-if="t.has_voice" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
               <audio :src="'/api/tasks/' + t.id + '/voice'" controls preload="none" class="w-full h-8"></audio>
             </div>
-            <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2 rounded-xl border border-amber-900/40">
-              <strong>🗣 Исходное поручение Шефа:</strong> {{ t.raw_input_text }}
+            <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2.5 rounded-xl border border-amber-900/40">
+              <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
+            </p>
+
+            <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-xs space-y-1.5">
+              <p class="text-slate-300"><strong>Суть задачи:</strong> {{ t.ai_summary }}</p>
+              <div class="text-slate-400 pt-1 border-t border-slate-800/80 whitespace-pre-line">
+                <strong class="text-indigo-300">Критерии сдачи (DoD):</strong><br>{{ t.definition_of_done }}
+              </div>
+            </div>
+
+            <p class="text-xs text-indigo-300 font-semibold px-1">
+              👤 Исполнитель: {{ t.lead_name || 'Не назначен' }}
             </p>
 
             <!-- ДАТЫ И ЧАСЫ НА КАРТОЧКЕ -->
-            <div class="text-[10px] text-slate-400 space-y-0.5">
+            <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
                 <span>📅 Создано:</span>
                 <span class="text-slate-200 font-mono">{{ formatLocalDT(t.created_at) }}</span>
@@ -710,7 +746,7 @@ async def index():
             </div>
 
             <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ -->
-            <div v-if="t.status === 'DRAFT'" class="space-y-2 pt-1">
+            <div v-if="t.status === 'DRAFT'" class="space-y-2 pt-1 border-t border-slate-800">
               <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold">
               <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200"></textarea>
               <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" placeholder="Критерии сдачи (DoD)" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200"></textarea>
@@ -743,22 +779,8 @@ async def index():
               </button>
             </div>
 
-            <!-- В РАБОТЕ -->
-            <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1">
-              <h4 class="text-sm font-bold text-white">{{ t.title }}</h4>
-              <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-xs space-y-1">
-                <p class="text-slate-300"><strong>ТЗ:</strong> {{ t.ai_summary }}</p>
-                <p class="text-slate-400 whitespace-pre-line"><strong>Критерии:</strong><br>{{ t.definition_of_done }}</p>
-                <p class="text-indigo-300 pt-1"><strong>Исполнитель:</strong> {{ t.lead_name }}</p>
-              </div>
-              <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 border border-slate-700">
-                <i class="fa-solid fa-comments"></i> Чат задачи
-              </button>
-            </div>
-
             <!-- СДАНО НА ПРОВЕРКУ -->
             <div v-if="t.status === 'REVIEW'" class="space-y-2 pt-1 border-t border-amber-800/40">
-              <h4 class="text-sm font-bold text-white">{{ t.title }}</h4>
               <div class="p-2.5 bg-amber-950/30 rounded-xl border border-amber-800/60 text-xs space-y-1.5">
                 <p class="text-amber-300 font-bold">📝 Отчет исполнителя ({{ t.lead_name }}):</p>
                 <p class="text-slate-200 whitespace-pre-wrap">{{ t.result_report }}</p>
@@ -773,6 +795,13 @@ async def index():
                 </button>
               </div>
             </div>
+
+            <!-- КНОПКА ЧАТА ДЛЯ ЗАМА ВСЕГДА -->
+            <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
+              <i class="fa-solid fa-comments"></i>
+              <span>Чат по задаче</span>
+              <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{{ t.unread_count }}</span>
+            </button>
 
           </div>
         </div>
@@ -815,12 +844,14 @@ async def index():
           <button @click="empTab = 'archive'" :class="empTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="flex-1 py-1.5 rounded-lg">История</button>
         </div>
 
+        <!-- Список задач исполнителя (100% идентичная структура карточки) -->
         <div class="space-y-3">
           <div v-if="displayedEmpTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
             В этом разделе пока нет задач.
           </div>
 
           <div v-for="t in displayedEmpTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
+            
             <div class="flex justify-between items-start gap-2">
               <div class="flex items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
@@ -832,6 +863,13 @@ async def index():
             </div>
 
             <h4 class="text-sm font-bold text-white">{{ t.title }}</h4>
+
+            <div v-if="t.has_voice" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
+              <audio :src="'/api/tasks/' + t.id + '/voice'" controls preload="none" class="w-full h-8"></audio>
+            </div>
+            <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2.5 rounded-xl border border-amber-900/40">
+              <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
+            </p>
             
             <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-xs space-y-1.5">
               <p class="text-slate-300"><strong>Суть задачи:</strong> {{ t.ai_summary }}</p>
@@ -849,6 +887,10 @@ async def index():
               <div v-if="t.deadline" class="flex justify-between">
                 <span>⏰ Сдать до:</span>
                 <span class="text-amber-300 font-mono font-bold">{{ formatLocalDT(t.deadline) }}</span>
+              </div>
+              <div v-if="t.completed_at" class="flex justify-between">
+                <span>🏁 Завершено:</span>
+                <span class="text-emerald-400 font-mono">{{ formatLocalDT(t.completed_at) }}</span>
               </div>
             </div>
 
@@ -868,11 +910,21 @@ async def index():
               </button>
             </div>
 
-            <div v-if="t.status === 'REVIEW'" class="pt-1">
+            <div v-if="t.status === 'REVIEW'" class="space-y-2 pt-1">
               <div class="bg-amber-950/40 border border-amber-800/50 p-2.5 rounded-xl text-xs text-amber-300 text-center font-bold">
                 ⏳ Отчет передан Жамолиддину на проверку.
               </div>
+              <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
+                <i class="fa-solid fa-comments"></i> Чат по задаче
+              </button>
             </div>
+
+            <div v-if="t.status === 'ARCHIVED'" class="pt-1">
+              <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
+                <i class="fa-solid fa-comments"></i> История чата
+              </button>
+            </div>
+
           </div>
         </div>
       </div>
@@ -925,7 +977,13 @@ async def index():
           </div>
         </div>
 
-        <div class="p-2.5 border-t border-slate-800 bg-slate-900 space-y-2">
+        <!-- ПАНЕЛЬ ВВОДА ИЛИ БЛОКИРОВКА ЕСЛИ В АРХИВЕ -->
+        <div v-if="activeChatTask.status === 'ARCHIVED'" class="p-3 bg-slate-900 border-t border-slate-800 text-center text-xs text-slate-400 font-semibold flex items-center justify-center gap-2">
+          <i class="fa-solid fa-lock text-slate-500"></i>
+          <span>Задача закрыта в архив. Чат только для чтения.</span>
+        </div>
+
+        <div v-else class="p-2.5 border-t border-slate-800 bg-slate-900 space-y-2">
           <div class="flex items-center gap-1.5">
             <label class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 flex items-center justify-center cursor-pointer hover:bg-slate-700 text-sm">
               <i class="fa-solid fa-paperclip"></i>
@@ -1024,7 +1082,7 @@ async def index():
           return m.sender_id === currentUser.value.id;
         };
 
-        // ХЕЛПЕРЫ ВРЕМЕНИ И ТАЙМЗОНЫ
+        // ХЕЛПЕРЫ МЕСТНОГО ВРЕМЕНИ
         const formatLocalDT = (isoStr) => {
           if (!isoStr) return '';
           const d = new Date(isoStr);
@@ -1196,8 +1254,9 @@ async def index():
           fd.append('lead_id', draft.lead_id || employeesOnly.value[0]?.id || 3);
           fd.append('priority', draft.priority || 'URGENT');
           
-          // Корректная конвертация местного времени из инпута в глобальный UTC ISO
-          const deadlineIso = draft.deadline ? new Date(draft.deadline).toISOString() : new Date(Date.now() + 86400000).toISOString();
+          // Отправка в стандарте UTC ISO
+          const d = new Date(draft.deadline);
+          const deadlineIso = isNaN(d.getTime()) ? new Date(Date.now() + 86400000).toISOString() : d.toISOString();
           fd.append('deadline', deadlineIso);
           
           fd.append('title', draft.title || '');
@@ -1265,7 +1324,12 @@ async def index():
           fd.append('sender_role', currentUser.value.role);
           fd.append('sender_name', currentUser.value.full_name);
           fd.append('content', chatInput.value);
-          await fetch(`/api/tasks/${activeChatTask.value.id}/messages/text`, { method: 'POST', body: fd });
+          const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages/text`, { method: 'POST', body: fd });
+          if (!res.ok) {
+            const err = await res.json();
+            alert('❌ ' + (err.detail || 'Ошибка отправки'));
+            return;
+          }
           chatInput.value = '';
           await loadMessages();
         };
@@ -1397,4 +1461,3 @@ async def index():
   </script>
 </body>
 </html>"""
-
