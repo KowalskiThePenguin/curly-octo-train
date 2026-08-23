@@ -75,6 +75,7 @@ async def startup():
         await conn.execute("""
             ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(50);
             ALTER TABLE users ADD COLUMN IF NOT EXISTS password VARCHAR(100);
+            ALTER TABLE users ALTER COLUMN phone_or_login DROP NOT NULL;
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority VARCHAR(30) DEFAULT 'NORMAL';
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS deadline TIMESTAMPTZ;
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result_report TEXT;
@@ -95,21 +96,20 @@ async def startup():
 
         await conn.execute("UPDATE users SET is_active = FALSE")
 
-        # Актуальный состав команды с персональными паролями
         team_users = [
-            (1, 'Хуршид', 'OWNER', 'Дирекция', 'khurshid', 'treds5'),
-            (2, 'Жамолиддин', 'DEPUTY', 'Управление', 'zhamoliddin', 'tru1'),
-            (3, 'Марат', 'EMPLOYEE', 'Исполнитель', 'marat', 'fruti9'),
-            (4, 'Сагынай', 'EMPLOYEE', 'Исполнитель', 'sagynay', 'reet3'),
-            (5, 'Иброхим', 'EMPLOYEE', 'Исполнитель', 'ibrohim', 'frost')
+            (1, 'khurshid', 'Хуршид', 'OWNER', 'Дирекция', 'khurshid', 'treds5'),
+            (2, 'zhamoliddin', 'Жамолиддин', 'DEPUTY', 'Управление', 'zhamoliddin', 'tru1'),
+            (3, 'marat', 'Марат', 'EMPLOYEE', 'Исполнитель', 'marat', 'fruti9'),
+            (4, 'sagynay', 'Сагынай', 'EMPLOYEE', 'Исполнитель', 'sagynay', 'reet3'),
+            (5, 'ibrohim', 'Иброхим', 'EMPLOYEE', 'Исполнитель', 'ibrohim', 'frost')
         ]
-        for uid, name, role, dept, uname, pwd in team_users:
+        for uid, phone_login, name, role, dept, uname, pwd in team_users:
             await conn.execute("""
-                INSERT INTO users (id, full_name, role, department, username, password, is_active)
-                VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+                INSERT INTO users (id, phone_or_login, full_name, role, department, username, password, is_active)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
                 ON CONFLICT (id) DO UPDATE 
-                SET username = $5, password = $6, full_name = $2, role = $3, department = $4, is_active = TRUE
-            """, uid, name, role, dept, uname, pwd)
+                SET phone_or_login = $2, username = $6, password = $7, full_name = $3, role = $4, department = $5, is_active = TRUE
+            """, uid, phone_login, name, role, dept, uname, pwd)
 
     asyncio.create_task(keep_alive_worker())
 
@@ -141,7 +141,9 @@ async def login(username: str = Form(...), password: str = Form(...)):
         user = await conn.fetchrow("""
             SELECT id, full_name, role, department, username 
             FROM users 
-            WHERE LOWER(TRIM(username)) = LOWER(TRIM($1)) AND TRIM(password) = TRIM($2) AND is_active = TRUE
+            WHERE (LOWER(TRIM(username)) = LOWER(TRIM($1)) OR LOWER(TRIM(phone_or_login)) = LOWER(TRIM($1))) 
+              AND TRIM(password) = TRIM($2) 
+              AND is_active = TRUE
         """, username, password)
         
         if not user:
@@ -551,9 +553,7 @@ async def index():
         </button>
       </header>
 
-      <!-- ========================================== -->
       <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
-      <!-- ========================================== -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
         <div class="bg-slate-900 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl">
           <h2 class="text-base font-bold text-white">Голосовое поручение</h2>
@@ -615,9 +615,7 @@ async def index():
         </div>
       </div>
 
-      <!-- ========================================== -->
       <!-- 2. КАБИНЕТ ДИРЕКТОРА (ЖАМОЛИДДИН) -->
-      <!-- ========================================== -->
       <div v-if="currentUser.role === 'DEPUTY'" class="space-y-4">
         <div class="grid grid-cols-4 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
           <button @click="deputyTab = 'inbox'" :class="deputyTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
@@ -713,11 +711,8 @@ async def index():
         </div>
       </div>
 
-      <!-- ========================================== -->
       <!-- 3. ЛИЧНЫЙ КАБИНЕТ ИСПОЛНИТЕЛЯ (МАРАТ, САГЫНАЙ, ИБРОХИМ) -->
-      <!-- ========================================== -->
       <div v-if="currentUser.role === 'EMPLOYEE'" class="space-y-4">
-        
         <div class="bg-gradient-to-r from-slate-900 to-indigo-950 border border-indigo-800/50 p-4 rounded-3xl space-y-3 shadow-xl">
           <div class="flex items-center gap-3">
             <div class="w-10 h-10 rounded-2xl bg-indigo-600 text-white flex items-center justify-center font-black text-base shadow">
@@ -912,7 +907,6 @@ async def index():
 
         const employeesOnly = computed(() => users.value.filter(u => u.role === 'EMPLOYEE'));
 
-        // Задачи исполнителя
         const myTasks = computed(() => tasks.value.filter(t => t.lead_user_id === currentUser.value?.id));
         const myActiveTasks = computed(() => myTasks.value.filter(t => t.status === 'IN_PROGRESS'));
         const myReviewTasks = computed(() => myTasks.value.filter(t => t.status === 'REVIEW'));
@@ -924,7 +918,6 @@ async def index():
           return myArchiveTasks.value;
         });
 
-        // Задачи Директора (Жамолиддин)
         const inboxTasks = computed(() => tasks.value.filter(t => t.status === 'DRAFT'));
         const activeTasks = computed(() => tasks.value.filter(t => t.status === 'IN_PROGRESS'));
         const reviewTasks = computed(() => tasks.value.filter(t => t.status === 'REVIEW'));
@@ -1270,4 +1263,3 @@ async def index():
   </script>
 </body>
 </html>"""
-
