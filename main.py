@@ -2,20 +2,51 @@ import os
 import json
 import base64
 import re
+import asyncio
 import traceback
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 import asyncpg
 
 app = FastAPI()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 db_pool = None
+
+# Список активных SSE-соединений для мгновенных пушей
+sse_subscribers = set()
+
+async def broadcast_event(event_type: str = "update"):
+    """Мгновенное оповещение всех подключенных телефонов без поллинга"""
+    for queue in list(sse_subscribers):
+        try:
+            await queue.put(f"data: {json.dumps({'event': event_type})}\n\n")
+        except Exception:
+            sse_subscribers.discard(queue)
+
+def send_telegram_alert(text: str):
+    """Отправка мгновенных алертов в Telegram Шефу и Заму"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = json.dumps({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML"
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"Telegram Alert Error: {e}")
 
 async def get_db():
     global db_pool
@@ -27,6 +58,22 @@ async def get_db():
             max_size=7
         )
     return db_pool
+
+async def keep_alive_worker():
+    """Фоновый воркер: предотвращает сон Render и автопаузу Supabase"""
+    while True:
+        await asyncio.sleep(480) # Каждые 8 минут
+        try:
+            pool = await get_db()
+            async with pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            
+            if RENDER_EXTERNAL_URL:
+                req = urllib.request.Request(f"{RENDER_EXTERNAL_URL}/api/health", headers={"User-Agent": "KeepAlive"})
+                urllib.request.urlopen(req, timeout=10)
+            print("⚡ Keep-alive пинг выполнен: Сервер и БД активны")
+        except Exception as e:
+            print(f"Keep-alive ошибка: {e}")
 
 @app.on_event("startup")
 async def startup():
@@ -49,14 +96,39 @@ async def startup():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+    # Запуск анти-сна
+    asyncio.create_task(keep_alive_worker())
+
+@app.get("/api/health")
+async def health():
+    return {"status": "alive"}
+
+# Server-Sent Events (SSE) эндпоинт вместо постоянного Polling
+@app.get("/api/events")
+async def events_stream(request: Request):
+    async def event_generator():
+        queue = asyncio.Queue()
+        sse_subscribers.add(queue)
+        try:
+            # Первичный сигнал готовности
+            yield "data: {\"event\": \"connected\"}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                data = await queue.get()
+                yield data
+        finally:
+            sse_subscribers.discard(queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 SYSTEM_PROMPT = """
-Ты — операционный директор компании. Преврати поручение владельца в четкое техническое задание для Замдиректора.
-Верни ТОЛЬКО чистый JSON без markdown:
+Ты — операционный директор. Преврати поручение владельца в четкое техническое задание для Замдиректора.
+Верни ТОЛЬКО валидный JSON (без оформления markdown):
 {
-  "title": "Краткий заголовок (до 6 слов)",
+  "title": "Краткий заголовок задачи (до 6 слов)",
   "ai_summary": "Суть задачи в 2 предложениях",
-  "definition_of_done": "1. Первый результат\\n2. Второй результат",
+  "definition_of_done": "1. Первый пункт\\n2. Второй пункт",
   "task_type": "SOLO",
   "priority": "URGENT"
 }
@@ -97,15 +169,18 @@ async def get_users():
         users = await conn.fetch("SELECT id, full_name, role, department FROM users WHERE is_active = TRUE ORDER BY id ASC")
         return [dict(u) for u in users]
 
+# Оптимизированный эндпоинт задач: БЕЗ тяжелого base64 аудио
 @app.get("/api/tasks")
 async def get_tasks():
     pool = await get_db()
     async with pool.acquire() as conn:
         tasks = await conn.fetch("""
-            SELECT t.*, m.file_url as voice_url, u.full_name as lead_name,
+            SELECT t.id, t.title, t.raw_input_text, t.ai_summary, t.definition_of_done,
+                   t.task_type, t.status, t.priority, t.deadline, t.lead_user_id,
+                   u.full_name as lead_name,
+                   (EXISTS(SELECT 1 FROM media_attachments m WHERE m.task_id = t.id AND m.attachment_type = 'VOICE_ORIGINAL')) as has_voice,
                    (SELECT COUNT(*) FROM task_messages msg WHERE msg.task_id = t.id AND msg.is_read = FALSE) as unread_count
             FROM tasks t
-            LEFT JOIN media_attachments m ON m.task_id = t.id AND m.attachment_type = 'VOICE_ORIGINAL'
             LEFT JOIN users u ON u.id = t.lead_user_id
             ORDER BY 
                 CASE WHEN t.status = 'ARCHIVED' THEN 2 ELSE 1 END ASC,
@@ -118,6 +193,27 @@ async def get_tasks():
                 t.id DESC
         """)
         return [dict(t) for t in tasks]
+
+# Потоковая отдача аудио Шефа по требованию (Lazy loading)
+@app.get("/api/tasks/{task_id}/voice")
+async def get_task_voice(task_id: int):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        audio_b64 = await conn.fetchval("""
+            SELECT file_url FROM media_attachments 
+            WHERE task_id = $1 AND attachment_type = 'VOICE_ORIGINAL' 
+            LIMIT 1
+        """, task_id)
+        
+        if not audio_b64:
+            raise HTTPException(status_code=404, detail="Аудио не найдено")
+            
+        header, encoded = audio_b64.split(",", 1)
+        mime = "audio/webm"
+        if "audio/" in header:
+            mime = header.split(";")[0].replace("data:", "")
+            
+        return Response(content=base64.b64decode(encoded), media_type=mime)
 
 @app.post("/api/tasks/create-voice")
 async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1)):
@@ -148,7 +244,9 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
                 VALUES ($1, $2, 'VOICE_ORIGINAL', $3, $4)
             """, task_id, user_id, audio_b64, parsed.get("ai_summary", ""))
 
-        return {"status": "ok", "task_id": task_id, "data": parsed}
+        send_telegram_alert(f"🎙 <b>Новое голосовое поручение #{task_id}</b>\n\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        await broadcast_event("new_task")
+        return {"status": "ok", "task_id": task_id}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
@@ -167,7 +265,9 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
                 RETURNING id
             """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), user_id, True)
 
-        return {"status": "ok", "task_id": task_id, "data": parsed}
+        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id}</b>\n\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        await broadcast_event("new_task")
+        return {"status": "ok", "task_id": task_id}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
@@ -183,7 +283,6 @@ async def assign_task(
     definition_of_done: str = Form(None)
 ):
     try:
-        # Корректное преобразование строки в объект datetime для PostgreSQL
         dt_deadline = None
         if deadline:
             try:
@@ -213,6 +312,8 @@ async def assign_task(
                 VALUES ($1, 2, 'DEPUTY', 'Замдиректора', 'SYSTEM', '🚀 Задача утверждена и передана в работу')
             """, task_id)
 
+        send_telegram_alert(f"🚀 <b>Задача #{task_id} запущена в работу!</b>\n<b>Приоритет:</b> {priority}\n<b>Срок:</b> {deadline}")
+        await broadcast_event("task_assigned")
         return {"status": "ok"}
     except Exception as e:
         traceback.print_exc()
@@ -245,6 +346,7 @@ async def send_text_msg(task_id: int, sender_role: str = Form(...), sender_name:
             INSERT INTO task_messages (task_id, sender_role, sender_name, message_type, content)
             VALUES ($1, $2, $3, 'TEXT', $4)
         """, task_id, sender_role, sender_name, content)
+    await broadcast_event(f"chat_{task_id}")
     return {"status": "ok"}
 
 @app.post("/api/tasks/{task_id}/messages/voice")
@@ -258,6 +360,7 @@ async def send_voice_msg(task_id: int, sender_role: str = Form(...), sender_name
             INSERT INTO task_messages (task_id, sender_role, sender_name, message_type, media_url, content)
             VALUES ($1, $2, $3, 'VOICE', $4, 'Голосовое сообщение')
         """, task_id, sender_role, sender_name, audio_b64)
+    await broadcast_event(f"chat_{task_id}")
     return {"status": "ok"}
 
 @app.post("/api/tasks/{task_id}/messages/image")
@@ -271,6 +374,7 @@ async def send_image_msg(task_id: int, sender_role: str = Form(...), sender_name
             INSERT INTO task_messages (task_id, sender_role, sender_name, message_type, media_url, content)
             VALUES ($1, $2, $3, 'IMAGE', $4, 'Прикрепленное фото')
         """, task_id, sender_role, sender_name, file_b64)
+    await broadcast_event(f"chat_{task_id}")
     return {"status": "ok"}
 
 @app.post("/api/tasks/{task_id}/red-flag")
@@ -285,6 +389,9 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_name: str = For
             INSERT INTO task_messages (task_id, sender_role, sender_name, message_type, content)
             VALUES ($1, 'EMPLOYEE', $2, 'REDFLAG', $3)
         """, task_id, sender_name, f"🚨 RED FLAG (БЛОКЕР): {reason}")
+
+    send_telegram_alert(f"🚨🚨🚨 <b>RED FLAG на задаче #{task_id}!</b>\n<b>Исполнитель:</b> {sender_name}\n<b>Проблема:</b> {reason}")
+    await broadcast_event("red_flag")
     return {"status": "flagged"}
 
 @app.post("/api/tasks/{task_id}/complete")
@@ -296,6 +403,7 @@ async def complete_task(task_id: int):
             INSERT INTO task_messages (task_id, sender_role, sender_name, message_type, content)
             VALUES ($1, 'DEPUTY', 'Замдиректора', 'SYSTEM', '🏁 Задача успешно принята и закрыта в архив')
         """, task_id)
+    await broadcast_event("task_completed")
     return {"status": "completed"}
 
 @app.get("/", response_class=HTMLResponse)
@@ -305,7 +413,7 @@ async def index():
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Task OS Core</title>
+  <title>Task OS Pro</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
@@ -317,7 +425,10 @@ async def index():
     <!-- ХЕДЕР -->
     <header class="bg-slate-900 border border-slate-800 p-3 rounded-2xl mb-3.5 shadow-md">
       <div class="flex justify-between items-center mb-2.5">
-        <span class="text-[11px] font-black tracking-wider text-slate-400">TASK OS PLATFORM</span>
+        <div class="flex items-center gap-1.5">
+          <div class="w-2 h-2 rounded-full" :class="sseConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'"></div>
+          <span class="text-[11px] font-black tracking-wider text-slate-400">TASK OS LIVE</span>
+        </div>
         <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">{{ roleTitle }}</span>
       </div>
       <div class="grid grid-cols-3 gap-1 p-1 bg-slate-950 rounded-xl border border-slate-800">
@@ -375,8 +486,9 @@ async def index():
 
           <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-          <div v-if="t.voice_url" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
-            <audio :src="t.voice_url" controls class="w-full h-8"></audio>
+          <!-- Аудио с Lazy loading (не грузит трафик заранее) -->
+          <div v-if="t.has_voice" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
+            <audio :src="'/api/tasks/' + t.id + '/voice'" controls preload="none" class="w-full h-8"></audio>
           </div>
 
           <p class="text-xs text-slate-300 bg-slate-950/70 p-2.5 rounded-xl border border-slate-800"><strong>ТЗ:</strong> {{ t.ai_summary }}</p>
@@ -412,14 +524,14 @@ async def index():
             <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="statusBadge(t.status)">{{ statusLabel(t.status) }}</span>
           </div>
 
-          <div v-if="t.voice_url" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
-            <audio :src="t.voice_url" controls class="w-full h-8"></audio>
+          <div v-if="t.has_voice" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
+            <audio :src="'/api/tasks/' + t.id + '/voice'" controls preload="none" class="w-full h-8"></audio>
           </div>
           <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2 rounded-xl border border-amber-900/40">
             <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
           </p>
 
-          <!-- ФОРМА УТВЕРЖДЕНИЯ ДЛЯ ЗАМА (ВХОДЯЩИЕ) -->
+          <!-- ФОРМА УТВЕРЖДЕНИЯ ДЛЯ ЗАМА -->
           <div v-if="t.status === 'DRAFT'" class="space-y-2 pt-1">
             <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold">
             <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200"></textarea>
@@ -479,7 +591,7 @@ async def index():
     <!-- 3. ЭКРАН СОТРУДНИКА -->
     <div v-if="role === 'EMPLOYEE'" class="space-y-3.5">
       <div class="bg-indigo-950/40 border border-indigo-800/40 p-2.5 rounded-2xl text-xs text-indigo-300">
-        👋 Ваши задачи в работе. Общайтесь и отчитывайтесь в чате задачи:
+        👋 Ваши задачи в работе. Отчитывайтесь и сдавайте файлы в чате задачи:
       </div>
 
       <div class="space-y-3">
@@ -592,6 +704,7 @@ async def index():
         const recordSeconds = ref(0);
         const textInput = ref('');
         const editDrafts = ref({});
+        const sseConnected = ref(false);
         let timerInterval = null;
 
         const tasks = ref([]);
@@ -605,7 +718,6 @@ async def index():
         const isChatRecording = ref(false);
         let chatRecorder = null;
         let chatAudioChunks = [];
-        let chatPollInterval = null;
 
         const roleTitle = computed(() => {
           if (role.value === 'OWNER') return 'Шеф (Владелец)';
@@ -662,6 +774,21 @@ async def index():
           } catch (e) {
             console.error("Ошибка загрузки:", e);
           }
+        };
+
+        // Подключение к Server-Sent Events (Мгновенное обновление без нагрузки)
+        const setupSSE = () => {
+          const evtSource = new EventSource('/api/events');
+          evtSource.onopen = () => { sseConnected.value = true; };
+          evtSource.onmessage = (event) => {
+            loadData();
+            if (activeChatTask.value) loadMessages();
+          };
+          evtSource.onerror = () => {
+            sseConnected.value = false;
+            evtSource.close();
+            setTimeout(setupSSE, 5000);
+          };
         };
 
         const toggleRecord = async () => {
@@ -748,8 +875,6 @@ async def index():
         const openChat = async (task) => {
           activeChatTask.value = task;
           await loadMessages();
-          if (chatPollInterval) clearInterval(chatPollInterval);
-          chatPollInterval = setInterval(loadMessages, 3000);
         };
 
         const loadMessages = async () => {
@@ -860,11 +985,11 @@ async def index():
 
         onMounted(() => {
           loadData();
-          setInterval(loadData, 4000);
+          setupSSE();
         });
 
         return {
-          role, deputyTab, isRecording, isProcessing, recordSeconds, textInput,
+          role, deputyTab, isRecording, isProcessing, recordSeconds, textInput, sseConnected,
           tasks, users, employeesOnly, editDrafts, roleTitle, inboxTasks, activeTasks, archiveTasks,
           displayedDeputyTasks, activeChatTask, chatMessages, chatInput, isChatRecording,
           toggleRecord, sendTextTask, assignTask, openChat, sendChatMessage, toggleChatVoice, uploadChatImage,
@@ -876,4 +1001,3 @@ async def index():
   </script>
 </body>
 </html>"""
-
