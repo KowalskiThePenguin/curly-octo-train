@@ -200,9 +200,9 @@ async def get_users():
         users = await conn.fetch("SELECT id, full_name, role, department, username FROM users WHERE is_active = TRUE ORDER BY id ASC")
         return [dict(u) for u in users]
 
-# Получение задач со строгим ISO-форматом UTC времени
+# Сортировка: Важность -> Ближайший дедлайн -> Дата создания
 @app.get("/api/tasks")
-async def get_tasks():
+async def get_tasks(viewer_user_id: int = 1):
     pool = await get_db()
     async with pool.acquire() as conn:
         tasks = await conn.fetch("""
@@ -213,24 +213,24 @@ async def get_tasks():
                    to_char(t.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as completed_at,
                    u.full_name as lead_name,
                    (EXISTS(SELECT 1 FROM media_attachments m WHERE m.task_id = t.id AND m.attachment_type = 'VOICE_ORIGINAL')) as has_voice,
-                   (SELECT COUNT(*) FROM task_messages msg WHERE msg.task_id = t.id AND msg.is_read = FALSE) as unread_count
+                   (SELECT COUNT(*) FROM task_messages msg 
+                    WHERE msg.task_id = t.id 
+                      AND msg.is_read = FALSE 
+                      AND msg.sender_id != $1) as unread_count
             FROM tasks t
             LEFT JOIN users u ON u.id = t.lead_user_id
             ORDER BY 
-                CASE 
-                    WHEN t.status = 'REVIEW' THEN 1
-                    WHEN t.status = 'IN_PROGRESS' THEN 2
-                    WHEN t.status = 'DRAFT' THEN 3
-                    ELSE 4 
-                END ASC,
+                CASE WHEN t.status = 'ARCHIVED' THEN 2 ELSE 1 END ASC,
                 CASE 
                     WHEN t.priority = 'URGENT' THEN 1 
                     WHEN t.priority = 'NORMAL' THEN 2 
                     WHEN t.priority = 'FUTURE' THEN 3 
                     ELSE 4 
                 END ASC,
+                CASE WHEN t.deadline IS NULL THEN 1 ELSE 0 END ASC,
+                t.deadline ASC,
                 t.id DESC
-        """)
+        """, viewer_user_id)
         return [dict(t) for t in tasks]
 
 @app.get("/api/tasks/{task_id}/voice")
@@ -393,14 +393,15 @@ async def reject_review(task_id: int, reason: str = Form(...)):
     return {"status": "ok"}
 
 @app.get("/api/tasks/{task_id}/messages")
-async def get_messages(task_id: int, viewer_role: str = "OWNER", viewer_user_id: int = 1):
+async def get_messages(task_id: int, viewer_user_id: int = 1):
     pool = await get_db()
     async with pool.acquire() as conn:
-        await conn.execute("""
+        # Отмечаем сообщения прочитанными и отправляем оповещение
+        updated_status = await conn.execute("""
             UPDATE task_messages 
             SET is_read = TRUE 
-            WHERE task_id = $1 AND (sender_role != $2 OR sender_id != $3)
-        """, task_id, viewer_role, viewer_user_id)
+            WHERE task_id = $1 AND sender_id != $2 AND is_read = FALSE
+        """, task_id, viewer_user_id)
 
         rows = await conn.fetch("""
             SELECT id, task_id, sender_id, sender_role, sender_name, message_type, content, media_url, is_read,
@@ -409,9 +410,12 @@ async def get_messages(task_id: int, viewer_role: str = "OWNER", viewer_user_id:
             WHERE task_id = $1 
             ORDER BY id ASC
         """, task_id)
+
+        if "UPDATE 0" not in updated_status:
+            await broadcast_event("read_receipt")
+
         return [dict(r) for r in rows]
 
-# ПРОВЕРКА: Блокировка отправки сообщений, если задача в архиве
 async def check_task_not_archived(conn, task_id: int):
     status = await conn.fetchval("SELECT status FROM tasks WHERE id = $1", task_id)
     if status == 'ARCHIVED':
@@ -512,14 +516,17 @@ async def index():
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Task OS Corporate</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-  <style>[v-cloak] { display: none !important; }</style>
+  <style>
+    [v-cloak] { display: none !important; }
+    .overscroll-contain { overscroll-behavior: contain; }
+  </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased select-none">
   <div id="app" v-cloak class="max-w-md mx-auto p-3.5 pb-24">
     
     <!-- ЭКРАН ВХОДА -->
@@ -609,7 +616,7 @@ async def index():
           <button @click="ownerTab = 'archive'" :class="ownerTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Архив ({{ archiveTasks.length }})</button>
         </div>
 
-        <!-- Список задач Шефа (100% идентичная структура карточки) -->
+        <!-- Список задач Шефа -->
         <div class="space-y-3">
           <div v-if="displayedOwnerTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
             В этом разделе пока нет задач.
@@ -696,7 +703,7 @@ async def index():
             В этом разделе пока нет задач.
           </div>
 
-          <div v-for="t in displayedDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
+          <div v-for="t in displayedDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-3 shadow">
             
             <div class="flex justify-between items-start gap-2">
               <div class="flex flex-wrap items-center gap-1.5">
@@ -808,7 +815,7 @@ async def index():
       </div>
 
       <!-- ========================================== -->
-      <!-- 3. ЛИЧНЫЙ КАБИНЕТ ИСПОЛНИТЕЛЯ (МАРАТ, САГЫНАЙ, ИБРОХИМ) -->
+      <!-- 3. ЛИЧНЫЙ КАБИНЕТ ИСПОЛНИТЕЛЯ -->
       <!-- ========================================== -->
       <div v-if="currentUser.role === 'EMPLOYEE'" class="space-y-4">
         <div class="bg-gradient-to-r from-slate-900 to-indigo-950 border border-indigo-800/50 p-4 rounded-3xl space-y-3 shadow-xl">
@@ -844,7 +851,6 @@ async def index():
           <button @click="empTab = 'archive'" :class="empTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="flex-1 py-1.5 rounded-lg">История</button>
         </div>
 
-        <!-- Список задач исполнителя (100% идентичная структура карточки) -->
         <div class="space-y-3">
           <div v-if="displayedEmpTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
             В этом разделе пока нет задач.
@@ -862,7 +868,7 @@ async def index():
               </span>
             </div>
 
-            <h4 class="text-sm font-bold text-white">{{ t.title }}</h4>
+            <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
             <div v-if="t.has_voice" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
               <audio :src="'/api/tasks/' + t.id + '/voice'" controls preload="none" class="w-full h-8"></audio>
@@ -881,7 +887,7 @@ async def index():
             <!-- ДАТЫ И ЧАСЫ НА КАРТОЧКЕ ИСПОЛНИТЕЛЯ -->
             <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
-                <span>📅 Назначено:</span>
+                <span>📅 Создано:</span>
                 <span class="text-slate-200 font-mono">{{ formatLocalDT(t.created_at) }}</span>
               </div>
               <div v-if="t.deadline" class="flex justify-between">
@@ -931,84 +937,96 @@ async def index():
 
     </div>
 
-    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ -->
-    <div v-if="activeChatTask" class="fixed inset-0 bg-slate-950/90 backdrop-blur-md z-50 flex flex-col justify-end">
-      <div class="bg-slate-900 border-t border-slate-800 rounded-t-3xl h-[85vh] flex flex-col max-w-md w-full mx-auto shadow-2xl">
-        
-        <div class="p-3.5 border-b border-slate-800 flex justify-between items-center bg-slate-900/80">
-          <div>
-            <span class="text-[10px] font-bold text-indigo-400 uppercase">Чат по задаче #{{ activeChatTask.id }}</span>
-            <h3 class="text-xs font-bold text-white truncate max-w-[240px]">{{ activeChatTask.title }}</h3>
+    <!-- ========================================== -->
+    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (TELEGRAM VIEW) -->
+    <!-- ========================================== -->
+    <div v-if="activeChatTask" class="fixed inset-0 bg-slate-950 z-50 flex flex-col h-[100dvh] w-full max-w-md mx-auto overscroll-contain">
+      
+      <!-- Шапка чата -->
+      <div class="p-3.5 border-b border-slate-800 flex justify-between items-center bg-slate-900/95 shrink-0">
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="text-[10px] font-bold text-indigo-400 uppercase">Чат задачи #{{ activeChatTask.id }}</span>
+            <span class="text-[9px] font-bold px-1.5 py-0.2 rounded" :class="statusBadge(activeChatTask.status)">{{ statusLabel(activeChatTask.status) }}</span>
           </div>
-          <button @click="activeChatTask = null" class="w-8 h-8 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-sm hover:text-white">
-            <i class="fa-solid fa-xmark"></i>
-          </button>
+          <h3 class="text-xs font-bold text-white truncate max-w-[250px] mt-0.5">{{ activeChatTask.title }}</h3>
+        </div>
+        <button @click="closeChat" class="w-8 h-8 rounded-full bg-slate-800 text-slate-300 flex items-center justify-center text-sm hover:text-white transition">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <!-- Лента сообщений -->
+      <div ref="chatContainer" class="flex-1 overflow-y-auto overscroll-contain p-3.5 space-y-2.5 bg-slate-950/80">
+        
+        <!-- Лоадер при открытии чата -->
+        <div v-if="isChatLoading" class="flex flex-col items-center justify-center h-full text-slate-400 py-12 space-y-2">
+          <i class="fa-solid fa-circle-notch fa-spin text-2xl text-indigo-500"></i>
+          <span class="text-xs font-semibold">Загрузка сообщений...</span>
         </div>
 
-        <div ref="chatContainer" class="flex-1 overflow-y-auto p-3.5 space-y-2.5 bg-slate-950/40">
-          <div v-if="chatMessages.length === 0" class="text-center text-slate-500 text-xs py-8">
-            Сообщений пока нет.
-          </div>
+        <div v-else-if="chatMessages.length === 0" class="text-center text-slate-500 text-xs py-12">
+          Сообщений пока нет. Напишите первое сообщение!
+        </div>
 
-          <div v-for="m in chatMessages" :key="m.id" :class="isMyMessage(m) ? 'justify-end' : 'justify-start'" class="flex">
-            <div :class="isMyMessage(m) ? 'bg-indigo-600 text-white rounded-tr-none' : (m.message_type === 'REDFLAG' ? 'bg-red-950/80 border border-red-800 text-red-200' : 'bg-slate-800 text-slate-200 rounded-tl-none')" class="max-w-[80%] rounded-2xl p-2.5 shadow-sm text-xs space-y-1">
-              
-              <div class="flex justify-between items-center gap-3 text-[9px] opacity-75 font-semibold">
-                <span>{{ m.sender_name }} ({{ formatRoleName(m.sender_role) }})</span>
-                <span>{{ formatLocalTimeOnly(m.created_at) }}</span>
-              </div>
+        <div v-else v-for="m in chatMessages" :key="m.id" :class="isMyMessage(m) ? 'justify-end' : 'justify-start'" class="flex">
+          <div :class="isMyMessage(m) ? 'bg-indigo-600 text-white rounded-tr-none' : (m.message_type === 'REDFLAG' ? 'bg-red-950/80 border border-red-800 text-red-200' : 'bg-slate-800 text-slate-200 rounded-tl-none')" class="max-w-[82%] rounded-2xl p-2.5 shadow-md text-xs space-y-1">
+            
+            <div class="flex justify-between items-center gap-3 text-[9px] opacity-75 font-semibold">
+              <span>{{ m.sender_name }} ({{ formatRoleName(m.sender_role) }})</span>
+              <span>{{ formatLocalTimeOnly(m.created_at) }}</span>
+            </div>
 
-              <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
+            <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
 
-              <div v-if="m.message_type === 'VOICE'" class="py-1">
-                <audio :src="m.media_url" controls class="h-8 w-48"></audio>
-              </div>
+            <div v-if="m.message_type === 'VOICE'" class="py-1">
+              <audio :src="m.media_url" controls class="h-8 w-48"></audio>
+            </div>
 
-              <div v-if="m.message_type === 'IMAGE'" class="py-1">
-                <img :src="m.media_url" class="rounded-lg max-h-44 object-cover">
-              </div>
+            <div v-if="m.message_type === 'IMAGE'" class="py-1">
+              <img :src="m.media_url" class="rounded-lg max-h-44 object-cover">
+            </div>
 
-              <div class="text-right text-[10px] leading-none pt-0.5">
-                <span v-if="isMyMessage(m)" :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
-                  {{ m.is_read ? '✓✓' : '✓' }}
-                </span>
-              </div>
+            <div class="text-right text-[10px] leading-none pt-0.5">
+              <span v-if="isMyMessage(m)" :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
+                {{ m.is_read ? '✓✓' : '✓' }}
+              </span>
             </div>
           </div>
         </div>
-
-        <!-- ПАНЕЛЬ ВВОДА ИЛИ БЛОКИРОВКА ЕСЛИ В АРХИВЕ -->
-        <div v-if="activeChatTask.status === 'ARCHIVED'" class="p-3 bg-slate-900 border-t border-slate-800 text-center text-xs text-slate-400 font-semibold flex items-center justify-center gap-2">
-          <i class="fa-solid fa-lock text-slate-500"></i>
-          <span>Задача закрыта в архив. Чат только для чтения.</span>
-        </div>
-
-        <div v-else class="p-2.5 border-t border-slate-800 bg-slate-900 space-y-2">
-          <div class="flex items-center gap-1.5">
-            <label class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 flex items-center justify-center cursor-pointer hover:bg-slate-700 text-sm">
-              <i class="fa-solid fa-paperclip"></i>
-              <input type="file" accept="image/*" @change="uploadChatImage" class="hidden">
-            </label>
-
-            <button @click="toggleChatVoice" :class="isChatRecording ? 'bg-red-500 animate-pulse text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'" class="w-9 h-9 rounded-xl flex items-center justify-center text-sm">
-              <i :class="isChatRecording ? 'fa-solid fa-stop' : 'fa-solid fa-microphone'"></i>
-            </button>
-
-            <input v-model="chatInput" @keyup.enter="sendChatMessage" placeholder="Сообщение..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white">
-
-            <button @click="sendChatMessage" class="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center text-sm hover:bg-indigo-500">
-              <i class="fa-solid fa-paper-plane"></i>
-            </button>
-          </div>
-        </div>
-
       </div>
+
+      <!-- Панель ввода или плашка только для чтения -->
+      <div v-if="activeChatTask.status === 'ARCHIVED'" class="p-3 bg-slate-900 border-t border-slate-800 text-center text-xs text-slate-400 font-semibold flex items-center justify-center gap-2 shrink-0">
+        <i class="fa-solid fa-lock text-slate-500"></i>
+        <span>Задача закрыта в архив. Чат доступен только для чтения.</span>
+      </div>
+
+      <div v-else class="p-2.5 border-t border-slate-800 bg-slate-900 space-y-2 shrink-0">
+        <div class="flex items-center gap-1.5">
+          <label class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 flex items-center justify-center cursor-pointer hover:bg-slate-700 text-sm">
+            <i class="fa-solid fa-paperclip"></i>
+            <input type="file" accept="image/*" @change="uploadChatImage" class="hidden">
+          </label>
+
+          <button @click="toggleChatVoice" :class="isChatRecording ? 'bg-red-500 animate-pulse text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'" class="w-9 h-9 rounded-xl flex items-center justify-center text-sm">
+            <i :class="isChatRecording ? 'fa-solid fa-stop' : 'fa-solid fa-microphone'"></i>
+          </button>
+
+          <input v-model="chatInput" @keyup.enter="sendChatMessage" placeholder="Сообщение..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+
+          <button @click="sendChatMessage" class="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center text-sm hover:bg-indigo-500">
+            <i class="fa-solid fa-paper-plane"></i>
+          </button>
+        </div>
+      </div>
+
     </div>
 
   </div>
 
   <script>
-    const { createApp, ref, computed, onMounted } = Vue;
+    const { createApp, ref, computed, onMounted, nextTick } = Vue;
     createApp({
       setup() {
         const currentUser = ref(null);
@@ -1035,6 +1053,8 @@ async def index():
         const chatMessages = ref([]);
         const chatInput = ref('');
         const isChatRecording = ref(false);
+        const isChatLoading = ref(false);
+        const chatContainer = ref(null);
         let chatRecorder = null;
         let chatAudioChunks = [];
 
@@ -1082,7 +1102,6 @@ async def index():
           return m.sender_id === currentUser.value.id;
         };
 
-        // ХЕЛПЕРЫ МЕСТНОГО ВРЕМЕНИ
         const formatLocalDT = (isoStr) => {
           if (!isoStr) return '';
           const d = new Date(isoStr);
@@ -1105,10 +1124,17 @@ async def index():
           });
         };
 
+        // ДЕДЛАЙН: Текущий день, час и минута
         const getDefaultLocalDateTimeInput = () => {
-          const target = new Date(Date.now() + 24 * 60 * 60 * 1000);
-          const offset = target.getTimezoneOffset() * 60000;
-          return new Date(target.getTime() - offset).toISOString().slice(0, 16);
+          const now = new Date();
+          const offset = now.getTimezoneOffset() * 60000;
+          return new Date(now.getTime() - offset).toISOString().slice(0, 16);
+        };
+
+        const scrollToBottom = () => {
+          if (chatContainer.value) {
+            chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+          }
         };
 
         const handleLogin = async () => {
@@ -1140,9 +1166,10 @@ async def index():
         };
 
         const loadData = async () => {
+          if (!currentUser.value) return;
           try {
             const [rTasks, rUsers] = await Promise.all([
-              fetch('/api/tasks').then(r => r.json()),
+              fetch(`/api/tasks?viewer_user_id=${currentUser.value.id}`).then(r => r.json()),
               fetch('/api/users').then(r => r.json())
             ]);
             tasks.value = rTasks;
@@ -1254,9 +1281,8 @@ async def index():
           fd.append('lead_id', draft.lead_id || employeesOnly.value[0]?.id || 3);
           fd.append('priority', draft.priority || 'URGENT');
           
-          // Отправка в стандарте UTC ISO
           const d = new Date(draft.deadline);
-          const deadlineIso = isNaN(d.getTime()) ? new Date(Date.now() + 86400000).toISOString() : d.toISOString();
+          const deadlineIso = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
           fd.append('deadline', deadlineIso);
           
           fd.append('title', draft.title || '');
@@ -1302,16 +1328,32 @@ async def index():
           await loadData();
         };
 
+        // ОТКРЫТИЕ ЧАТА (СБРОС БЕЙДЖА, ИЗОЛЯЦИЯ СКРОЛЛА, ЛОАДЕР)
         const openChat = async (task) => {
           activeChatTask.value = task;
+          chatMessages.value = [];
+          isChatLoading.value = true;
+          document.body.classList.add('overflow-hidden');
+          task.unread_count = 0; // Мгновенный отклик в интерфейсе
+          
           await loadMessages();
+          isChatLoading.value = false;
+          await nextTick();
+          scrollToBottom();
+        };
+
+        const closeChat = () => {
+          activeChatTask.value = null;
+          document.body.classList.remove('overflow-hidden');
         };
 
         const loadMessages = async () => {
           if (!activeChatTask.value || !currentUser.value) return;
           try {
-            const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages?viewer_role=${currentUser.value.role}&viewer_user_id=${currentUser.value.id}`);
+            const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages?viewer_user_id=${currentUser.value.id}`);
             chatMessages.value = await res.json();
+            await nextTick();
+            scrollToBottom();
           } catch (e) {
             console.error(e);
           }
@@ -1449,9 +1491,9 @@ async def index():
           inboxTasks, activeTasks, reviewTasks, archiveTasks,
           displayedOwnerTasks, displayedDeputyTasks,
           myActiveTasks, myReviewTasks, myArchiveTasks, displayedEmpTasks, isMyMessage,
-          activeChatTask, chatMessages, chatInput, isChatRecording,
+          activeChatTask, chatMessages, chatInput, isChatRecording, isChatLoading, chatContainer,
           handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, submitTaskForReview, rejectTask,
-          completeTask, openChat, sendChatMessage, toggleChatVoice, uploadChatImage, sendRedFlag,
+          completeTask, openChat, closeChat, sendChatMessage, toggleChatVoice, uploadChatImage, sendRedFlag,
           formatLocalDT, formatLocalTimeOnly,
           getDeadlineCountdown, getDeadlineBadge, priorityBadge, priorityLabel, statusBadge, statusLabel,
           formatRoleName, formatTime
