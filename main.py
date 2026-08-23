@@ -29,19 +29,18 @@ async def get_db():
 
 SYSTEM_PROMPT = """
 Ты — операционный директор компании. Преврати поручение владельца в четкое техническое задание для Замдиректора.
-Верни ТОЛЬКО валидный JSON (без лишних слов и без markdown):
+Верни ТОЛЬКО чистый валидный JSON без кавычек markdown и лишнего текста:
 {
   "title": "Краткий заголовок (до 6 слов)",
   "ai_summary": "Суть задачи в 2 предложениях",
-  "definition_of_done": "1. Первый пункт\\n2. Второй пункт",
+  "definition_of_done": "1. Первый результат\\n2. Второй результат",
   "task_type": "SOLO",
   "is_urgent": false
 }
 """
 
 def query_gemini_direct(parts_list: list) -> dict:
-    # Пробуем актуальные модели
-    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
     
     for model_name in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
@@ -53,7 +52,7 @@ def query_gemini_direct(parts_list: list) -> dict:
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=25) as resp:
                 res_json = json.loads(resp.read().decode("utf-8"))
                 raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
                 match = re.search(r'\{.*\}', raw_text, re.DOTALL)
@@ -63,8 +62,8 @@ def query_gemini_direct(parts_list: list) -> dict:
             error_msg = e.read().decode('utf-8', errors='ignore')
             print(f"Ошибка Gemini ({model_name}): {e.code} - {error_msg}")
             continue
-        except Exception as e:
-            print(f"Ошибка вызова {model_name}: {e}")
+        except Exception as err:
+            print(f"Ошибка вызова {model_name}: {err}")
             continue
 
     return {
@@ -260,7 +259,7 @@ async def index():
         <div class="pt-3 border-t border-slate-800 text-left space-y-2">
           <span class="text-[10px] font-bold text-slate-400 uppercase">Или введите текстом:</span>
           <div class="flex gap-2">
-            <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Например: Узнать цену напитка..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2.5 rounded-xl text-white">
+            <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Например: Узнать цену сахара..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2.5 rounded-xl text-white">
             <button @click="sendTextTask" class="bg-indigo-600 hover:bg-indigo-500 px-3.5 rounded-xl text-white font-bold text-xs">
               <i class="fa-solid fa-paper-plane"></i>
             </button>
