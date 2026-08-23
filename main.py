@@ -40,23 +40,31 @@ SYSTEM_PROMPT = """
 """
 
 def query_gemini_direct(parts_list: list) -> dict:
-    models = ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-2.0-flash"]
+    # Пробуем актуальные модели
+    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
     
     for model_name in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-        payload = {"contents": [{"parts": parts_list}]}
+        payload = {
+            "contents": [{"parts": parts_list}],
+            "generationConfig": {"temperature": 0.2}
+        }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         
         try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 res_json = json.loads(resp.read().decode("utf-8"))
                 raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
                 match = re.search(r'\{.*\}', raw_text, re.DOTALL)
                 if match:
                     return json.loads(match.group(0))
-        except Exception as err:
-            print(f"Попытка с {model_name}: {err}")
+        except urllib.error.HTTPError as e:
+            error_msg = e.read().decode('utf-8', errors='ignore')
+            print(f"Ошибка Gemini ({model_name}): {e.code} - {error_msg}")
+            continue
+        except Exception as e:
+            print(f"Ошибка вызова {model_name}: {e}")
             continue
 
     return {
