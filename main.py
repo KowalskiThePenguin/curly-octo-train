@@ -19,16 +19,23 @@ if GEMINI_API_KEY:
 
 db_pool = None
 
-@app.on_event("startup")
-async def startup():
+async def get_db():
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    if db_pool is None:
+        # statement_cache_size=0 обязателен для работы через Supabase Pooler
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            statement_cache_size=0,
+            min_size=1,
+            max_size=5
+        )
+    return db_pool
 
 SYSTEM_PROMPT = """
-Ты — операционный директор компании. Преврати поручение владельца в четкое техническое задание для Замдиректора.
-Верни ТОЛЬКО чистый валидный JSON без лишнего текста:
+Ты — операционный директор. Преврати поручение владельца в четкое техническое задание для Замдиректора.
+Верни ТОЛЬКО валидный JSON в таком формате (без markdown и лишних слов):
 {
-  "title": "Краткий заголовок задачи (до 6 слов)",
+  "title": "Краткий заголовок (до 6 слов)",
   "ai_summary": "Суть задачи в 2 предложениях",
   "definition_of_done": "1. Первый результат\\n2. Второй результат",
   "task_type": "SOLO",
@@ -36,19 +43,29 @@ SYSTEM_PROMPT = """
 }
 """
 
-def extract_json(text: str) -> dict:
-    cleaned = re.sub(r"```(?:json)?", "", text).strip()
-    return json.loads(cleaned)
+def parse_ai_json(text: str) -> dict:
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+    return {
+        "title": "Новое поручение",
+        "ai_summary": text[:200],
+        "definition_of_done": "1. Выполнить поставленную задачу",
+        "task_type": "SOLO",
+        "is_urgent": False
+    }
 
 @app.get("/api/users")
 async def get_users():
-    async with db_pool.acquire() as conn:
+    pool = await get_db()
+    async with pool.acquire() as conn:
         users = await conn.fetch("SELECT id, full_name, role, department FROM users WHERE is_active = TRUE ORDER BY id ASC")
         return [dict(u) for u in users]
 
 @app.get("/api/tasks")
 async def get_tasks():
-    async with db_pool.acquire() as conn:
+    pool = await get_db()
+    async with pool.acquire() as conn:
         tasks = await conn.fetch("""
             SELECT t.*, m.file_url as voice_url, u.full_name as lead_name
             FROM tasks t
@@ -72,15 +89,17 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         if "octet-stream" in mime:
             mime = "audio/webm"
 
+        # Универсальный запрос к Gemini
         response = gemini_model.generate_content([
             {"mime_type": mime, "data": audio_bytes},
             SYSTEM_PROMPT
         ])
         
-        parsed = extract_json(response.text)
+        parsed = parse_ai_json(response.text)
         audio_b64 = f"data:{mime};base64," + base64.b64encode(audio_bytes).decode('utf-8')
 
-        async with db_pool.acquire() as conn:
+        pool = await get_db()
+        async with pool.acquire() as conn:
             task_id = await conn.fetchval("""
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, created_by, is_urgent)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7)
@@ -95,18 +114,19 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         return {"status": "ok", "task_id": task_id, "data": parsed}
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Ошибка обработки: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 @app.post("/api/tasks/create-text")
 async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
     try:
         response = gemini_model.generate_content([
-            f"Текст поручения шефа: {text}",
+            f"Поручение шефа: {text}",
             SYSTEM_PROMPT
         ])
-        parsed = extract_json(response.text)
+        parsed = parse_ai_json(response.text)
 
-        async with db_pool.acquire() as conn:
+        pool = await get_db()
+        async with pool.acquire() as conn:
             task_id = await conn.fetchval("""
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, created_by, is_urgent)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7)
@@ -120,7 +140,8 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
 
 @app.post("/api/tasks/{task_id}/assign")
 async def assign_task(task_id: int, lead_id: int = Form(...), deadline: str = Form(...)):
-    async with db_pool.acquire() as conn:
+    pool = await get_db()
+    async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE tasks 
             SET lead_user_id = $1, deadline = $2::timestamptz, status = 'IN_PROGRESS'
@@ -136,7 +157,8 @@ async def assign_task(task_id: int, lead_id: int = Form(...), deadline: str = Fo
 
 @app.post("/api/tasks/{task_id}/approve-checkpoint")
 async def approve_checkpoint(task_id: int, cp_type: str = Form(...)):
-    async with db_pool.acquire() as conn:
+    pool = await get_db()
+    async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE task_checkpoints 
             SET status = 'APPROVED'
@@ -146,7 +168,8 @@ async def approve_checkpoint(task_id: int, cp_type: str = Form(...)):
 
 @app.post("/api/tasks/{task_id}/checkpoint-report")
 async def submit_report(task_id: int, cp_type: str = Form(...), report_text: str = Form(...)):
-    async with db_pool.acquire() as conn:
+    pool = await get_db()
+    async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE task_checkpoints 
             SET status = 'SUBMITTED', report_text = $1, submitted_at = NOW()
@@ -156,7 +179,8 @@ async def submit_report(task_id: int, cp_type: str = Form(...), report_text: str
 
 @app.post("/api/tasks/{task_id}/red-flag")
 async def red_flag(task_id: int, reason: str = Form(...)):
-    async with db_pool.acquire() as conn:
+    pool = await get_db()
+    async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE tasks SET risks_notes = $1, is_urgent = TRUE WHERE id = $2
         """, f"🚨 БЛОКЕР: {reason}", task_id)
@@ -164,7 +188,8 @@ async def red_flag(task_id: int, reason: str = Form(...)):
 
 @app.post("/api/tasks/{task_id}/complete")
 async def complete_task(task_id: int):
-    async with db_pool.acquire() as conn:
+    pool = await get_db()
+    async with pool.acquire() as conn:
         await conn.execute("UPDATE tasks SET status = 'ARCHIVED', completed_at = NOW() WHERE id = $1", task_id)
     return {"status": "completed"}
 
@@ -177,9 +202,9 @@ async def index():
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
       <title>Task Control Core</title>
-      <script src="[https://cdn.tailwindcss.com](https://cdn.tailwindcss.com)"></script>
-      <script src="[https://unpkg.com/vue@3/dist/vue.global.js](https://unpkg.com/vue@3/dist/vue.global.js)"></script>
-      <link rel="stylesheet" href="[https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css](https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css)">
+      <script src="https://cdn.tailwindcss.com"></script>
+      <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+      <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
       <style>[v-cloak] { display: none; }</style>
     </head>
     <body class="bg-slate-950 text-slate-100 min-h-screen font-sans">
@@ -393,7 +418,7 @@ async def index():
                         throw new Error(err.detail || 'Ошибка сервера');
                       }
                       await loadData();
-                      alert('✅ Поручение успешно создано и передано Заму!');
+                      alert('✅ Поручение создано и передано Заму!');
                     } catch (err) {
                       alert('❌ ' + err.message);
                     } finally {
@@ -404,7 +429,7 @@ async def index():
                   mediaRecorder.start();
                   isRecording.value = true;
                 } catch (err) {
-                  alert('Разрешите доступ к микрофону в настройках браузера!');
+                  alert('Разрешите доступ к микрофону в браузере!');
                 }
               } else {
                 mediaRecorder.stop();
