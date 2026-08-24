@@ -389,7 +389,7 @@ async def assign_task(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# 1. РЕДАКТИРОВАНИЕ ДЕТАЛЕЙ ЗАДАЧИ ДИРЕКТОРОМ (С УВЕДОМЛЕНИЕМ В ЧАТ)
+# РЕДАКТИРОВАНИЕ ДЕТАЛЕЙ ЗАДАЧИ С ПОЛНЫМ ДИФФОМ (БЫЛО -> СТАЛО)
 @app.post("/api/tasks/{task_id}/update-details")
 async def update_task_details(
     task_id: int,
@@ -399,6 +399,8 @@ async def update_task_details(
     project_group: str = Form(...),
     priority: str = Form(...),
     deadline: str = Form(...),
+    formatted_old_deadline: str = Form(""),
+    formatted_new_deadline: str = Form(""),
     user_name: str = Form("Жамолиддин")
 ):
     try:
@@ -412,6 +414,11 @@ async def update_task_details(
 
         pool = await get_db()
         async with pool.acquire() as conn:
+            old_task = await conn.fetchrow("""
+                SELECT title, ai_summary, definition_of_done, project_group, priority 
+                FROM tasks WHERE id = $1
+            """, task_id)
+
             await conn.execute("""
                 UPDATE tasks 
                 SET title = $1, 
@@ -424,13 +431,24 @@ async def update_task_details(
             """, title, ai_summary, definition_of_done, project_group, priority, dt_deadline, task_id)
 
             priority_map = {'URGENT': '🔴 Оперативно', 'NORMAL': '🟡 Умеренно', 'FUTURE': '🔵 На будущее'}
-            sys_msg = (
-                f"✏️ Директор {user_name} обновил параметры задачи:\n"
-                f"• Заголовок: {title}\n"
-                f"• Группа: {project_group}\n"
-                f"• Важность: {priority_map.get(priority, priority)}\n"
-                f"• Срок: {deadline[:16].replace('T', ' ')}"
-            )
+            
+            changes = []
+            if old_task:
+                if old_task['title'] != title:
+                    changes.append(f"• Заголовок: «{old_task['title']}» ➔ «{title}»")
+                if old_task['project_group'] != project_group:
+                    changes.append(f"• Проект: «{old_task['project_group']}» ➔ «{project_group}»")
+                if old_task['priority'] != priority:
+                    changes.append(f"• Важность: {priority_map.get(old_task['priority'], old_task['priority'])} ➔ {priority_map.get(priority, priority)}")
+                if formatted_old_deadline and formatted_new_deadline and formatted_old_deadline != formatted_new_deadline:
+                    changes.append(f"• Дедлайн: {formatted_old_deadline} ➔ {formatted_new_deadline}")
+                if old_task['ai_summary'] != ai_summary or old_task['definition_of_done'] != definition_of_done:
+                    changes.append("• ТЗ и критерии сдачи (DoD) обновлены")
+
+            if changes:
+                sys_msg = f"✏️ Директор {user_name} изменил параметры задачи:\n" + "\n".join(changes)
+            else:
+                sys_msg = f"✏️ Директор {user_name} сохранил параметры задачи без изменений."
 
             await conn.execute("""
                 INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
@@ -443,7 +461,7 @@ async def update_task_details(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# 2. ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ И ЛИДА (С ПРОВЕРКОЙ И УВЕДОМЛЕНИЕМ В ЧАТ)
+# ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ И ЛИДА С ДИФФОМ
 @app.post("/api/tasks/{task_id}/update-team")
 async def update_task_team(
     task_id: int,
@@ -465,9 +483,11 @@ async def update_task_team(
                 SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1
             """, task_id)
 
-            lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
-            team_rows = await conn.fetch("SELECT full_name FROM users WHERE id = ANY($1)", parsed_assignees)
-            team_str = ", ".join([r['full_name'] for r in team_rows])
+            old_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", old_task['lead_user_id']) if old_task else 'Не назначен'
+            new_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
+            
+            new_team_rows = await conn.fetch("SELECT full_name FROM users WHERE id = ANY($1)", parsed_assignees)
+            new_team_str = ", ".join([r['full_name'] for r in new_team_rows])
 
             await conn.execute("""
                 UPDATE tasks 
@@ -476,7 +496,8 @@ async def update_task_team(
                 WHERE id = $3
             """, lead_id, parsed_assignees, task_id)
 
-            sys_msg = f"👥 Директор {user_name} изменил состав команды:\n👑 Лид: {lead_name}\n👥 Исполнители: {team_str}"
+            lead_change_str = f"👑 Лид: {old_lead_name} ➔ {new_lead_name}" if old_lead_name != new_lead_name else f"👑 Лид: {new_lead_name}"
+            sys_msg = f"👥 Директор {user_name} обновил состав команды:\n{lead_change_str}\n👥 Исполнители: {new_team_str}"
 
             await conn.execute("""
                 INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
@@ -915,7 +936,6 @@ async def index():
                   ⏰ {{ getDeadlineCountdown(t.deadline) }}
                 </span>
               </div>
-              <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="statusBadge(t.status)">{{ statusLabel(t.status) }}</span>
             </div>
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
@@ -930,13 +950,14 @@ async def index():
               </div>
             </div>
 
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
                   <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
                 </button>
                 <div class="flex-1 space-y-1">
-                  <div @click="seekAudio('task_' + t.id, $event)" @touchmove="handleTouchSeek('task_' + t.id, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
                          :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
@@ -1013,18 +1034,18 @@ async def index():
                   ⏰ {{ getDeadlineCountdown(t.deadline) }}
                 </span>
               </div>
-              <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="statusBadge(t.status)">{{ statusLabel(t.status) }}</span>
             </div>
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
                   <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
                 </button>
                 <div class="flex-1 space-y-1">
-                  <div @click="seekAudio('task_' + t.id, $event)" @touchmove="handleTouchSeek('task_' + t.id, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
                          :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
@@ -1155,7 +1176,6 @@ async def index():
                 </div>
               </div>
 
-              <!-- КНОПКИ РЕДАКТИРОВАНИЯ ДЕТАЛЕЙ И СОСТАВА КОМАНДЫ ДИРЕКТОРОМ -->
               <div class="grid grid-cols-2 gap-2 pt-1 border-t border-slate-800/80">
                 <button @click="openEditDetailsModal(t)" class="py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-indigo-300 text-xs font-bold border border-slate-700 flex items-center justify-center gap-1.5 transition">
                   <i class="fa-solid fa-pen-to-square"></i> Изменить ТЗ/Срок
@@ -1234,13 +1254,14 @@ async def index():
               </div>
             </div>
 
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
                   <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
                 </button>
                 <div class="flex-1 space-y-1">
-                  <div @click="seekAudio('task_' + t.id, $event)" @touchmove="handleTouchSeek('task_' + t.id, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
                          :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
@@ -1334,9 +1355,7 @@ async def index():
 
     </div>
 
-    <!-- ========================================== -->
     <!-- МОДАЛЬНОЕ ОКНО: РЕДАКТИРОВАНИЕ ДЕТАЛЕЙ ЗАДАЧИ -->
-    <!-- ========================================== -->
     <div v-if="editingDetailsTask" class="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-center justify-center p-3.5">
       <div class="bg-slate-900 border border-slate-800 rounded-3xl p-5 max-w-sm w-full space-y-3.5 shadow-2xl">
         <div class="flex justify-between items-center">
@@ -1395,9 +1414,7 @@ async def index():
       </div>
     </div>
 
-    <!-- ========================================== -->
     <!-- МОДАЛЬНОЕ ОКНО: УПРАВЛЕНИЕ КОМАНДОЙ И ЛИДОМ -->
-    <!-- ========================================== -->
     <div v-if="managingTeamTask" class="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-center justify-center p-3.5">
       <div class="bg-slate-900 border border-slate-800 rounded-3xl p-5 max-w-sm w-full space-y-3.5 shadow-2xl">
         <div class="flex justify-between items-center">
@@ -1410,7 +1427,6 @@ async def index():
         </div>
 
         <div class="space-y-3 text-xs">
-          <!-- Чекбоксы выбора участников -->
           <div class="bg-slate-950 p-3 rounded-2xl border border-slate-800 space-y-2">
             <label class="block text-[10px] font-bold text-slate-400 uppercase">Выберите участников (минимум 1):</label>
             <div class="space-y-1.5">
@@ -1424,7 +1440,6 @@ async def index():
             </div>
           </div>
 
-          <!-- Выбор Лида из отмеченных -->
           <div>
             <label class="block text-[10px] font-bold text-amber-300 mb-1">👑 Назначить Лида команды:</label>
             <select v-model="teamManageForm.lead_id" class="w-full bg-slate-950 border border-amber-500/60 p-2.5 rounded-xl text-amber-300 font-bold outline-none focus:border-amber-400">
@@ -1439,9 +1454,7 @@ async def index():
       </div>
     </div>
 
-    <!-- ========================================== -->
     <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (ENTERPRISE VIEW) -->
-    <!-- ========================================== -->
     <div v-if="activeChatTask" class="fixed inset-0 bg-slate-950 z-50 flex flex-col h-[100dvh] w-full max-w-md mx-auto overscroll-contain">
       
       <div class="p-3.5 border-b border-slate-800/80 flex justify-between items-center bg-slate-900/90 backdrop-blur-xl shrink-0 shadow-lg">
@@ -1492,7 +1505,7 @@ async def index():
                   <i :class="activeAudioId === 'msg_' + m.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
                 </button>
                 <div class="flex-1 space-y-1">
-                  <div @click="seekAudio('msg_' + m.id, $event)" @touchmove="handleTouchSeek('msg_' + m.id, $event)" class="h-5 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div @click="seekAudio('msg_' + m.id, m.media_url, $event)" @touchmove="handleTouchSeek('msg_' + m.id, m.media_url, $event)" class="h-5 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(m.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
                          :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? (isMyMessage(m) ? 'bg-white' : 'bg-indigo-400') : (isMyMessage(m) ? 'bg-indigo-400/50' : 'bg-slate-700')"
@@ -1547,7 +1560,7 @@ async def index():
             <i :class="activeAudioId === 'preview_voice' && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
           </button>
           <div class="flex-1 space-y-1">
-            <div @click="seekAudio('preview_voice', $event)" @touchmove="handleTouchSeek('preview_voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+            <div @click="seekAudio('preview_voice', recordedVoiceUrl, $event)" @touchmove="handleTouchSeek('preview_voice', recordedVoiceUrl, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
               <div v-for="(h, idx) in getWaveformBars(999)" :key="idx" 
                    :style="{ height: h + '%' }" 
                    :class="(activeAudioId === 'preview_voice' && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
@@ -1662,10 +1675,10 @@ async def index():
         const filterExecutor = ref('ALL');
         const filterUrgentOnly = ref(false);
 
-        // МОДАЛЬНЫЕ ОКНА РЕДАКТИРОВАНИЯ ДЛЯ ДИРЕКТОРА
+        // МОДАЛЬНЫЕ ОКНА
         const editingDetailsTask = ref(null);
         const editDetailsForm = ref({
-          title: '', ai_summary: '', definition_of_done: '', project_group: '', priority: '', deadline: ''
+          title: '', ai_summary: '', definition_of_done: '', project_group: '', priority: '', deadline: '', old_deadline_str: ''
         });
 
         const managingTeamTask = ref(null);
@@ -1848,12 +1861,15 @@ async def index():
           return bars;
         };
 
-        const togglePlayAudio = (id, url) => {
-          if (activeAudioId.value === id && globalAudio && globalAudio.src === url) {
-            if (isAudioPlaying.value) {
-              globalAudio.pause();
-              isAudioPlaying.value = false;
-            } else {
+        // УНИВЕРСАЛЬНЫЙ ПЛЕЕР С ПОЛНОЙ ПЕРЕМОТКОЙ
+        const playAudioAt = (id, url, targetRatio = null) => {
+          if (activeAudioId.value === id && globalAudio) {
+            if (targetRatio !== null && globalAudio.duration) {
+              globalAudio.currentTime = targetRatio * globalAudio.duration;
+              audioCurrentTime.value = globalAudio.currentTime;
+              audioProgress.value = targetRatio;
+            }
+            if (!isAudioPlaying.value) {
               globalAudio.play();
               isAudioPlaying.value = true;
             }
@@ -1869,11 +1885,15 @@ async def index():
           activeAudioId.value = id;
           isAudioPlaying.value = true;
           audioCurrentTime.value = 0;
-          audioProgress.value = 0;
+          audioProgress.value = targetRatio || 0;
 
           globalAudio = new Audio(url);
           globalAudio.onloadedmetadata = () => {
             audioDuration.value = globalAudio.duration;
+            if (targetRatio !== null) {
+              globalAudio.currentTime = targetRatio * globalAudio.duration;
+              audioCurrentTime.value = globalAudio.currentTime;
+            }
           };
           globalAudio.ontimeupdate = () => {
             if (globalAudio && globalAudio.duration) {
@@ -1888,36 +1908,40 @@ async def index():
             audioCurrentTime.value = 0;
           };
           globalAudio.play().catch(e => {
-            console.error("Audio playback error:", e);
+            console.error("Audio error:", e);
             isAudioPlaying.value = false;
           });
         };
 
-        const seekAudio = (id, event) => {
+        const togglePlayAudio = (id, url) => {
+          if (activeAudioId.value === id && globalAudio) {
+            if (isAudioPlaying.value) {
+              globalAudio.pause();
+              isAudioPlaying.value = false;
+            } else {
+              globalAudio.play();
+              isAudioPlaying.value = true;
+            }
+            return;
+          }
+          playAudioAt(id, url, null);
+        };
+
+        const seekAudio = (id, url, event) => {
           const rect = event.currentTarget.getBoundingClientRect();
           const clickX = event.clientX - rect.left;
           const ratio = Math.max(0, Math.min(1, clickX / rect.width));
-
-          if (activeAudioId.value === id && globalAudio && globalAudio.duration) {
-            globalAudio.currentTime = ratio * globalAudio.duration;
-            audioProgress.value = ratio;
-            audioCurrentTime.value = globalAudio.currentTime;
-          }
+          playAudioAt(id, url, ratio);
         };
 
-        const handleTouchSeek = (id, event) => {
+        const handleTouchSeek = (id, url, event) => {
           if (event.touches && event.touches[0]) {
             const touch = event.touches[0];
             const target = event.currentTarget;
             const rect = target.getBoundingClientRect();
             const touchX = touch.clientX - rect.left;
             const ratio = Math.max(0, Math.min(1, touchX / rect.width));
-
-            if (activeAudioId.value === id && globalAudio && globalAudio.duration) {
-              globalAudio.currentTime = ratio * globalAudio.duration;
-              audioProgress.value = ratio;
-              audioCurrentTime.value = globalAudio.currentTime;
-            }
+            playAudioAt(id, url, ratio);
           }
         };
 
@@ -2103,7 +2127,6 @@ async def index():
           }
         };
 
-        // ДИРЕКТОР: ОТКРЫТИЕ И СОХРАНЕНИЕ ДЕТАЛЕЙ ЗАДАЧИ
         const openEditDetailsModal = (task) => {
           editingDetailsTask.value = task;
           let initialDL = getDefaultLocalDateTimeInput();
@@ -2118,7 +2141,8 @@ async def index():
             definition_of_done: task.definition_of_done,
             project_group: task.project_group || 'Проект Кормовая Мука',
             priority: task.priority || 'URGENT',
-            deadline: initialDL
+            deadline: initialDL,
+            old_deadline_str: task.deadline ? formatLocalDT(task.deadline) : 'Не установлен'
           };
         };
 
@@ -2134,6 +2158,9 @@ async def index():
           const d = new Date(editDetailsForm.value.deadline);
           const deadlineIso = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
           fd.append('deadline', deadlineIso);
+          
+          fd.append('formatted_old_deadline', editDetailsForm.value.old_deadline_str);
+          fd.append('formatted_new_deadline', formatLocalDT(deadlineIso));
           fd.append('user_name', currentUser.value.full_name);
 
           try {
@@ -2141,13 +2168,12 @@ async def index():
             if (!res.ok) throw new Error('Ошибка обновления параметров');
             editingDetailsTask.value = null;
             await loadData();
-            alert('✅ Детали задачи обновлены, уведомление отправлено в чат!');
+            alert('✅ Детали задачи обновлены, история изменений отправлена в чат!');
           } catch (e) {
             alert('❌ ' + e.message);
           }
         };
 
-        // ДИРЕКТОР: УПРАВЛЕНИЕ КОМАНДОЙ И ЛИДОМ
         const openManageTeamModal = (task) => {
           managingTeamTask.value = task;
           const currentAssignees = (task.assignee_ids && task.assignee_ids.length > 0) ? [...task.assignee_ids] : [task.lead_user_id];
@@ -2163,7 +2189,6 @@ async def index():
             alert('⚠️ В задаче должен оставаться минимум 1 исполнитель!');
             return;
           }
-          // Если снят текущий Лид, выбираем нового Лида из оставшихся
           if (!teamManageForm.value.assignee_ids.includes(teamManageForm.value.lead_id)) {
             teamManageForm.value.lead_id = teamManageForm.value.assignee_ids[0];
           }
@@ -2656,18 +2681,6 @@ async def index():
           return '🔵 На будущее';
         };
 
-        const statusBadge = (s) => {
-          if (s === 'DRAFT') return 'bg-amber-950 text-amber-300';
-          if (s === 'IN_PROGRESS') return 'bg-blue-950 text-blue-300';
-          return 'bg-emerald-950 text-emerald-300';
-        };
-
-        const statusLabel = (s) => {
-          if (s === 'DRAFT') return 'Входящие';
-          if (s === 'IN_PROGRESS') return 'В работе';
-          return 'Архив';
-        };
-
         const formatRoleName = (r) => r === 'OWNER' ? 'Шеф' : (r === 'DEPUTY' ? 'Директор' : 'Исполнитель');
         const formatTime = (s) => `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
 
@@ -2718,7 +2731,7 @@ async def index():
           startVoiceRecording, stopVoiceRecording, cancelVoiceRecording, confirmSendVoice, sendRedFlag,
           onChatScroll, scrollToBottomSmooth,
           formatLocalDT, formatLocalTimeOnly,
-          getDeadlineCountdown, getDeadlineBadge, priorityBadge, priorityLabel, statusBadge, statusLabel,
+          getDeadlineCountdown, getDeadlineBadge, priorityBadge, priorityLabel,
           formatRoleName, formatTime
         };
       }
