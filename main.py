@@ -82,6 +82,8 @@ async def startup():
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result_report TEXT;
+            ALTER TABLE tasks ADD COLUMN IF NOT EXISTS progress INT DEFAULT 0;
+            ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pending_request VARCHAR(30);
 
             CREATE TABLE IF NOT EXISTS task_messages (
                 id SERIAL PRIMARY KEY,
@@ -214,6 +216,7 @@ async def get_tasks(viewer_user_id: int = 1):
         tasks = await conn.fetch("""
             SELECT t.id, t.title, t.raw_input_text, t.ai_summary, t.definition_of_done,
                    t.task_type, t.status, t.priority, t.lead_user_id, t.result_report,
+                   COALESCE(t.progress, 0) as progress, t.pending_request,
                    to_char(t.deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as deadline,
                    to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
                    to_char(t.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as completed_at,
@@ -276,8 +279,8 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         pool = await get_db()
         async with pool.acquire() as conn:
             task_id = await conn.fetchval("""
-                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, created_by, is_urgent, created_at)
-                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, NOW())
+                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, created_by, is_urgent, created_at, progress)
+                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, NOW(), 0)
                 RETURNING id
             """, parsed.get("title", "Голосовое поручение"), "Голосовая аудиозапись Шефа", parsed.get("ai_summary", ""), parsed.get("definition_of_done", ""), parsed.get("task_type", "SOLO"), parsed.get("priority", "URGENT"), user_id, True)
 
@@ -302,8 +305,8 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
         pool = await get_db()
         async with pool.acquire() as conn:
             task_id = await conn.fetchval("""
-                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, created_by, is_urgent, created_at)
-                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, NOW())
+                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, created_by, is_urgent, created_at, progress)
+                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, NOW(), 0)
                 RETURNING id
             """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), user_id, True)
 
@@ -347,7 +350,8 @@ async def assign_task(
                     title = COALESCE($4, title),
                     ai_summary = COALESCE($5, ai_summary),
                     definition_of_done = COALESCE($6, definition_of_done),
-                    status = 'IN_PROGRESS'
+                    status = 'IN_PROGRESS',
+                    progress = 0
                 WHERE id = $7
             """, lead_id, priority, dt_deadline, title, ai_summary, definition_of_done, task_id)
 
@@ -363,43 +367,117 @@ async def assign_task(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-@app.post("/api/tasks/{task_id}/submit-review")
-async def submit_review(
-    task_id: int, 
-    sender_id: int = Form(...), 
-    sender_name: str = Form(...), 
-    report_text: str = Form(...)
+# ПРЯМОЕ УПРАВЛЕНИЕ ЭТАПАМИ ДИРЕКТОРОМ (30% / 70% / АРХИВ)
+@app.post("/api/tasks/{task_id}/set-stage")
+async def set_stage(
+    task_id: int,
+    stage: str = Form(...), # '30', '70', 'ARCHIVE'
+    user_name: str = Form("Жамолиддин")
+):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if stage == 'ARCHIVE':
+            await conn.execute("""
+                UPDATE tasks 
+                SET status = 'ARCHIVED', progress = 100, completed_at = NOW(), pending_request = NULL 
+                WHERE id = $1
+            """, task_id)
+            sys_msg = f"🏁 Директор {user_name} утвердил и перевел задачу в архив."
+        else:
+            prog_val = int(stage)
+            await conn.execute("""
+                UPDATE tasks 
+                SET progress = $1, pending_request = NULL 
+                WHERE id = $2
+            """, prog_val, task_id)
+            sys_msg = f"⚡ Директор {user_name} установил прогресс задачи: {stage}%."
+
+        await conn.execute("""
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+            VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
+        """, task_id, user_name, sys_msg)
+
+    await broadcast_event("stage_updated")
+    return {"status": "ok"}
+
+# ЗАПРОС ЭТАПА ИСПОЛНИТЕЛЕМ (30% / 70% / АРХИВ)
+@app.post("/api/tasks/{task_id}/request-stage")
+async def request_stage(
+    task_id: int,
+    stage: str = Form(...), # '30', '70', 'ARCHIVE'
+    user_id: int = Form(...),
+    user_name: str = Form(...)
 ):
     pool = await get_db()
     async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE tasks 
-            SET status = 'REVIEW', result_report = $1 
+            SET pending_request = $1 
             WHERE id = $2
-        """, report_text, task_id)
+        """, stage, task_id)
+
+        target_str = "сдачу в архив" if stage == 'ARCHIVE' else f"этап {stage}%"
+        sys_msg = f"📌 Исполнитель {user_name} запросил подтверждение на {target_str}."
 
         await conn.execute("""
-            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content)
-            VALUES ($1, $2, 'EMPLOYEE', $3, 'SYSTEM', $4)
-        """, task_id, sender_id, sender_name, f"🏁 Результат сдан на проверку:\n{report_text}")
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+            VALUES ($1, $2, 'EMPLOYEE', $3, 'SYSTEM', $4, NOW())
+        """, task_id, user_id, user_name, sys_msg)
 
-    send_telegram_alert(f"🏁 <b>Задача #{task_id} сдана на проверку!</b>\n<b>Исполнитель:</b> {sender_name}\n<b>Отчет:</b> {report_text}")
-    await broadcast_event("task_submitted")
+    send_telegram_alert(f"📌 <b>Задача #{task_id}: запрос подтверждения</b>\n<b>Исполнитель:</b> {user_name}\n<b>Запрос:</b> {target_str}")
+    await broadcast_event("stage_requested")
     return {"status": "ok"}
 
-@app.post("/api/tasks/{task_id}/reject-review")
-async def reject_review(task_id: int, reason: str = Form(...)):
+# ПОДТВЕРЖДЕНИЕ / ОТКЛОНЕНИЕ ЗАПРОСА ДИРЕКТОРОМ
+@app.post("/api/tasks/{task_id}/confirm-stage-request")
+async def confirm_stage_request(
+    task_id: int,
+    approve: bool = Form(...),
+    user_name: str = Form("Жамолиддин")
+):
     pool = await get_db()
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE tasks SET status = 'IN_PROGRESS' WHERE id = $1", task_id)
+        task = await conn.fetchrow("""
+            SELECT t.pending_request, u.full_name as lead_name 
+            FROM tasks t 
+            LEFT JOIN users u ON u.id = t.lead_user_id 
+            WHERE t.id = $1
+        """, task_id)
+        
+        if not task or not task['pending_request']:
+            raise HTTPException(status_code=400, detail="Нет активного запроса на подтверждение")
+
+        req_stage = task['pending_request']
+        lead_name = task['lead_name'] or 'Исполнитель'
+        target_str = "сдачу в архив" if req_stage == 'ARCHIVE' else f"этап {req_stage}%"
+
+        if approve:
+            if req_stage == 'ARCHIVE':
+                await conn.execute("""
+                    UPDATE tasks 
+                    SET status = 'ARCHIVED', progress = 100, completed_at = NOW(), pending_request = NULL 
+                    WHERE id = $1
+                """, task_id)
+            else:
+                prog_val = int(req_stage)
+                await conn.execute("""
+                    UPDATE tasks 
+                    SET progress = $1, pending_request = NULL 
+                    WHERE id = $2
+                """, prog_val, task_id)
+            sys_msg = f"✅ Директор {user_name} подтвердил запрос ({lead_name}: {target_str})."
+        else:
+            await conn.execute("UPDATE tasks SET pending_request = NULL WHERE id = $1", task_id)
+            sys_msg = f"❌ Директор {user_name} отклонил запрос ({lead_name}: {target_str})."
+
         await conn.execute("""
-            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content)
-            VALUES ($1, 2, 'DEPUTY', 'Жамолиддин', 'SYSTEM', $2)
-        """, task_id, f"⚠️ Задача возвращена на доработку: {reason}")
-    await broadcast_event("task_rejected")
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+            VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
+        """, task_id, user_name, sys_msg)
+
+    await broadcast_event("stage_confirmed")
     return {"status": "ok"}
 
-# GET сообщений БЕЗ вызова SSE-триггера для предотвращения циклов
 @app.get("/api/tasks/{task_id}/messages")
 async def get_messages(task_id: int, viewer_user_id: int = 1):
     pool = await get_db()
@@ -546,18 +624,6 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(
     await broadcast_event("red_flag")
     return {"status": "flagged"}
 
-@app.post("/api/tasks/{task_id}/complete")
-async def complete_task(task_id: int):
-    pool = await get_db()
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE tasks SET status = 'ARCHIVED', completed_at = NOW() WHERE id = $1", task_id)
-        await conn.execute("""
-            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
-            VALUES ($1, 2, 'DEPUTY', 'Жамолиддин', 'SYSTEM', '🏁 Задача утверждена и закрыта в архив', NOW())
-        """, task_id)
-    await broadcast_event("task_completed")
-    return {"status": "completed"}
-
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return """<!DOCTYPE html>
@@ -653,10 +719,9 @@ async def index():
           </div>
         </div>
 
-        <div class="grid grid-cols-4 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
+        <div class="grid grid-cols-3 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
           <button @click="ownerTab = 'inbox'" :class="ownerTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
           <button @click="ownerTab = 'active'" :class="ownerTab === 'active' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">В работе ({{ activeTasks.length }})</button>
-          <button @click="ownerTab = 'review'" :class="ownerTab === 'review' ? 'bg-amber-600 text-white font-bold animate-pulse' : 'text-amber-400 font-bold'" class="py-1.5 rounded-lg text-center">Сдано ({{ reviewTasks.length }})</button>
           <button @click="ownerTab = 'archive'" :class="ownerTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Архив ({{ archiveTasks.length }})</button>
         </div>
 
@@ -670,7 +735,7 @@ async def index():
               <div class="flex flex-wrap items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
                 <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="priorityBadge(t.priority)">{{ priorityLabel(t.priority) }}</span>
-                <span v-if="t.status === 'IN_PROGRESS' || t.status === 'REVIEW'" class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
+                <span v-if="t.status === 'IN_PROGRESS'" class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
                   ⏰ {{ getDeadlineCountdown(t.deadline) }}
                 </span>
               </div>
@@ -678,6 +743,17 @@ async def index():
             </div>
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
+
+            <!-- ПРОГРЕСС-БАР -->
+            <div v-if="t.status === 'IN_PROGRESS'" class="space-y-1">
+              <div class="flex justify-between text-[10px] font-bold">
+                <span class="text-slate-400">Прогресс выполнения:</span>
+                <span :class="t.progress >= 70 ? 'text-emerald-400' : (t.progress >= 30 ? 'text-amber-400' : 'text-indigo-400')">{{ t.progress }}%</span>
+              </div>
+              <div class="w-full bg-slate-950 rounded-full h-1.5 border border-slate-800 overflow-hidden">
+                <div :style="{ width: (t.progress || 0) + '%' }" :class="t.progress >= 70 ? 'bg-emerald-500' : (t.progress >= 30 ? 'bg-amber-500' : 'bg-indigo-500')" class="h-full transition-all duration-300"></div>
+              </div>
+            </div>
 
             <!-- ПЛЕЕР ГОЛОСА ШЕФА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
@@ -730,11 +806,6 @@ async def index():
               </div>
             </div>
 
-            <div v-if="t.status === 'REVIEW'" class="p-2.5 bg-amber-950/30 rounded-xl border border-amber-800/60 text-xs space-y-1">
-              <span class="text-amber-300 font-bold block">📝 Сданный отчет исполнителя:</span>
-              <p class="text-slate-200 whitespace-pre-wrap">{{ t.result_report }}</p>
-            </div>
-
             <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700 transition">
               <i class="fa-solid fa-comments"></i>
               <span>Чат по задаче</span>
@@ -746,10 +817,9 @@ async def index():
 
       <!-- 2. КАБИНЕТ ДИРЕКТОРА (ЖАМОЛИДДИН) -->
       <div v-if="currentUser.role === 'DEPUTY'" class="space-y-4">
-        <div class="grid grid-cols-4 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
+        <div class="grid grid-cols-3 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
           <button @click="deputyTab = 'inbox'" :class="deputyTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
           <button @click="deputyTab = 'active'" :class="deputyTab === 'active' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">В работе ({{ activeTasks.length }})</button>
-          <button @click="deputyTab = 'review'" :class="deputyTab === 'review' ? 'bg-amber-600 text-white font-bold animate-pulse' : 'text-amber-400 font-bold'" class="py-1.5 rounded-lg text-center">Сдано ({{ reviewTasks.length }})</button>
           <button @click="deputyTab = 'archive'" :class="deputyTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Архив ({{ archiveTasks.length }})</button>
         </div>
 
@@ -763,7 +833,7 @@ async def index():
               <div class="flex flex-wrap items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
                 <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="priorityBadge(t.priority)">{{ priorityLabel(t.priority) }}</span>
-                <span v-if="t.status === 'IN_PROGRESS' || t.status === 'REVIEW'" class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
+                <span v-if="t.status === 'IN_PROGRESS'" class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
                   ⏰ {{ getDeadlineCountdown(t.deadline) }}
                 </span>
               </div>
@@ -772,6 +842,7 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -807,6 +878,7 @@ async def index():
               👤 Исполнитель: {{ t.lead_name || 'Не назначен' }}
             </p>
 
+            <!-- ДАТЫ И ЧАСЫ НА КАРТОЧКЕ -->
             <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
                 <span>📅 Создано:</span>
@@ -822,6 +894,7 @@ async def index():
               </div>
             </div>
 
+            <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ -->
             <div v-if="t.status === 'DRAFT'" class="space-y-2 pt-1 border-t border-slate-800">
               <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
               <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
@@ -855,19 +928,41 @@ async def index():
               </button>
             </div>
 
-            <div v-if="t.status === 'REVIEW'" class="space-y-2 pt-1 border-t border-amber-800/40">
-              <div class="p-2.5 bg-amber-950/30 rounded-xl border border-amber-800/60 text-xs space-y-1.5">
-                <p class="text-amber-300 font-bold">📝 Отчет исполнителя ({{ t.lead_name }}):</p>
-                <p class="text-slate-200 whitespace-pre-wrap">{{ t.result_report }}</p>
+            <!-- УПРАВЛЕНИЕ ЭТАПАМИ 30% / 70% / АРХИВ ДЛЯ ДИРЕКТОРА -->
+            <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-2 border-t border-slate-800">
+              
+              <!-- Блок подтверждения запроса от исполнителя -->
+              <div v-if="t.pending_request" class="p-2.5 bg-amber-950/40 border border-amber-800/60 rounded-xl space-y-2 animate-pulse">
+                <div class="flex justify-between items-center text-xs font-bold text-amber-300">
+                  <span>📌 Запрос от {{ t.lead_name }}:</span>
+                  <span class="bg-amber-500 text-slate-950 px-2 py-0.5 rounded text-[10px] font-black">
+                    {{ t.pending_request === 'ARCHIVE' ? 'Сдача в архив' : t.pending_request + '%' }}
+                  </span>
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                  <button @click="confirmStageRequest(t.id, true)" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-1.5 rounded-lg text-xs shadow">
+                    ✅ Подтвердить
+                  </button>
+                  <button @click="confirmStageRequest(t.id, false)" class="bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 font-bold py-1.5 rounded-lg text-xs">
+                    ❌ Отклонить
+                  </button>
+                </div>
               </div>
 
-              <div class="grid grid-cols-2 gap-2 pt-1">
-                <button @click="rejectTask(t.id)" class="bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 font-bold py-2 rounded-xl text-xs transition">
-                  ↩️ На доработку
-                </button>
-                <button @click="completeTask(t.id)" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 rounded-xl text-xs shadow transition">
-                  ✅ Принять и в архив
-                </button>
+              <!-- Прямые кнопки Директора 30% / 70% / Архив -->
+              <div>
+                <span class="text-[10px] font-bold text-slate-400 block mb-1">Установить этап напрямую:</span>
+                <div class="grid grid-cols-3 gap-1.5">
+                  <button @click="setDirectStage(t.id, '30')" :class="t.progress === 30 ? 'bg-amber-600 text-white font-bold shadow-lg' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'" class="py-1.5 rounded-xl text-xs font-semibold transition">
+                    30%
+                  </button>
+                  <button @click="setDirectStage(t.id, '70')" :class="t.progress === 70 ? 'bg-amber-600 text-white font-bold shadow-lg' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'" class="py-1.5 rounded-xl text-xs font-semibold transition">
+                    70%
+                  </button>
+                  <button @click="setDirectStage(t.id, 'ARCHIVE')" class="py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-bold transition">
+                    В архив
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -893,17 +988,13 @@ async def index():
             </div>
           </div>
 
-          <div class="grid grid-cols-3 gap-2 pt-2 border-t border-slate-800/80 text-center">
+          <div class="grid grid-cols-2 gap-2 pt-2 border-t border-slate-800/80 text-center">
             <div class="bg-slate-950/60 p-2 rounded-xl border border-slate-800">
               <span class="text-[10px] text-slate-400 block font-semibold">В работе</span>
               <span class="text-sm font-black text-indigo-400">{{ myActiveTasks.length }}</span>
             </div>
             <div class="bg-slate-950/60 p-2 rounded-xl border border-slate-800">
-              <span class="text-[10px] text-slate-400 block font-semibold">На проверке</span>
-              <span class="text-sm font-black text-amber-400">{{ myReviewTasks.length }}</span>
-            </div>
-            <div class="bg-slate-950/60 p-2 rounded-xl border border-slate-800">
-              <span class="text-[10px] text-slate-400 block font-semibold">Выполнено</span>
+              <span class="text-[10px] text-slate-400 block font-semibold">В архиве</span>
               <span class="text-sm font-black text-emerald-400">{{ myArchiveTasks.length }}</span>
             </div>
           </div>
@@ -911,7 +1002,6 @@ async def index():
 
         <div class="flex gap-1.5 p-1 bg-slate-900 rounded-xl border border-slate-800 text-xs">
           <button @click="empTab = 'active'" :class="empTab === 'active' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="flex-1 py-1.5 rounded-lg">В работе ({{ myActiveTasks.length }})</button>
-          <button @click="empTab = 'review'" :class="empTab === 'review' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="flex-1 py-1.5 rounded-lg">На проверке ({{ myReviewTasks.length }})</button>
           <button @click="empTab = 'archive'" :class="empTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="flex-1 py-1.5 rounded-lg">История</button>
         </div>
 
@@ -932,6 +1022,17 @@ async def index():
             </div>
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
+
+            <!-- ПРОГРЕСС-БАР -->
+            <div v-if="t.status === 'IN_PROGRESS'" class="space-y-1">
+              <div class="flex justify-between text-[10px] font-bold">
+                <span class="text-slate-400">Прогресс:</span>
+                <span :class="t.progress >= 70 ? 'text-emerald-400' : (t.progress >= 30 ? 'text-amber-400' : 'text-indigo-400')">{{ t.progress }}%</span>
+              </div>
+              <div class="w-full bg-slate-950 rounded-full h-1.5 border border-slate-800 overflow-hidden">
+                <div :style="{ width: (t.progress || 0) + '%' }" :class="t.progress >= 70 ? 'bg-emerald-500' : (t.progress >= 30 ? 'bg-amber-500' : 'bg-indigo-500')" class="h-full transition-all duration-300"></div>
+              </div>
+            </div>
 
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
@@ -979,8 +1080,29 @@ async def index():
               </div>
             </div>
 
+            <!-- КНОПКИ ЗАПРОСА 30% / 70% / АРХИВ ДЛЯ ИСПОЛНИТЕЛЯ -->
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1 border-t border-slate-800">
-              <div class="grid grid-cols-2 gap-2">
+              
+              <div v-if="t.pending_request" class="bg-amber-950/30 border border-amber-800/50 p-2 rounded-xl text-center text-xs text-amber-300 font-bold">
+                ⏳ Запрос на подтверждение ({{ t.pending_request === 'ARCHIVE' ? 'Архив' : t.pending_request + '%' }}) ожидает решения Жамолиддина
+              </div>
+
+              <div v-else class="space-y-1">
+                <span class="text-[10px] font-bold text-slate-400 block">Отправить запрос Жамолиддину:</span>
+                <div class="grid grid-cols-3 gap-1.5">
+                  <button @click="requestStage(t.id, '30')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold py-2 rounded-xl text-xs transition">
+                    📌 30%
+                  </button>
+                  <button @click="requestStage(t.id, '70')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold py-2 rounded-xl text-xs transition">
+                    📌 70%
+                  </button>
+                  <button @click="requestStage(t.id, 'ARCHIVE')" class="bg-emerald-900/80 hover:bg-emerald-800 text-emerald-200 font-bold py-2 rounded-xl text-xs transition">
+                    🏁 В архив
+                  </button>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-2 pt-1">
                 <button @click="openChat(t)" class="bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 border border-slate-700 transition">
                   <i class="fa-solid fa-comments"></i> Чат
                   <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[9px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
@@ -989,20 +1111,6 @@ async def index():
                   🚩 Red Flag
                 </button>
               </div>
-
-              <button @click="submitTaskForReview(t.id)" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-black py-2.5 rounded-xl text-xs shadow-lg transition">
-                🏁 Сдать задачу на проверку Жамолиддину
-              </button>
-            </div>
-
-            <div v-if="t.status === 'REVIEW'" class="space-y-2 pt-1">
-              <div class="bg-amber-950/40 border border-amber-800/50 p-2.5 rounded-xl text-xs text-amber-300 text-center font-bold">
-                ⏳ Отчет передан Жамолиддину на проверку.
-              </div>
-              <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700 transition">
-                <i class="fa-solid fa-comments"></i> Чат по задаче
-                <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[9px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
-              </button>
             </div>
 
             <div v-if="t.status === 'ARCHIVED'" class="pt-1">
@@ -1030,7 +1138,7 @@ async def index():
           </div>
           <div>
             <h3 class="text-xs font-bold text-white truncate max-w-[230px] leading-tight">{{ activeChatTask.title }}</h3>
-            <span class="text-[9px] font-semibold text-indigo-300/80">{{ statusLabel(activeChatTask.status) }}</span>
+            <span class="text-[9px] font-semibold text-indigo-300/80">{{ statusLabel(activeChatTask.status) }} • {{ activeChatTask.progress || 0 }}%</span>
           </div>
         </div>
         <button @click="closeChat" class="w-8 h-8 rounded-full bg-slate-800/80 text-slate-300 flex items-center justify-center text-sm hover:text-white transition">
@@ -1061,7 +1169,6 @@ async def index():
 
             <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
 
-            <!-- АУДИОСООБЩЕНИЕ С ВОЛНАМИ -->
             <div v-if="m.message_type === 'VOICE'" class="pt-1">
               <div class="flex items-center gap-2.5 bg-black/20 p-2 rounded-xl border border-white/5">
                 <button @click="togglePlayAudio('msg_' + m.id, m.media_url)" :class="isMyMessage(m) ? 'bg-white text-indigo-600' : 'bg-indigo-600 text-white'" class="w-8 h-8 rounded-full flex items-center justify-center text-xs shrink-0 shadow transition">
@@ -1082,7 +1189,6 @@ async def index():
               </div>
             </div>
 
-            <!-- Фотография -->
             <div v-if="m.message_type === 'IMAGE'" class="pt-1">
               <div @click="openImageLightbox(m.media_url)" class="relative group cursor-pointer overflow-hidden rounded-xl border border-white/10">
                 <img :src="m.media_url" class="rounded-xl max-h-52 w-full object-cover group-hover:scale-105 transition duration-200">
@@ -1101,9 +1207,13 @@ async def index():
         </div>
       </div>
 
-      <!-- КНОПКА ВОЗВРАТА К ПОСЛЕДНИМ СООБЩЕНИЯМ (TELEGRAM STYLE) -->
-      <button v-if="userScrolledUp" @click="scrollToBottomSmooth" class="fixed bottom-20 right-4 w-9 h-9 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-xl shadow-indigo-600/40 flex items-center justify-center text-xs transition duration-200 z-50 border border-indigo-400/30 animate-bounce">
+      <!-- КНОПКА ВОЗВРАТА ВНИЗ С БЕЙДЖЕМ НЕПРОЧИТАННЫХ (TELEGRAM STYLE) -->
+      <button v-if="userScrolledUp" @click="scrollToBottomSmooth" class="fixed bottom-20 right-4 w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-2xl flex items-center justify-center text-sm transition duration-200 z-50 border border-indigo-400/40 animate-bounce">
         <i class="fa-solid fa-arrow-down"></i>
+        <!-- Метка непрочитанных внутри чата -->
+        <span v-if="newMessagesBelowCount > 0" class="absolute -top-1.5 -right-1.5 bg-red-500 text-white text-[10px] font-black min-w-[20px] h-5 px-1 rounded-full flex items-center justify-center border-2 border-slate-950 shadow-md animate-pulse">
+          {{ newMessagesBelowCount }}
+        </span>
       </button>
 
       <!-- ПАНЕЛЬ УПРАВЛЕНИЯ ГОЛОСОВЫМ -->
@@ -1244,6 +1354,7 @@ async def index():
         const chatContainer = ref(null);
         const previewImageUrl = ref(null);
         const userScrolledUp = ref(false);
+        const newMessagesBelowCount = ref(0);
 
         // ГОЛОСОВОЙ КОНТРОЛЬ ПЕРЕД ОТПРАВКОЙ
         const isRecordingVoice = ref(false);
@@ -1273,31 +1384,26 @@ async def index():
 
         const inboxTasks = computed(() => tasks.value.filter(t => t.status === 'DRAFT'));
         const activeTasks = computed(() => tasks.value.filter(t => t.status === 'IN_PROGRESS'));
-        const reviewTasks = computed(() => tasks.value.filter(t => t.status === 'REVIEW'));
         const archiveTasks = computed(() => tasks.value.filter(t => t.status === 'ARCHIVED'));
 
         const displayedOwnerTasks = computed(() => {
           if (ownerTab.value === 'inbox') return inboxTasks.value;
           if (ownerTab.value === 'active') return activeTasks.value;
-          if (ownerTab.value === 'review') return reviewTasks.value;
           return archiveTasks.value;
         });
 
         const displayedDeputyTasks = computed(() => {
           if (deputyTab.value === 'inbox') return inboxTasks.value;
           if (deputyTab.value === 'active') return activeTasks.value;
-          if (deputyTab.value === 'review') return reviewTasks.value;
           return archiveTasks.value;
         });
 
         const myTasks = computed(() => tasks.value.filter(t => t.lead_user_id === currentUser.value?.id));
         const myActiveTasks = computed(() => myTasks.value.filter(t => t.status === 'IN_PROGRESS'));
-        const myReviewTasks = computed(() => myTasks.value.filter(t => t.status === 'REVIEW'));
         const myArchiveTasks = computed(() => myTasks.value.filter(t => t.status === 'ARCHIVED'));
 
         const displayedEmpTasks = computed(() => {
           if (empTab.value === 'active') return myActiveTasks.value;
-          if (empTab.value === 'review') return myReviewTasks.value;
           return myArchiveTasks.value;
         });
 
@@ -1495,7 +1601,7 @@ async def index():
         const setupSSE = () => {
           const evtSource = new EventSource('/api/events');
           evtSource.onopen = () => { sseConnected.value = true; };
-          evtSource.onmessage = (event) => {
+          evtSource.onmessage = () => {
             loadData();
             if (activeChatTask.value) {
               loadMessages(false);
@@ -1593,39 +1699,47 @@ async def index():
           }
         };
 
-        const submitTaskForReview = async (taskId) => {
-          const report = prompt('Опишите итоговый результат выполнения задачи:');
-          if (!report) return;
+        // ДИРЕКТОР: Прямая установка 30% / 70% / Архив
+        const setDirectStage = async (taskId, stage) => {
+          const label = stage === 'ARCHIVE' ? 'в архив' : `на ${stage}%`;
+          if (!confirm(`Перевести задачу ${label}?`)) return;
           const fd = new FormData();
-          fd.append('sender_id', currentUser.value.id);
-          fd.append('sender_name', currentUser.value.full_name);
-          fd.append('report_text', report);
-          await fetch(`/api/tasks/${taskId}/submit-review`, { method: 'POST', body: fd });
+          fd.append('stage', stage);
+          fd.append('user_name', currentUser.value.full_name);
+          await fetch(`/api/tasks/${taskId}/set-stage`, { method: 'POST', body: fd });
           await loadData();
-          alert('🏁 Задача передана Жамолиддину на проверку!');
         };
 
-        const rejectTask = async (taskId) => {
-          const reason = prompt('Причина возврата на доработку:');
-          if (!reason) return;
+        // ИСПОЛНИТЕЛЬ: Запрос 30% / 70% / Архив
+        const requestStage = async (taskId, stage) => {
+          const label = stage === 'ARCHIVE' ? 'сдачу в архив' : `этап ${stage}%`;
+          if (!confirm(`Отправить запрос Жамолиддину на ${label}?`)) return;
           const fd = new FormData();
-          fd.append('reason', reason);
-          await fetch(`/api/tasks/${taskId}/reject-review`, { method: 'POST', body: fd });
+          fd.append('stage', stage);
+          fd.append('user_id', currentUser.value.id);
+          fd.append('user_name', currentUser.value.full_name);
+          await fetch(`/api/tasks/${taskId}/request-stage`, { method: 'POST', body: fd });
           await loadData();
-          alert('Задача возвращена исполнителю.');
+          alert('📌 Запрос успешно отправлен Директору!');
         };
 
-        const completeTask = async (id) => {
-          if (!confirm('Утвердить выполнение и закрыть задачу в архив?')) return;
-          await fetch(`/api/tasks/${id}/complete`, { method: 'POST' });
+        // ДИРЕКТОР: Подтверждение / отклонение запроса исполнителя
+        const confirmStageRequest = async (taskId, approve) => {
+          const fd = new FormData();
+          fd.append('approve', approve);
+          fd.append('user_name', currentUser.value.full_name);
+          await fetch(`/api/tasks/${taskId}/confirm-stage-request`, { method: 'POST', body: fd });
           await loadData();
         };
 
-        // ОТСЛЕЖИВАНИЕ СКРОЛЛА
+        // ОТСЛЕЖИВАНИЕ СКРОЛЛА И БЕЙДЖА НЕПРОЧИТАННЫХ В ЧАТЕ
         const onChatScroll = () => {
           if (!chatContainer.value) return;
           const { scrollTop, scrollHeight, clientHeight } = chatContainer.value;
           userScrolledUp.value = (scrollHeight - scrollTop - clientHeight) > 60;
+          if (!userScrolledUp.value) {
+            newMessagesBelowCount.value = 0;
+          }
         };
 
         const scrollToBottomSmooth = () => {
@@ -1635,6 +1749,7 @@ async def index():
               behavior: 'smooth'
             });
             userScrolledUp.value = false;
+            newMessagesBelowCount.value = 0;
           }
         };
 
@@ -1643,6 +1758,7 @@ async def index():
           chatMessages.value = [];
           isChatLoading.value = true;
           userScrolledUp.value = false;
+          newMessagesBelowCount.value = 0;
           cancelVoiceRecording();
           document.body.classList.add('overflow-hidden');
           task.unread_count = 0;
@@ -1666,10 +1782,11 @@ async def index():
             const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages?viewer_user_id=${currentUser.value.id}`);
             const newMsgs = await res.json();
             
-            const currentJson = JSON.stringify(chatMessages.value);
-            const newJson = JSON.stringify(newMsgs);
+            const prevLen = chatMessages.value.length;
+            const newLen = newMsgs.length;
 
-            if (currentJson !== newJson) {
+            if (newLen > prevLen) {
+              const addedCount = newLen - prevLen;
               chatMessages.value = newMsgs;
               await nextTick();
               
@@ -1677,7 +1794,13 @@ async def index():
                 if (chatContainer.value) {
                   chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
                 }
+                newMessagesBelowCount.value = 0;
+              } else {
+                // Если пользователь просматривает историю вверху, увеличиваем бейдж на кнопке ↓
+                newMessagesBelowCount.value += addedCount;
               }
+            } else {
+              chatMessages.value = newMsgs;
             }
           } catch (e) {
             console.error(e);
@@ -1699,6 +1822,7 @@ async def index():
           }
           chatInput.value = '';
           userScrolledUp.value = false;
+          newMessagesBelowCount.value = 0;
           await loadMessages(true);
         };
 
@@ -1763,6 +1887,7 @@ async def index():
           await fetch(`/api/tasks/${activeChatTask.value.id}/messages/voice`, { method: 'POST', body: fd });
           cancelVoiceRecording();
           userScrolledUp.value = false;
+          newMessagesBelowCount.value = 0;
           await loadMessages(true);
         };
 
@@ -1776,6 +1901,7 @@ async def index():
           fd.append('file', file);
           await fetch(`/api/tasks/${activeChatTask.value.id}/messages/image`, { method: 'POST', body: fd });
           userScrolledUp.value = false;
+          newMessagesBelowCount.value = 0;
           await loadMessages(true);
         };
 
@@ -1831,14 +1957,12 @@ async def index():
         const statusBadge = (s) => {
           if (s === 'DRAFT') return 'bg-amber-950 text-amber-300';
           if (s === 'IN_PROGRESS') return 'bg-blue-950 text-blue-300';
-          if (s === 'REVIEW') return 'bg-purple-950 text-purple-300 border border-purple-800 animate-pulse';
           return 'bg-emerald-950 text-emerald-300';
         };
 
         const statusLabel = (s) => {
           if (s === 'DRAFT') return 'Входящие';
           if (s === 'IN_PROGRESS') return 'В работе';
-          if (s === 'REVIEW') return 'На проверке';
           return 'Архив';
         };
 
@@ -1859,15 +1983,15 @@ async def index():
         return {
           currentUser, loginForm, isLoggingIn, ownerTab, deputyTab, empTab, isRecording, isProcessing,
           recordSeconds, textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
-          inboxTasks, activeTasks, reviewTasks, archiveTasks,
+          inboxTasks, activeTasks, archiveTasks,
           displayedOwnerTasks, displayedDeputyTasks,
-          myActiveTasks, myReviewTasks, myArchiveTasks, displayedEmpTasks, isMyMessage,
+          myActiveTasks, myArchiveTasks, displayedEmpTasks, isMyMessage,
           activeChatTask, chatMessages, chatInput, isChatLoading, chatContainer, previewImageUrl,
-          isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl, userScrolledUp,
+          isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl, userScrolledUp, newMessagesBelowCount,
           activeAudioId, isAudioPlaying, audioCurrentTime, audioDuration, audioProgress,
           togglePlayAudio, seekAudio, handleTouchSeek, getWaveformBars, formatAudioTime,
-          handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, submitTaskForReview, rejectTask,
-          completeTask, openChat, closeChat, sendChatMessage, uploadChatImage, openImageLightbox,
+          handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, setDirectStage, requestStage, confirmStageRequest,
+          openChat, closeChat, sendChatMessage, uploadChatImage, openImageLightbox,
           startVoiceRecording, stopVoiceRecording, cancelVoiceRecording, confirmSendVoice, sendRedFlag,
           onChatScroll, scrollToBottomSmooth,
           formatLocalDT, formatLocalTimeOnly,
