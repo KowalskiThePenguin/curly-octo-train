@@ -96,7 +96,6 @@ async def startup():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
 
-            -- Таблица индивидуального учета прочитанных сообщений для каждого пользователя
             CREATE TABLE IF NOT EXISTS task_user_reads (
                 task_id INT REFERENCES tasks(id) ON DELETE CASCADE,
                 user_id INT REFERENCES users(id) ON DELETE CASCADE,
@@ -208,7 +207,6 @@ async def get_users():
         users = await conn.fetch("SELECT id, full_name, role, department, username FROM users WHERE is_active = TRUE ORDER BY id ASC")
         return [dict(u) for u in users]
 
-# Получение задач с честным индивидуальным подсчетом непрочитанных
 @app.get("/api/tasks")
 async def get_tasks(viewer_user_id: int = 1):
     pool = await get_db()
@@ -401,12 +399,10 @@ async def reject_review(task_id: int, reason: str = Form(...)):
     await broadcast_event("task_rejected")
     return {"status": "ok"}
 
-# Telegram-логика: индивидуальная фиксация прочтения и вычисление статуса ✓✓
 @app.get("/api/tasks/{task_id}/messages")
 async def get_messages(task_id: int, viewer_user_id: int = 1):
     pool = await get_db()
     async with pool.acquire() as conn:
-        # 1. Фиксируем максимальный прочитанный ID для текущего зрителя
         max_id = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM task_messages WHERE task_id = $1", task_id)
         if max_id > 0:
             await conn.execute("""
@@ -416,7 +412,6 @@ async def get_messages(task_id: int, viewer_user_id: int = 1):
                 SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
             """, task_id, viewer_user_id, max_id)
 
-        # 2. Вычисляем статус галочек (is_read = true, если кто-то другой прочитал до этого ID)
         rows = await conn.fetch("""
             SELECT msg.id, msg.task_id, msg.sender_id, msg.sender_role, msg.sender_name, msg.message_type, msg.content, msg.media_url,
                    to_char(msg.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
@@ -456,7 +451,6 @@ async def send_text_msg(
             RETURNING id
         """, task_id, sender_id, sender_role, sender_name, content)
         
-        # Отправитель автоматически считается прочитавшим свое сообщение
         await conn.execute("""
             INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
             VALUES ($1, $2, $3)
@@ -585,27 +579,27 @@ async def index():
     
     <!-- ЭКРАН ВХОДА -->
     <div v-if="!currentUser" class="min-h-[85vh] flex flex-col justify-center px-2">
-      <div class="bg-slate-900 border border-slate-800 p-6 rounded-3xl space-y-4 shadow-2xl text-center">
-        <div class="w-14 h-14 bg-indigo-600 rounded-2xl flex items-center justify-center text-white text-2xl mx-auto shadow-lg">
+      <div class="bg-slate-900/90 border border-slate-800 p-6 rounded-3xl space-y-4 shadow-2xl text-center backdrop-blur-xl">
+        <div class="w-14 h-14 bg-gradient-to-tr from-indigo-600 to-indigo-500 rounded-2xl flex items-center justify-center text-white text-2xl mx-auto shadow-lg shadow-indigo-600/30">
           <i class="fa-solid fa-shield-halved"></i>
         </div>
         <div>
-          <h2 class="text-lg font-black text-white">TASK CONTROL OS</h2>
+          <h2 class="text-lg font-black tracking-wide text-white">TASK CONTROL OS</h2>
           <p class="text-xs text-slate-400 mt-0.5">Вход в персональный кабинет</p>
         </div>
 
         <form @submit.prevent="handleLogin" class="text-left space-y-3 pt-2">
           <div>
             <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1">Ваш логин:</label>
-            <input v-model="loginForm.username" type="text" autocapitalize="none" required placeholder="Введите логин" class="w-full bg-slate-950 border border-slate-700 text-xs p-3 rounded-xl text-white font-medium focus:border-indigo-500 outline-none">
+            <input v-model="loginForm.username" type="text" autocapitalize="none" required placeholder="Введите логин" class="w-full bg-slate-950/80 border border-slate-700/80 text-xs p-3 rounded-xl text-white font-medium focus:border-indigo-500 outline-none">
           </div>
 
           <div>
             <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1">Пароль:</label>
-            <input v-model="loginForm.password" type="password" required placeholder="••••" class="w-full bg-slate-950 border border-slate-700 text-xs p-3 rounded-xl text-white font-medium focus:border-indigo-500 outline-none">
+            <input v-model="loginForm.password" type="password" required placeholder="••••" class="w-full bg-slate-950/80 border border-slate-700/80 text-xs p-3 rounded-xl text-white font-medium focus:border-indigo-500 outline-none">
           </div>
 
-          <button type="submit" :disabled="isLoggingIn" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 rounded-xl text-xs shadow-lg transition mt-2 flex items-center justify-center gap-2">
+          <button type="submit" :disabled="isLoggingIn" class="w-full bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-bold py-3 rounded-xl text-xs shadow-lg shadow-indigo-600/30 transition mt-2 flex items-center justify-center gap-2">
             <i v-if="isLoggingIn" class="fa-solid fa-circle-notch fa-spin"></i>
             <span>{{ isLoggingIn ? 'Вход...' : 'Войти в кабинет' }}</span>
           </button>
@@ -617,15 +611,15 @@ async def index():
     <div v-else class="space-y-4">
       
       <!-- ХЕДЕР -->
-      <header class="bg-slate-900 border border-slate-800 p-3 rounded-2xl shadow-md flex justify-between items-center">
-        <div class="flex items-center gap-2">
+      <header class="bg-slate-900/90 border border-slate-800 p-3 rounded-2xl shadow-lg backdrop-blur-md flex justify-between items-center">
+        <div class="flex items-center gap-2.5">
           <div class="w-2.5 h-2.5 rounded-full" :class="sseConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'"></div>
           <div>
             <h3 class="text-xs font-bold text-white leading-none">{{ currentUser.full_name }}</h3>
-            <span class="text-[9px] font-bold text-indigo-400 uppercase">{{ roleBadgeTitle }}</span>
+            <span class="text-[9px] font-bold text-indigo-400 uppercase tracking-wider">{{ roleBadgeTitle }}</span>
           </div>
         </div>
-        <button @click="handleLogout" class="text-[10px] font-bold text-red-400 bg-red-950/50 hover:bg-red-900/60 px-2.5 py-1.5 rounded-xl border border-red-800/60 transition">
+        <button @click="handleLogout" class="text-[10px] font-bold text-red-400 bg-red-950/40 hover:bg-red-900/60 px-2.5 py-1.5 rounded-xl border border-red-800/50 transition">
           <i class="fa-solid fa-right-from-bracket mr-1"></i> Выйти
         </button>
       </header>
@@ -633,7 +627,7 @@ async def index():
       <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
         
-        <div class="bg-slate-900 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl">
+        <div class="bg-slate-900/90 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl backdrop-blur-md">
           <h2 class="text-base font-bold text-white">Голосовое поручение</h2>
           
           <div class="flex justify-center py-1">
@@ -652,7 +646,7 @@ async def index():
 
           <div class="pt-2.5 border-t border-slate-800 text-left space-y-1.5">
             <div class="flex gap-1.5">
-              <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите поручение текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white">
+              <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите поручение текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
               <button @click="sendTextTask" class="bg-indigo-600 hover:bg-indigo-500 px-3 rounded-xl text-white font-bold text-xs">
                 <i class="fa-solid fa-paper-plane"></i>
               </button>
@@ -724,7 +718,7 @@ async def index():
               <p class="text-slate-200 whitespace-pre-wrap">{{ t.result_report }}</p>
             </div>
 
-            <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
+            <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700 transition">
               <i class="fa-solid fa-comments"></i>
               <span>Чат по задаче</span>
               <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
@@ -796,14 +790,14 @@ async def index():
 
             <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ -->
             <div v-if="t.status === 'DRAFT'" class="space-y-2 pt-1 border-t border-slate-800">
-              <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold">
-              <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200"></textarea>
-              <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" placeholder="Критерии сдачи (DoD)" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200"></textarea>
+              <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
+              <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
+              <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" placeholder="Критерии сдачи (DoD)" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
 
               <div class="grid grid-cols-2 gap-2 pt-1">
                 <div>
                   <label class="block text-[10px] font-bold text-slate-400 mb-1">Важность:</label>
-                  <select v-model="editDrafts[t.id].priority" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white">
+                  <select v-model="editDrafts[t.id].priority" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
                     <option value="URGENT">🔴 Оперативно</option>
                     <option value="NORMAL">🟡 Умеренно</option>
                     <option value="FUTURE">🔵 На будущее</option>
@@ -812,7 +806,7 @@ async def index():
 
                 <div>
                   <label class="block text-[10px] font-bold text-slate-400 mb-1">Исполнитель:</label>
-                  <select v-model="editDrafts[t.id].lead_id" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white">
+                  <select v-model="editDrafts[t.id].lead_id" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
                     <option v-for="u in employeesOnly" :key="u.id" :value="u.id">{{ u.full_name }}</option>
                   </select>
                 </div>
@@ -820,7 +814,7 @@ async def index():
 
               <div>
                 <label class="block text-[10px] font-bold text-slate-400 mb-1">Дедлайн (ваше местное время):</label>
-                <input v-model="editDrafts[t.id].deadline" type="datetime-local" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white">
+                <input v-model="editDrafts[t.id].deadline" type="datetime-local" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
               </div>
 
               <button @click="assignTask(t.id)" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 rounded-xl text-xs shadow transition mt-1">
@@ -836,16 +830,16 @@ async def index():
               </div>
 
               <div class="grid grid-cols-2 gap-2 pt-1">
-                <button @click="rejectTask(t.id)" class="bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 font-bold py-2 rounded-xl text-xs">
+                <button @click="rejectTask(t.id)" class="bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 font-bold py-2 rounded-xl text-xs transition">
                   ↩️ На доработку
                 </button>
-                <button @click="completeTask(t.id)" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 rounded-xl text-xs shadow">
+                <button @click="completeTask(t.id)" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 rounded-xl text-xs shadow transition">
                   ✅ Принять и в архив
                 </button>
               </div>
             </div>
 
-            <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
+            <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700 transition">
               <i class="fa-solid fa-comments"></i>
               <span>Чат по задаче</span>
               <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
@@ -938,11 +932,11 @@ async def index():
 
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1 border-t border-slate-800">
               <div class="grid grid-cols-2 gap-2">
-                <button @click="openChat(t)" class="bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 border border-slate-700">
+                <button @click="openChat(t)" class="bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 border border-slate-700 transition">
                   <i class="fa-solid fa-comments"></i> Чат
                   <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[9px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
                 </button>
-                <button @click="sendRedFlag(t.id)" class="bg-red-950 text-red-300 border border-red-800 hover:bg-red-900 text-xs font-bold py-2 rounded-xl flex items-center justify-center gap-1">
+                <button @click="sendRedFlag(t.id)" class="bg-red-950 text-red-300 border border-red-800 hover:bg-red-900 text-xs font-bold py-2 rounded-xl flex items-center justify-center gap-1 transition">
                   🚩 Red Flag
                 </button>
               </div>
@@ -956,14 +950,14 @@ async def index():
               <div class="bg-amber-950/40 border border-amber-800/50 p-2.5 rounded-xl text-xs text-amber-300 text-center font-bold">
                 ⏳ Отчет передан Жамолиддину на проверку.
               </div>
-              <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
+              <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700 transition">
                 <i class="fa-solid fa-comments"></i> Чат по задаче
                 <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[9px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
               </button>
             </div>
 
             <div v-if="t.status === 'ARCHIVED'" class="pt-1">
-              <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
+              <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700 transition">
                 <i class="fa-solid fa-comments"></i> История чата
               </button>
             </div>
@@ -975,53 +969,63 @@ async def index():
     </div>
 
     <!-- ========================================== -->
-    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (TELEGRAM VIEW) -->
+    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (ENTERPRISE TELEGRAM VIEW) -->
     <!-- ========================================== -->
     <div v-if="activeChatTask" class="fixed inset-0 bg-slate-950 z-50 flex flex-col h-[100dvh] w-full max-w-md mx-auto overscroll-contain">
       
       <!-- Шапка чата -->
-      <div class="p-3.5 border-b border-slate-800 flex justify-between items-center bg-slate-900/95 shrink-0">
-        <div>
-          <div class="flex items-center gap-2">
-            <span class="text-[10px] font-bold text-indigo-400 uppercase">Чат задачи #{{ activeChatTask.id }}</span>
-            <span class="text-[9px] font-bold px-1.5 py-0.2 rounded" :class="statusBadge(activeChatTask.status)">{{ statusLabel(activeChatTask.status) }}</span>
+      <div class="p-3.5 border-b border-slate-800/80 flex justify-between items-center bg-slate-900/90 backdrop-blur-xl shrink-0 shadow-lg">
+        <div class="flex items-center gap-2.5">
+          <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-indigo-500 text-white flex items-center justify-center font-bold text-xs shadow-md shadow-indigo-600/30">
+            #{{ activeChatTask.id }}
           </div>
-          <h3 class="text-xs font-bold text-white truncate max-w-[250px] mt-0.5">{{ activeChatTask.title }}</h3>
+          <div>
+            <h3 class="text-xs font-bold text-white truncate max-w-[230px] leading-tight">{{ activeChatTask.title }}</h3>
+            <span class="text-[9px] font-semibold text-indigo-300/80">{{ statusLabel(activeChatTask.status) }}</span>
+          </div>
         </div>
-        <button @click="closeChat" class="w-8 h-8 rounded-full bg-slate-800 text-slate-300 flex items-center justify-center text-sm hover:text-white transition">
+        <button @click="closeChat" class="w-8 h-8 rounded-full bg-slate-800/80 text-slate-300 flex items-center justify-center text-sm hover:text-white transition">
           <i class="fa-solid fa-xmark"></i>
         </button>
       </div>
 
       <!-- Лента сообщений -->
-      <div ref="chatContainer" class="flex-1 overflow-y-auto overscroll-contain p-3.5 space-y-2.5 bg-slate-950/80">
+      <div ref="chatContainer" class="flex-1 overflow-y-auto overscroll-contain p-3.5 space-y-3 bg-slate-950">
         
-        <!-- Лоадер -->
-        <div v-if="isChatLoading" class="flex flex-col items-center justify-center h-full text-slate-400 py-12 space-y-2">
+        <div v-if="isChatLoading" class="flex flex-col items-center justify-center h-full text-slate-400 py-16 space-y-2.5">
           <i class="fa-solid fa-circle-notch fa-spin text-2xl text-indigo-500"></i>
-          <span class="text-xs font-semibold">Загрузка сообщений...</span>
+          <span class="text-xs font-semibold tracking-wide">Загрузка диалога...</span>
         </div>
 
-        <div v-else-if="chatMessages.length === 0" class="text-center text-slate-500 text-xs py-12">
-          Сообщений пока нет. Напишите первое сообщение!
+        <div v-else-if="chatMessages.length === 0" class="text-center text-slate-500 text-xs py-16">
+          <i class="fa-regular fa-comments text-3xl mb-2 block opacity-40"></i>
+          Сообщений пока нет. Напишите или надиктуйте ответ!
         </div>
 
         <div v-else v-for="m in chatMessages" :key="m.id" :class="isMyMessage(m) ? 'justify-end' : 'justify-start'" class="flex">
-          <div :class="isMyMessage(m) ? 'bg-indigo-600 text-white rounded-tr-none' : (m.message_type === 'REDFLAG' ? 'bg-red-950/80 border border-red-800 text-red-200' : 'bg-slate-800 text-slate-200 rounded-tl-none')" class="max-w-[82%] rounded-2xl p-2.5 shadow-md text-xs space-y-1">
+          <div :class="isMyMessage(m) ? 'bg-gradient-to-br from-indigo-600 to-indigo-700 text-white rounded-tr-none shadow-indigo-600/20' : (m.message_type === 'REDFLAG' ? 'bg-red-950/80 border border-red-800/80 text-red-200' : 'bg-slate-900 border border-slate-800/90 text-slate-200 rounded-tl-none')" class="max-w-[84%] rounded-2xl p-3 shadow-md text-xs space-y-1.5 transition-all">
             
             <div class="flex justify-between items-center gap-3 text-[9px] opacity-75 font-semibold">
               <span>{{ m.sender_name }} ({{ formatRoleName(m.sender_role) }})</span>
               <span>{{ formatLocalTimeOnly(m.created_at) }}</span>
             </div>
 
+            <!-- Текст -->
             <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
 
-            <div v-if="m.message_type === 'VOICE'" class="py-1">
-              <audio :src="m.media_url" controls class="h-8 w-48"></audio>
+            <!-- Аудиосообщение с кастомным интерфейсом -->
+            <div v-if="m.message_type === 'VOICE'" class="pt-1">
+              <audio :src="m.media_url" controls class="h-8 w-52 rounded-lg"></audio>
             </div>
 
-            <div v-if="m.message_type === 'IMAGE'" class="py-1">
-              <img :src="m.media_url" class="rounded-lg max-h-44 object-cover">
+            <!-- Фотография с открытием Lightbox -->
+            <div v-if="m.message_type === 'IMAGE'" class="pt-1">
+              <div @click="openImageLightbox(m.media_url)" class="relative group cursor-pointer overflow-hidden rounded-xl border border-white/10">
+                <img :src="m.media_url" class="rounded-xl max-h-52 w-full object-cover group-hover:scale-105 transition duration-200">
+                <div class="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white text-base transition">
+                  <i class="fa-solid fa-magnifying-glass-plus"></i>
+                </div>
+              </div>
             </div>
 
             <!-- Галочки прочтения в стиле Telegram -->
@@ -1034,31 +1038,95 @@ async def index():
         </div>
       </div>
 
-      <!-- Панель ввода или плашка только для чтения -->
-      <div v-if="activeChatTask.status === 'ARCHIVED'" class="p-3 bg-slate-900 border-t border-slate-800 text-center text-xs text-slate-400 font-semibold flex items-center justify-center gap-2 shrink-0">
+      <!-- ПАНЕЛЬ УПРАВЛЕНИЯ ГОЛОСОВЫМ ПЕРЕД ОТПРАВКОЙ -->
+      <div v-if="recordedVoiceUrl" class="p-3 bg-slate-900 border-t border-slate-800 space-y-2 shrink-0 animate-fadeIn">
+        <div class="flex justify-between items-center text-[11px] font-bold text-slate-300">
+          <span class="flex items-center gap-1.5 text-indigo-400">
+            <i class="fa-solid fa-microphone-lines"></i> Прослушать запись перед отправкой:
+          </span>
+          <span class="font-mono text-xs text-slate-400">{{ formatTime(recordVoiceSeconds) }}</span>
+        </div>
+
+        <audio :src="recordedVoiceUrl" controls class="w-full h-8 rounded-lg"></audio>
+
+        <div class="grid grid-cols-2 gap-2 pt-1">
+          <button @click="cancelVoiceRecording" class="py-2 rounded-xl bg-red-950/60 hover:bg-red-900/80 border border-red-800/60 text-red-300 text-xs font-bold flex items-center justify-center gap-1.5 transition">
+            <i class="fa-solid fa-trash-can"></i> Удалить
+          </button>
+          <button @click="confirmSendVoice" class="py-2 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow transition">
+            <i class="fa-solid fa-paper-plane"></i> Отправить
+          </button>
+        </div>
+      </div>
+
+      <!-- ПАНЕЛЬ АКТИВНОЙ ЗАПИСИ ГОЛОСА -->
+      <div v-else-if="isRecordingVoice" class="p-3 bg-slate-900 border-t border-slate-800 flex items-center justify-between shrink-0 animate-pulse">
+        <div class="flex items-center gap-2 text-xs font-bold text-red-400">
+          <div class="w-3 h-3 rounded-full bg-red-500 animate-ping"></div>
+          <span>Идет запись: {{ formatTime(recordVoiceSeconds) }}</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button @click="cancelVoiceRecording" class="w-8 h-8 rounded-xl bg-slate-800 text-slate-400 flex items-center justify-center text-xs hover:text-red-300">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+          <button @click="stopVoiceRecording" class="px-3 py-1.5 rounded-xl bg-red-600 text-white text-xs font-bold flex items-center gap-1 shadow">
+            <i class="fa-solid fa-stop"></i> Завершить
+          </button>
+        </div>
+      </div>
+
+      <!-- ПАНЕЛЬ ТОЛЬКО ДЛЯ ЧТЕНИЯ В АРХИВЕ -->
+      <div v-else-if="activeChatTask.status === 'ARCHIVED'" class="p-3 bg-slate-900 border-t border-slate-800 text-center text-xs text-slate-400 font-semibold flex items-center justify-center gap-2 shrink-0">
         <i class="fa-solid fa-lock text-slate-500"></i>
         <span>Задача закрыта в архив. Чат доступен только для чтения.</span>
       </div>
 
-      <div v-else class="p-2.5 border-t border-slate-800 bg-slate-900 space-y-2 shrink-0">
+      <!-- СТАНДАРТНАЯ СТРОКА ВВОДА -->
+      <div v-else class="p-2.5 border-t border-slate-800/80 bg-slate-900/90 backdrop-blur-md space-y-2 shrink-0">
         <div class="flex items-center gap-1.5">
-          <label class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 flex items-center justify-center cursor-pointer hover:bg-slate-700 text-sm">
+          
+          <label class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 flex items-center justify-center cursor-pointer hover:bg-slate-700 text-sm transition">
             <i class="fa-solid fa-paperclip"></i>
             <input type="file" accept="image/*" @change="uploadChatImage" class="hidden">
           </label>
 
-          <button @click="toggleChatVoice" :class="isChatRecording ? 'bg-red-500 animate-pulse text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'" class="w-9 h-9 rounded-xl flex items-center justify-center text-sm">
-            <i :class="isChatRecording ? 'fa-solid fa-stop' : 'fa-solid fa-microphone'"></i>
+          <button @click="startVoiceRecording" class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 hover:bg-slate-700 flex items-center justify-center text-sm transition">
+            <i class="fa-solid fa-microphone"></i>
           </button>
 
-          <input v-model="chatInput" @keyup.enter="sendChatMessage" placeholder="Сообщение..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+          <input v-model="chatInput" @keyup.enter="sendChatMessage" placeholder="Сообщение..." class="flex-1 bg-slate-950 border border-slate-700/80 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
 
-          <button @click="sendChatMessage" class="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center text-sm hover:bg-indigo-500">
+          <button @click="sendChatMessage" class="w-9 h-9 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 text-white flex items-center justify-center text-sm hover:from-indigo-500 hover:to-indigo-400 shadow transition">
             <i class="fa-solid fa-paper-plane"></i>
           </button>
         </div>
       </div>
 
+    </div>
+
+    <!-- ========================================== -->
+    <!-- LIGHTBOX ДЛЯ ПОЛНОЭКРАННОГО ПРЕДОСМОТРА ФОТО -->
+    <!-- ========================================== -->
+    <div v-if="previewImageUrl" class="fixed inset-0 bg-black/95 backdrop-blur-2xl z-[60] flex flex-col justify-between p-4" @click.self="previewImageUrl = null">
+      <div class="flex justify-between items-center text-white shrink-0">
+        <span class="text-xs font-bold opacity-75">Просмотр фото</span>
+        <div class="flex items-center gap-3">
+          <a :href="previewImageUrl" download="task_photo.jpg" target="_blank" class="w-9 h-9 rounded-xl bg-white/10 flex items-center justify-center text-white text-sm hover:bg-white/20 transition">
+            <i class="fa-solid fa-download"></i>
+          </a>
+          <button @click="previewImageUrl = null" class="w-9 h-9 rounded-xl bg-white/10 flex items-center justify-center text-white text-sm hover:bg-white/20 transition">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="flex-1 flex items-center justify-center overflow-hidden my-4">
+        <img :src="previewImageUrl" class="max-h-full max-w-full object-contain rounded-2xl shadow-2xl">
+      </div>
+
+      <div class="text-center text-[11px] text-slate-400 shrink-0">
+        Нажмите крестик или фон, чтобы закрыть
+      </div>
     </div>
 
   </div>
@@ -1087,14 +1155,22 @@ async def index():
         let mediaRecorder = null;
         let audioChunks = [];
 
+        // ЧАТ ПЕРЕМЕННЫЕ
         const activeChatTask = ref(null);
         const chatMessages = ref([]);
         const chatInput = ref('');
-        const isChatRecording = ref(false);
         const isChatLoading = ref(false);
         const chatContainer = ref(null);
-        let chatRecorder = null;
-        let chatAudioChunks = [];
+        const previewImageUrl = ref(null);
+
+        // ГОЛОСОВОЙ КОНТРОЛЬ ПЕРЕД ОТПРАВКОЙ
+        const isRecordingVoice = ref(false);
+        const recordVoiceSeconds = ref(0);
+        const recordedVoiceBlob = ref(null);
+        const recordedVoiceUrl = ref(null);
+        let chatVoiceRecorder = null;
+        let chatVoiceChunks = [];
+        let chatVoiceTimer = null;
 
         const roleBadgeTitle = computed(() => {
           if (!currentUser.value) return '';
@@ -1365,11 +1441,11 @@ async def index():
           await loadData();
         };
 
-        // ОТКРЫТИЕ ЧАТА (ОПТИМИСТИЧНЫЙ СБРОС СЧЕТЧИКА + СИНХРОНИЗАЦИЯ)
         const openChat = async (task) => {
           activeChatTask.value = task;
           chatMessages.value = [];
           isChatLoading.value = true;
+          cancelVoiceRecording();
           document.body.classList.add('overflow-hidden');
           task.unread_count = 0;
           
@@ -1381,6 +1457,7 @@ async def index():
 
         const closeChat = () => {
           activeChatTask.value = null;
+          cancelVoiceRecording();
           document.body.classList.remove('overflow-hidden');
           loadData();
         };
@@ -1414,28 +1491,68 @@ async def index():
           await loadMessages();
         };
 
-        const toggleChatVoice = async () => {
-          if (!isChatRecording.value) {
+        // ЗАПИСЬ И ПРЕДПРОСЛУШИВАНИЕ АУДИОСООБЩЕНИЯ
+        const startVoiceRecording = async () => {
+          try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            chatRecorder = new MediaRecorder(stream);
-            chatAudioChunks = [];
-            chatRecorder.ondataavailable = e => chatAudioChunks.push(e.data);
-            chatRecorder.onstop = async () => {
-              const blob = new Blob(chatAudioChunks, { type: chatRecorder.mimeType || 'audio/webm' });
-              const fd = new FormData();
-              fd.append('sender_id', currentUser.value.id);
-              fd.append('sender_role', currentUser.value.role);
-              fd.append('sender_name', currentUser.value.full_name);
-              fd.append('audio', blob, 'voice.webm');
-              await fetch(`/api/tasks/${activeChatTask.value.id}/messages/voice`, { method: 'POST', body: fd });
-              await loadMessages();
+            chatVoiceRecorder = new MediaRecorder(stream);
+            chatVoiceChunks = [];
+            recordVoiceSeconds.value = 0;
+            isRecordingVoice.value = true;
+            recordedVoiceBlob.value = null;
+            recordedVoiceUrl.value = null;
+
+            chatVoiceTimer = setInterval(() => recordVoiceSeconds.value++, 1000);
+
+            chatVoiceRecorder.ondataavailable = e => {
+              if (e.data.size > 0) chatVoiceChunks.push(e.data);
             };
-            chatRecorder.start();
-            isChatRecording.value = true;
-          } else {
-            chatRecorder.stop();
-            isChatRecording.value = false;
+
+            chatVoiceRecorder.onstop = () => {
+              clearInterval(chatVoiceTimer);
+              const blob = new Blob(chatVoiceChunks, { type: chatVoiceRecorder.mimeType || 'audio/webm' });
+              recordedVoiceBlob.value = blob;
+              recordedVoiceUrl.value = URL.createObjectURL(blob);
+              isRecordingVoice.value = false;
+            };
+
+            chatVoiceRecorder.start();
+          } catch (err) {
+            alert('Разрешите доступ к микрофону для записи!');
           }
+        };
+
+        const stopVoiceRecording = () => {
+          if (chatVoiceRecorder && isRecordingVoice.value) {
+            chatVoiceRecorder.stop();
+          }
+        };
+
+        const cancelVoiceRecording = () => {
+          if (chatVoiceTimer) clearInterval(chatVoiceTimer);
+          if (chatVoiceRecorder && isRecordingVoice.value) {
+            chatVoiceRecorder.stop();
+          }
+          isRecordingVoice.value = false;
+          recordVoiceSeconds.value = 0;
+          recordedVoiceBlob.value = null;
+          if (recordedVoiceUrl.value) {
+            URL.revokeObjectURL(recordedVoiceUrl.value);
+            recordedVoiceUrl.value = null;
+          }
+        };
+
+        const confirmSendVoice = async () => {
+          if (!recordedVoiceBlob.value || !activeChatTask.value || !currentUser.value) return;
+          const fd = new FormData();
+          fd.append('sender_id', currentUser.value.id);
+          fd.append('sender_role', currentUser.value.role);
+          fd.append('sender_name', currentUser.value.full_name);
+          fd.append('audio', recordedVoiceBlob.value, 'voice.webm');
+          
+          await fetch(`/api/tasks/${activeChatTask.value.id}/messages/voice`, { method: 'POST', body: fd });
+          cancelVoiceRecording();
+          await loadMessages();
         };
 
         const uploadChatImage = async (e) => {
@@ -1448,6 +1565,10 @@ async def index():
           fd.append('file', file);
           await fetch(`/api/tasks/${activeChatTask.value.id}/messages/image`, { method: 'POST', body: fd });
           await loadMessages();
+        };
+
+        const openImageLightbox = (url) => {
+          previewImageUrl.value = url;
         };
 
         const sendRedFlag = async (id) => {
@@ -1529,9 +1650,11 @@ async def index():
           inboxTasks, activeTasks, reviewTasks, archiveTasks,
           displayedOwnerTasks, displayedDeputyTasks,
           myActiveTasks, myReviewTasks, myArchiveTasks, displayedEmpTasks, isMyMessage,
-          activeChatTask, chatMessages, chatInput, isChatRecording, isChatLoading, chatContainer,
+          activeChatTask, chatMessages, chatInput, isChatLoading, chatContainer, previewImageUrl,
+          isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl,
           handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, submitTaskForReview, rejectTask,
-          completeTask, openChat, closeChat, sendChatMessage, toggleChatVoice, uploadChatImage, sendRedFlag,
+          completeTask, openChat, closeChat, sendChatMessage, uploadChatImage, openImageLightbox,
+          startVoiceRecording, stopVoiceRecording, cancelVoiceRecording, confirmSendVoice, sendRedFlag,
           formatLocalDT, formatLocalTimeOnly,
           getDeadlineCountdown, getDeadlineBadge, priorityBadge, priorityLabel, statusBadge, statusLabel,
           formatRoleName, formatTime
@@ -1541,3 +1664,4 @@ async def index():
   </script>
 </body>
 </html>"""
+
