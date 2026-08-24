@@ -95,6 +95,14 @@ async def startup():
                 is_read BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
+
+            -- Таблица индивидуального учета прочитанных сообщений для каждого пользователя
+            CREATE TABLE IF NOT EXISTS task_user_reads (
+                task_id INT REFERENCES tasks(id) ON DELETE CASCADE,
+                user_id INT REFERENCES users(id) ON DELETE CASCADE,
+                last_read_msg_id INT DEFAULT 0,
+                PRIMARY KEY (task_id, user_id)
+            );
         """)
 
         await conn.execute("UPDATE users SET is_active = FALSE")
@@ -200,7 +208,7 @@ async def get_users():
         users = await conn.fetch("SELECT id, full_name, role, department, username FROM users WHERE is_active = TRUE ORDER BY id ASC")
         return [dict(u) for u in users]
 
-# Сортировка: Важность -> Ближайший дедлайн -> Дата создания
+# Получение задач с честным индивидуальным подсчетом непрочитанных
 @app.get("/api/tasks")
 async def get_tasks(viewer_user_id: int = 1):
     pool = await get_db()
@@ -215,8 +223,9 @@ async def get_tasks(viewer_user_id: int = 1):
                    (EXISTS(SELECT 1 FROM media_attachments m WHERE m.task_id = t.id AND m.attachment_type = 'VOICE_ORIGINAL')) as has_voice,
                    (SELECT COUNT(*) FROM task_messages msg 
                     WHERE msg.task_id = t.id 
-                      AND msg.is_read = FALSE 
-                      AND msg.sender_id != $1) as unread_count
+                      AND msg.sender_id != $1 
+                      AND msg.id > COALESCE((SELECT last_read_msg_id FROM task_user_reads r WHERE r.task_id = t.id AND r.user_id = $1), 0)
+                   ) as unread_count
             FROM tasks t
             LEFT JOIN users u ON u.id = t.lead_user_id
             ORDER BY 
@@ -392,28 +401,37 @@ async def reject_review(task_id: int, reason: str = Form(...)):
     await broadcast_event("task_rejected")
     return {"status": "ok"}
 
+# Telegram-логика: индивидуальная фиксация прочтения и вычисление статуса ✓✓
 @app.get("/api/tasks/{task_id}/messages")
 async def get_messages(task_id: int, viewer_user_id: int = 1):
     pool = await get_db()
     async with pool.acquire() as conn:
-        # Отмечаем сообщения прочитанными и отправляем оповещение
-        updated_status = await conn.execute("""
-            UPDATE task_messages 
-            SET is_read = TRUE 
-            WHERE task_id = $1 AND sender_id != $2 AND is_read = FALSE
-        """, task_id, viewer_user_id)
+        # 1. Фиксируем максимальный прочитанный ID для текущего зрителя
+        max_id = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM task_messages WHERE task_id = $1", task_id)
+        if max_id > 0:
+            await conn.execute("""
+                INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (task_id, user_id) DO UPDATE 
+                SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+            """, task_id, viewer_user_id, max_id)
 
+        # 2. Вычисляем статус галочек (is_read = true, если кто-то другой прочитал до этого ID)
         rows = await conn.fetch("""
-            SELECT id, task_id, sender_id, sender_role, sender_name, message_type, content, media_url, is_read,
-                   to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at
-            FROM task_messages 
-            WHERE task_id = $1 
-            ORDER BY id ASC
+            SELECT msg.id, msg.task_id, msg.sender_id, msg.sender_role, msg.sender_name, msg.message_type, msg.content, msg.media_url,
+                   to_char(msg.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
+                   EXISTS(
+                       SELECT 1 FROM task_user_reads r 
+                       WHERE r.task_id = msg.task_id 
+                         AND r.user_id != msg.sender_id 
+                         AND r.last_read_msg_id >= msg.id
+                   ) as is_read
+            FROM task_messages msg 
+            WHERE msg.task_id = $1 
+            ORDER BY msg.id ASC
         """, task_id)
 
-        if "UPDATE 0" not in updated_status:
-            await broadcast_event("read_receipt")
-
+        await broadcast_event("read_receipt")
         return [dict(r) for r in rows]
 
 async def check_task_not_archived(conn, task_id: int):
@@ -432,10 +450,20 @@ async def send_text_msg(
     pool = await get_db()
     async with pool.acquire() as conn:
         await check_task_not_archived(conn, task_id)
-        await conn.execute("""
+        msg_id = await conn.fetchval("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
             VALUES ($1, $2, $3, $4, 'TEXT', $5, NOW())
+            RETURNING id
         """, task_id, sender_id, sender_role, sender_name, content)
+        
+        # Отправитель автоматически считается прочитавшим свое сообщение
+        await conn.execute("""
+            INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (task_id, user_id) DO UPDATE 
+            SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+        """, task_id, sender_id, msg_id)
+
     await broadcast_event(f"chat_{task_id}")
     return {"status": "ok"}
 
@@ -453,10 +481,19 @@ async def send_voice_msg(
         audio_bytes = await audio.read()
         mime = audio.content_type or "audio/webm"
         audio_b64 = f"data:{mime};base64," + base64.b64encode(audio_bytes).decode('utf-8')
-        await conn.execute("""
+        msg_id = await conn.fetchval("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, media_url, content, created_at)
             VALUES ($1, $2, $3, $4, 'VOICE', $5, 'Голосовое сообщение', NOW())
+            RETURNING id
         """, task_id, sender_id, sender_role, sender_name, audio_b64)
+        
+        await conn.execute("""
+            INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (task_id, user_id) DO UPDATE 
+            SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+        """, task_id, sender_id, msg_id)
+
     await broadcast_event(f"chat_{task_id}")
     return {"status": "ok"}
 
@@ -474,10 +511,19 @@ async def send_image_msg(
         file_bytes = await file.read()
         mime = file.content_type or "image/jpeg"
         file_b64 = f"data:{mime};base64," + base64.b64encode(file_bytes).decode('utf-8')
-        await conn.execute("""
+        msg_id = await conn.fetchval("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, media_url, content, created_at)
             VALUES ($1, $2, $3, $4, 'IMAGE', $5, 'Прикрепленное фото', NOW())
+            RETURNING id
         """, task_id, sender_id, sender_role, sender_name, file_b64)
+        
+        await conn.execute("""
+            INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (task_id, user_id) DO UPDATE 
+            SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+        """, task_id, sender_id, msg_id)
+
     await broadcast_event(f"chat_{task_id}")
     return {"status": "ok"}
 
@@ -489,10 +535,18 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(
             UPDATE tasks SET priority = 'URGENT', is_urgent = TRUE, risks_notes = $1 WHERE id = $2
         """, f"🚨 RED FLAG: {reason}", task_id)
         
-        await conn.execute("""
+        msg_id = await conn.fetchval("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
             VALUES ($1, $2, 'EMPLOYEE', $3, 'REDFLAG', $4, NOW())
+            RETURNING id
         """, task_id, sender_id, sender_name, f"🚨 RED FLAG (БЛОКЕР): {reason}")
+
+        await conn.execute("""
+            INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (task_id, user_id) DO UPDATE 
+            SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+        """, task_id, sender_id, msg_id)
 
     send_telegram_alert(f"🚨🚨🚨 <b>RED FLAG на задаче #{task_id}!</b>\n<b>Исполнитель:</b> {sender_name}\n<b>Проблема:</b> {reason}")
     await broadcast_event("red_flag")
@@ -576,9 +630,7 @@ async def index():
         </button>
       </header>
 
-      <!-- ========================================== -->
       <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
-      <!-- ========================================== -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
         
         <div class="bg-slate-900 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl">
@@ -608,7 +660,6 @@ async def index():
           </div>
         </div>
 
-        <!-- 4 синхронные вкладки Шефа -->
         <div class="grid grid-cols-4 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
           <button @click="ownerTab = 'inbox'" :class="ownerTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
           <button @click="ownerTab = 'active'" :class="ownerTab === 'active' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">В работе ({{ activeTasks.length }})</button>
@@ -616,14 +667,12 @@ async def index():
           <button @click="ownerTab = 'archive'" :class="ownerTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Архив ({{ archiveTasks.length }})</button>
         </div>
 
-        <!-- Список задач Шефа -->
         <div class="space-y-3">
           <div v-if="displayedOwnerTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
             В этом разделе пока нет задач.
           </div>
 
           <div v-for="t in displayedOwnerTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
-            
             <div class="flex justify-between items-start gap-2">
               <div class="flex flex-wrap items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
@@ -637,7 +686,6 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ИСХОДНОЕ ПОРУЧЕНИЕ ШЕФА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
               <audio :src="'/api/tasks/' + t.id + '/voice'" controls preload="none" class="w-full h-8"></audio>
             </div>
@@ -656,7 +704,6 @@ async def index():
               👤 Исполнитель: {{ t.lead_name || 'Не назначен' }}
             </p>
 
-            <!-- ДАТЫ И ЧАСЫ НА КАРТОЧКЕ -->
             <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
                 <span>📅 Создано:</span>
@@ -677,19 +724,16 @@ async def index():
               <p class="text-slate-200 whitespace-pre-wrap">{{ t.result_report }}</p>
             </div>
 
-            <!-- КНОПКА ЧАТА -->
             <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
               <i class="fa-solid fa-comments"></i>
               <span>Чат по задаче</span>
-              <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{{ t.unread_count }}</span>
+              <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
             </button>
           </div>
         </div>
       </div>
 
-      <!-- ========================================== -->
       <!-- 2. КАБИНЕТ ДИРЕКТОРА (ЖАМОЛИДДИН) -->
-      <!-- ========================================== -->
       <div v-if="currentUser.role === 'DEPUTY'" class="space-y-4">
         <div class="grid grid-cols-4 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
           <button @click="deputyTab = 'inbox'" :class="deputyTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
@@ -703,8 +747,7 @@ async def index():
             В этом разделе пока нет задач.
           </div>
 
-          <div v-for="t in displayedDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-3.5 space-y-3 shadow">
-            
+          <div v-for="t in displayedDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
             <div class="flex justify-between items-start gap-2">
               <div class="flex flex-wrap items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
@@ -736,7 +779,6 @@ async def index():
               👤 Исполнитель: {{ t.lead_name || 'Не назначен' }}
             </p>
 
-            <!-- ДАТЫ И ЧАСЫ НА КАРТОЧКЕ -->
             <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
                 <span>📅 Создано:</span>
@@ -803,20 +845,16 @@ async def index():
               </div>
             </div>
 
-            <!-- КНОПКА ЧАТА ДЛЯ ЗАМА ВСЕГДА -->
             <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
               <i class="fa-solid fa-comments"></i>
               <span>Чат по задаче</span>
-              <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full">{{ t.unread_count }}</span>
+              <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
             </button>
-
           </div>
         </div>
       </div>
 
-      <!-- ========================================== -->
       <!-- 3. ЛИЧНЫЙ КАБИНЕТ ИСПОЛНИТЕЛЯ -->
-      <!-- ========================================== -->
       <div v-if="currentUser.role === 'EMPLOYEE'" class="space-y-4">
         <div class="bg-gradient-to-r from-slate-900 to-indigo-950 border border-indigo-800/50 p-4 rounded-3xl space-y-3 shadow-xl">
           <div class="flex items-center gap-3">
@@ -857,7 +895,6 @@ async def index():
           </div>
 
           <div v-for="t in displayedEmpTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
-            
             <div class="flex justify-between items-start gap-2">
               <div class="flex items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
@@ -884,7 +921,6 @@ async def index():
               </div>
             </div>
 
-            <!-- ДАТЫ И ЧАСЫ НА КАРТОЧКЕ ИСПОЛНИТЕЛЯ -->
             <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
                 <span>📅 Создано:</span>
@@ -904,7 +940,7 @@ async def index():
               <div class="grid grid-cols-2 gap-2">
                 <button @click="openChat(t)" class="bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 border border-slate-700">
                   <i class="fa-solid fa-comments"></i> Чат
-                  <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[9px] px-1.5 py-0.2 rounded-full">{{ t.unread_count }}</span>
+                  <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[9px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
                 </button>
                 <button @click="sendRedFlag(t.id)" class="bg-red-950 text-red-300 border border-red-800 hover:bg-red-900 text-xs font-bold py-2 rounded-xl flex items-center justify-center gap-1">
                   🚩 Red Flag
@@ -922,6 +958,7 @@ async def index():
               </div>
               <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700">
                 <i class="fa-solid fa-comments"></i> Чат по задаче
+                <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[9px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
               </button>
             </div>
 
@@ -959,7 +996,7 @@ async def index():
       <!-- Лента сообщений -->
       <div ref="chatContainer" class="flex-1 overflow-y-auto overscroll-contain p-3.5 space-y-2.5 bg-slate-950/80">
         
-        <!-- Лоадер при открытии чата -->
+        <!-- Лоадер -->
         <div v-if="isChatLoading" class="flex flex-col items-center justify-center h-full text-slate-400 py-12 space-y-2">
           <i class="fa-solid fa-circle-notch fa-spin text-2xl text-indigo-500"></i>
           <span class="text-xs font-semibold">Загрузка сообщений...</span>
@@ -987,6 +1024,7 @@ async def index():
               <img :src="m.media_url" class="rounded-lg max-h-44 object-cover">
             </div>
 
+            <!-- Галочки прочтения в стиле Telegram -->
             <div class="text-right text-[10px] leading-none pt-0.5">
               <span v-if="isMyMessage(m)" :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
                 {{ m.is_read ? '✓✓' : '✓' }}
@@ -1124,7 +1162,6 @@ async def index():
           });
         };
 
-        // ДЕДЛАЙН: Текущий день, час и минута
         const getDefaultLocalDateTimeInput = () => {
           const now = new Date();
           const offset = now.getTimezoneOffset() * 60000;
@@ -1328,13 +1365,13 @@ async def index():
           await loadData();
         };
 
-        // ОТКРЫТИЕ ЧАТА (СБРОС БЕЙДЖА, ИЗОЛЯЦИЯ СКРОЛЛА, ЛОАДЕР)
+        // ОТКРЫТИЕ ЧАТА (ОПТИМИСТИЧНЫЙ СБРОС СЧЕТЧИКА + СИНХРОНИЗАЦИЯ)
         const openChat = async (task) => {
           activeChatTask.value = task;
           chatMessages.value = [];
           isChatLoading.value = true;
           document.body.classList.add('overflow-hidden');
-          task.unread_count = 0; // Мгновенный отклик в интерфейсе
+          task.unread_count = 0;
           
           await loadMessages();
           isChatLoading.value = false;
@@ -1345,6 +1382,7 @@ async def index():
         const closeChat = () => {
           activeChatTask.value = null;
           document.body.classList.remove('overflow-hidden');
+          loadData();
         };
 
         const loadMessages = async () => {
