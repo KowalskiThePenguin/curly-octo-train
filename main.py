@@ -315,7 +315,7 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
+            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), user_id, True)
 
         send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от Хуршида</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         await broadcast_event("new_task")
@@ -327,7 +327,7 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
 @app.post("/api/tasks/{task_id}/assign")
 async def assign_task(
     task_id: int, 
-    lead_id: int = Form(...),
+    lead_id: int = Form(...), 
     assignee_ids: str = Form("[]"),
     project_group: str = Form("Проект Кормовая Мука"),
     priority: str = Form("URGENT"),
@@ -347,7 +347,6 @@ async def assign_task(
         else:
             dt_deadline = datetime.now(timezone.utc) + timedelta(days=1)
 
-        # Парсинг массива исполнителей
         parsed_assignees = []
         try:
             parsed_assignees = json.loads(assignee_ids)
@@ -360,10 +359,12 @@ async def assign_task(
         pool = await get_db()
         async with pool.acquire() as conn:
             lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
+            team_rows = await conn.fetch("SELECT full_name FROM users WHERE id = ANY($1)", parsed_assignees)
+            team_str = ", ".join([r['full_name'] for r in team_rows])
 
             await conn.execute("""
                 UPDATE tasks 
-                SET lead_user_id = $1,
+                SET lead_user_id = $1, 
                     assignee_ids = $2,
                     project_group = $3,
                     priority = $4,
@@ -379,11 +380,113 @@ async def assign_task(
             await conn.execute("""
                 INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content)
                 VALUES ($1, 2, 'DEPUTY', 'Жамолиддин', 'SYSTEM', $2)
-            """, task_id, f"🚀 Задача назначена в группу [{project_group}]. Лид: {lead_name}")
+            """, task_id, f"🚀 Задача утверждена и передана в работу.\n📁 Группа: {project_group}\n👑 Лид: {lead_name}\n👥 Команда: {team_str}")
 
         send_telegram_alert(f"🚀 <b>Задача #{task_id} передана в работу</b>\n📁 <b>Группа:</b> {project_group}\n👑 <b>Лид:</b> {lead_name}\n<b>Приоритет:</b> {priority}")
         await broadcast_event("task_assigned")
         return {"status": "ok"}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+# 1. РЕДАКТИРОВАНИЕ ДЕТАЛЕЙ ЗАДАЧИ ДИРЕКТОРОМ (С УВЕДОМЛЕНИЕМ В ЧАТ)
+@app.post("/api/tasks/{task_id}/update-details")
+async def update_task_details(
+    task_id: int,
+    title: str = Form(...),
+    ai_summary: str = Form(...),
+    definition_of_done: str = Form(...),
+    project_group: str = Form(...),
+    priority: str = Form(...),
+    deadline: str = Form(...),
+    user_name: str = Form("Жамолиддин")
+):
+    try:
+        dt_deadline = None
+        if deadline:
+            try:
+                clean_dl = deadline.replace("Z", "+00:00")
+                dt_deadline = datetime.fromisoformat(clean_dl)
+            except Exception:
+                dt_deadline = datetime.now(timezone.utc) + timedelta(days=1)
+
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE tasks 
+                SET title = $1, 
+                    ai_summary = $2, 
+                    definition_of_done = $3, 
+                    project_group = $4, 
+                    priority = $5, 
+                    deadline = $6 
+                WHERE id = $7
+            """, title, ai_summary, definition_of_done, project_group, priority, dt_deadline, task_id)
+
+            priority_map = {'URGENT': '🔴 Оперативно', 'NORMAL': '🟡 Умеренно', 'FUTURE': '🔵 На будущее'}
+            sys_msg = (
+                f"✏️ Директор {user_name} обновил параметры задачи:\n"
+                f"• Заголовок: {title}\n"
+                f"• Группа: {project_group}\n"
+                f"• Важность: {priority_map.get(priority, priority)}\n"
+                f"• Срок: {deadline[:16].replace('T', ' ')}"
+            )
+
+            await conn.execute("""
+                INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+                VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
+            """, task_id, user_name, sys_msg)
+
+        await broadcast_event("task_updated")
+        return {"status": "ok"}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+# 2. ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ И ЛИДА (С ПРОВЕРКОЙ И УВЕДОМЛЕНИЕМ В ЧАТ)
+@app.post("/api/tasks/{task_id}/update-team")
+async def update_task_team(
+    task_id: int,
+    lead_id: int = Form(...),
+    assignee_ids: str = Form(...),
+    user_name: str = Form("Жамолиддин")
+):
+    try:
+        parsed_assignees = json.loads(assignee_ids)
+        if not parsed_assignees or len(parsed_assignees) == 0:
+            raise HTTPException(status_code=400, detail="Нельзя убрать всех исполнителей. В задаче должен остаться минимум 1 человек.")
+        
+        if lead_id not in parsed_assignees:
+            lead_id = parsed_assignees[0]
+
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            old_task = await conn.fetchrow("""
+                SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1
+            """, task_id)
+
+            lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
+            team_rows = await conn.fetch("SELECT full_name FROM users WHERE id = ANY($1)", parsed_assignees)
+            team_str = ", ".join([r['full_name'] for r in team_rows])
+
+            await conn.execute("""
+                UPDATE tasks 
+                SET lead_user_id = $1, 
+                    assignee_ids = $2 
+                WHERE id = $3
+            """, lead_id, parsed_assignees, task_id)
+
+            sys_msg = f"👥 Директор {user_name} изменил состав команды:\n👑 Лид: {lead_name}\n👥 Исполнители: {team_str}"
+
+            await conn.execute("""
+                INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+                VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
+            """, task_id, user_name, sys_msg)
+
+        await broadcast_event("team_updated")
+        return {"status": "ok"}
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
@@ -429,7 +532,6 @@ async def request_stage(
 ):
     pool = await get_db()
     async with pool.acquire() as conn:
-        # Проверка: только Лид задачи может отправлять запросы этапов
         lead_id = await conn.fetchval("SELECT lead_user_id FROM tasks WHERE id = $1", task_id)
         if lead_id != user_id:
             raise HTTPException(status_code=403, detail="Только Лид команды имеет право отправлять запросы на утверждение этапов.")
@@ -713,7 +815,7 @@ async def index():
         </button>
       </header>
 
-      <!-- ПАНЕЛЬ ФИЛЬТРОВ (ПРОЕКТ, ВАЖНОСТЬ, ИСПОЛНИТЕЛЬ, СРОК) -->
+      <!-- ПАНЕЛЬ ФИЛЬТРОВ -->
       <div class="bg-slate-900/90 border border-slate-800 p-3 rounded-2xl space-y-2.5 shadow-md">
         <div class="flex justify-between items-center">
           <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
@@ -725,7 +827,6 @@ async def index():
         </div>
 
         <div class="grid grid-cols-2 gap-2 text-xs">
-          <!-- Фильтр по проекту -->
           <div>
             <label class="block text-[9px] font-bold text-slate-400 mb-1">Проект:</label>
             <select v-model="filterProject" class="w-full bg-slate-950 border border-slate-800 text-[11px] p-2 rounded-xl text-white outline-none focus:border-indigo-500">
@@ -735,7 +836,6 @@ async def index():
             </select>
           </div>
 
-          <!-- Фильтр по важности -->
           <div>
             <label class="block text-[9px] font-bold text-slate-400 mb-1">Важность:</label>
             <select v-model="filterPriority" class="w-full bg-slate-950 border border-slate-800 text-[11px] p-2 rounded-xl text-white outline-none focus:border-indigo-500">
@@ -748,7 +848,6 @@ async def index():
         </div>
 
         <div class="grid grid-cols-2 gap-2 items-center text-xs">
-          <!-- Фильтр по сотруднику (для Шефа и Директора) -->
           <div v-if="currentUser.role !== 'EMPLOYEE'">
             <label class="block text-[9px] font-bold text-slate-400 mb-1">Исполнитель/Лид:</label>
             <select v-model="filterExecutor" class="w-full bg-slate-950 border border-slate-800 text-[11px] p-2 rounded-xl text-white outline-none focus:border-indigo-500">
@@ -757,7 +856,6 @@ async def index():
             </select>
           </div>
 
-          <!-- Тумблер горящих дедлайнов -->
           <div :class="currentUser.role === 'EMPLOYEE' ? 'col-span-2' : ''" class="pt-2">
             <button @click="filterUrgentOnly = !filterUrgentOnly" :class="filterUrgentOnly ? 'bg-red-950 border-red-800 text-red-300 font-bold' : 'bg-slate-950 border-slate-800 text-slate-400'" class="w-full py-2 px-3 rounded-xl border text-[11px] flex items-center justify-center gap-1.5 transition">
               <i class="fa-solid fa-fire text-amber-500"></i>
@@ -971,14 +1069,13 @@ async def index():
               </div>
             </div>
 
-            <!-- ФОРМА НАЗНАЧЕНИЯ (ПРОЕКТ + ЛИД + КОМАНДА) -->
+            <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ -->
             <div v-if="t.status === 'DRAFT'" class="space-y-2.5 pt-1 border-t border-slate-800">
               <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
               <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
               <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" placeholder="Критерии сдачи (DoD)" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
 
               <div class="grid grid-cols-2 gap-2">
-                <!-- Выбор проекта -->
                 <div>
                   <label class="block text-[10px] font-bold text-slate-400 mb-1">Группа проекта:</label>
                   <select v-model="editDrafts[t.id].project_group" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500 font-bold">
@@ -987,7 +1084,6 @@ async def index():
                   </select>
                 </div>
 
-                <!-- Важность -->
                 <div>
                   <label class="block text-[10px] font-bold text-slate-400 mb-1">Важность:</label>
                   <select v-model="editDrafts[t.id].priority" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
@@ -998,15 +1094,13 @@ async def index():
                 </div>
               </div>
 
-              <!-- Выбор Лида -->
               <div>
-                <label class="block text-[10px] font-bold text-amber-300 mb-1">👑 Лид команды (Отвечает за сдачу):</label>
+                <label class="block text-[10px] font-bold text-amber-300 mb-1">👑 Лид команды:</label>
                 <select v-model="editDrafts[t.id].lead_id" @change="ensureLeadInAssignees(t.id)" class="w-full bg-slate-950 border border-amber-500/50 text-xs p-2 rounded-xl text-amber-300 font-bold outline-none focus:border-amber-400">
                   <option v-for="u in employeesOnly" :key="u.id" :value="u.id">{{ u.full_name }} (Лид)</option>
                 </select>
               </div>
 
-              <!-- Чекбоксы состава команды -->
               <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800 space-y-1.5">
                 <label class="block text-[10px] font-bold text-slate-400">👥 Состав исполнителей команды:</label>
                 <div class="grid grid-cols-3 gap-1 text-[11px]">
@@ -1027,7 +1121,7 @@ async def index():
               </button>
             </div>
 
-            <!-- УПРАВЛЕНИЕ ЭТАПАМИ ДЛЯ ДИРЕКТОРА -->
+            <!-- УПРАВЛЕНИЕ И РЕДАКТИРОВАНИЕ В ПРОЦЕССЕ РАБОТЫ -->
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-2 border-t border-slate-800">
               <div v-if="t.pending_request" class="p-2.5 bg-amber-950/40 border border-amber-800/60 rounded-xl space-y-2 animate-pulse">
                 <div class="flex justify-between items-center text-xs font-bold text-amber-300">
@@ -1059,6 +1153,16 @@ async def index():
                     В архив
                   </button>
                 </div>
+              </div>
+
+              <!-- КНОПКИ РЕДАКТИРОВАНИЯ ДЕТАЛЕЙ И СОСТАВА КОМАНДЫ ДИРЕКТОРОМ -->
+              <div class="grid grid-cols-2 gap-2 pt-1 border-t border-slate-800/80">
+                <button @click="openEditDetailsModal(t)" class="py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-indigo-300 text-xs font-bold border border-slate-700 flex items-center justify-center gap-1.5 transition">
+                  <i class="fa-solid fa-pen-to-square"></i> Изменить ТЗ/Срок
+                </button>
+                <button @click="openManageTeamModal(t)" class="py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-bold border border-slate-700 flex items-center justify-center gap-1.5 transition">
+                  <i class="fa-solid fa-users-gear"></i> Состав команды
+                </button>
               </div>
             </div>
 
@@ -1182,8 +1286,6 @@ async def index():
             </div>
 
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1 border-t border-slate-800">
-              
-              <!-- КНОПКИ ЗАПРОСА: ВИДНЫ ТОЛЬКО ЛИДУ -->
               <div v-if="t.lead_user_id === currentUser.id">
                 <div v-if="t.pending_request" class="bg-amber-950/30 border border-amber-800/50 p-2 rounded-xl text-center text-xs text-amber-300 font-bold">
                   ⏳ Ваш запрос ({{ t.pending_request === 'ARCHIVE' ? 'Архив' : t.pending_request + '%' }}) ожидает решения Жамолиддина
@@ -1205,7 +1307,6 @@ async def index():
                 </div>
               </div>
 
-              <!-- СООБЩЕНИЕ ДЛЯ УЧАСТНИКОВ КОМАНДЫ (НЕ ЛИДОВ) -->
               <div v-else class="bg-slate-950 p-2 rounded-xl border border-slate-800 text-[11px] text-slate-400">
                 👥 Вы состоите в команде. Запросы на утверждение этапов отправляет Лид (<strong class="text-indigo-300">{{ t.lead_name }}</strong>).
               </div>
@@ -1233,7 +1334,114 @@ async def index():
 
     </div>
 
-    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ -->
+    <!-- ========================================== -->
+    <!-- МОДАЛЬНОЕ ОКНО: РЕДАКТИРОВАНИЕ ДЕТАЛЕЙ ЗАДАЧИ -->
+    <!-- ========================================== -->
+    <div v-if="editingDetailsTask" class="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-center justify-center p-3.5">
+      <div class="bg-slate-900 border border-slate-800 rounded-3xl p-5 max-w-sm w-full space-y-3.5 shadow-2xl">
+        <div class="flex justify-between items-center">
+          <h3 class="text-sm font-bold text-white flex items-center gap-1.5">
+            <i class="fa-solid fa-pen-to-square text-indigo-400"></i> Редактирование ТЗ #{{ editingDetailsTask.id }}
+          </h3>
+          <button @click="editingDetailsTask = null" class="w-7 h-7 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs hover:text-white">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+
+        <div class="space-y-2 text-xs">
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 mb-1">Заголовок:</label>
+            <input v-model="editDetailsForm.title" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
+          </div>
+
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 mb-1">Суть ТЗ:</label>
+            <textarea v-model="editDetailsForm.ai_summary" rows="2" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
+          </div>
+
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 mb-1">Критерии сдачи (DoD):</label>
+            <textarea v-model="editDetailsForm.definition_of_done" rows="2" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-[10px] font-bold text-slate-400 mb-1">Группа проекта:</label>
+              <select v-model="editDetailsForm.project_group" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-white outline-none focus:border-indigo-500 font-bold">
+                <option value="Проект Кормовая Мука">Кормовая Мука</option>
+                <option value="Мука Евразия">Мука Евразия</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="block text-[10px] font-bold text-slate-400 mb-1">Важность:</label>
+              <select v-model="editDetailsForm.priority" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+                <option value="URGENT">🔴 Оперативно</option>
+                <option value="NORMAL">🟡 Умеренно</option>
+                <option value="FUTURE">🔵 На будущее</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 mb-1">Дедлайн (местное время):</label>
+            <input v-model="editDetailsForm.deadline" type="datetime-local" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+          </div>
+        </div>
+
+        <button @click="saveTaskDetails" class="w-full bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-bold py-2.5 rounded-xl text-xs shadow-lg transition">
+          💾 Сохранить изменения и уведомить в чате
+        </button>
+      </div>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- МОДАЛЬНОЕ ОКНО: УПРАВЛЕНИЕ КОМАНДОЙ И ЛИДОМ -->
+    <!-- ========================================== -->
+    <div v-if="managingTeamTask" class="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-center justify-center p-3.5">
+      <div class="bg-slate-900 border border-slate-800 rounded-3xl p-5 max-w-sm w-full space-y-3.5 shadow-2xl">
+        <div class="flex justify-between items-center">
+          <h3 class="text-sm font-bold text-white flex items-center gap-1.5">
+            <i class="fa-solid fa-users-gear text-amber-400"></i> Состав команды #{{ managingTeamTask.id }}
+          </h3>
+          <button @click="managingTeamTask = null" class="w-7 h-7 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs hover:text-white">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+
+        <div class="space-y-3 text-xs">
+          <!-- Чекбоксы выбора участников -->
+          <div class="bg-slate-950 p-3 rounded-2xl border border-slate-800 space-y-2">
+            <label class="block text-[10px] font-bold text-slate-400 uppercase">Выберите участников (минимум 1):</label>
+            <div class="space-y-1.5">
+              <label v-for="u in employeesOnly" :key="u.id" class="flex items-center justify-between p-2 rounded-xl hover:bg-slate-900 cursor-pointer border border-transparent hover:border-slate-800">
+                <div class="flex items-center gap-2">
+                  <input type="checkbox" :value="u.id" v-model="teamManageForm.assignee_ids" @change="onAssigneeCheckboxChange(u.id)" class="rounded bg-slate-800 text-indigo-600 focus:ring-0">
+                  <span class="text-white font-semibold">{{ u.full_name }}</span>
+                </div>
+                <span v-if="teamManageForm.lead_id === u.id" class="text-[10px] bg-amber-500/20 text-amber-300 font-black px-2 py-0.5 rounded border border-amber-500/30">👑 Лид</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Выбор Лида из отмеченных -->
+          <div>
+            <label class="block text-[10px] font-bold text-amber-300 mb-1">👑 Назначить Лида команды:</label>
+            <select v-model="teamManageForm.lead_id" class="w-full bg-slate-950 border border-amber-500/60 p-2.5 rounded-xl text-amber-300 font-bold outline-none focus:border-amber-400">
+              <option v-for="u in selectedAssigneesObjects" :key="u.id" :value="u.id">{{ u.full_name }} (Лид)</option>
+            </select>
+          </div>
+        </div>
+
+        <button @click="saveTaskTeam" :disabled="teamManageForm.assignee_ids.length === 0" class="w-full bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 disabled:opacity-50 text-slate-950 font-black py-2.5 rounded-xl text-xs shadow-lg transition">
+          👥 Сохранить команду и уведомить в чате
+        </button>
+      </div>
+    </div>
+
+    <!-- ========================================== -->
+    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (ENTERPRISE VIEW) -->
+    <!-- ========================================== -->
     <div v-if="activeChatTask" class="fixed inset-0 bg-slate-950 z-50 flex flex-col h-[100dvh] w-full max-w-md mx-auto overscroll-contain">
       
       <div class="p-3.5 border-b border-slate-800/80 flex justify-between items-center bg-slate-900/90 backdrop-blur-xl shrink-0 shadow-lg">
@@ -1266,7 +1474,7 @@ async def index():
         </div>
 
         <div v-else v-for="m in chatMessages" :key="m.id" :class="isMyMessage(m) ? 'justify-end' : 'justify-start'" class="flex">
-          <div :class="isMyMessage(m) ? 'bg-gradient-to-br from-indigo-600 to-indigo-700 text-white rounded-tr-none shadow-indigo-600/20' : (m.message_type === 'REDFLAG' ? 'bg-red-950/80 border border-red-800/80 text-red-200' : 'bg-slate-900 border border-slate-800/90 text-slate-200 rounded-tl-none')" class="max-w-[84%] rounded-2xl p-3 shadow-md text-xs space-y-1.5 transition-all">
+          <div :class="isMyMessage(m) ? 'bg-gradient-to-br from-indigo-600 to-indigo-700 text-white rounded-tr-none shadow-indigo-600/20' : (m.message_type === 'REDFLAG' ? 'bg-red-950/80 border border-red-800/80 text-red-200' : (m.message_type === 'SYSTEM' ? 'bg-indigo-950/40 border border-indigo-800/50 text-indigo-200 rounded-xl max-w-full' : 'bg-slate-900 border border-slate-800/90 text-slate-200 rounded-tl-none'))" class="max-w-[84%] rounded-2xl p-3 shadow-md text-xs space-y-1.5 transition-all">
             
             <div class="flex justify-between items-center gap-3 text-[9px] opacity-75 font-semibold">
               <span>{{ m.sender_name }} ({{ formatRoleName(m.sender_role) }})</span>
@@ -1307,7 +1515,7 @@ async def index():
               </div>
             </div>
 
-            <div class="text-right text-[10px] leading-none pt-0.5">
+            <div v-if="m.message_type !== 'SYSTEM'" class="text-right text-[10px] leading-none pt-0.5">
               <span v-if="isMyMessage(m)">
                 <span v-if="isPendingMessage(m)" class="text-[9px] text-amber-300 font-semibold opacity-90">В очереди...</span>
                 <span v-else :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
@@ -1454,6 +1662,17 @@ async def index():
         const filterExecutor = ref('ALL');
         const filterUrgentOnly = ref(false);
 
+        // МОДАЛЬНЫЕ ОКНА РЕДАКТИРОВАНИЯ ДЛЯ ДИРЕКТОРА
+        const editingDetailsTask = ref(null);
+        const editDetailsForm = ref({
+          title: '', ai_summary: '', definition_of_done: '', project_group: '', priority: '', deadline: ''
+        });
+
+        const managingTeamTask = ref(null);
+        const teamManageForm = ref({
+          lead_id: null, assignee_ids: []
+        });
+
         const tasks = ref([]);
         const users = ref([]);
         let mediaRecorder = null;
@@ -1500,6 +1719,10 @@ async def index():
 
         const employeesOnly = computed(() => users.value.filter(u => u.role === 'EMPLOYEE'));
 
+        const selectedAssigneesObjects = computed(() => {
+          return employeesOnly.value.filter(u => teamManageForm.value.assignee_ids.includes(u.id));
+        });
+
         const hasActiveFilters = computed(() => {
           return filterProject.value !== 'ALL' || filterPriority.value !== 'ALL' || filterExecutor.value !== 'ALL' || filterUrgentOnly.value;
         });
@@ -1511,7 +1734,6 @@ async def index():
           filterUrgentOnly.value = false;
         };
 
-        // УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ФИЛЬТРАЦИИ
         const applyTaskFilters = (taskList) => {
           return taskList.filter(t => {
             if (filterProject.value !== 'ALL' && t.project_group !== filterProject.value) return false;
@@ -1548,7 +1770,6 @@ async def index():
         });
         const filteredDeputyTasks = computed(() => applyTaskFilters(displayedDeputyTasks.value));
 
-        // Задачи исполнителя (он Лид или состоит в команде assignee_ids)
         const myTasks = computed(() => tasks.value.filter(t => {
           if (!currentUser.value) return false;
           return t.lead_user_id === currentUser.value.id || (t.assignee_ids && t.assignee_ids.includes(currentUser.value.id));
@@ -1877,6 +2098,101 @@ async def index():
             await loadData();
             deputyTab.value = 'active';
             alert('🚀 Задача утверждена и передана команде!');
+          } catch (e) {
+            alert('❌ ' + e.message);
+          }
+        };
+
+        // ДИРЕКТОР: ОТКРЫТИЕ И СОХРАНЕНИЕ ДЕТАЛЕЙ ЗАДАЧИ
+        const openEditDetailsModal = (task) => {
+          editingDetailsTask.value = task;
+          let initialDL = getDefaultLocalDateTimeInput();
+          if (task.deadline) {
+            const d = new Date(task.deadline);
+            const offset = d.getTimezoneOffset() * 60000;
+            initialDL = new Date(d.getTime() - offset).toISOString().slice(0, 16);
+          }
+          editDetailsForm.value = {
+            title: task.title,
+            ai_summary: task.ai_summary,
+            definition_of_done: task.definition_of_done,
+            project_group: task.project_group || 'Проект Кормовая Мука',
+            priority: task.priority || 'URGENT',
+            deadline: initialDL
+          };
+        };
+
+        const saveTaskDetails = async () => {
+          if (!editingDetailsTask.value) return;
+          const fd = new FormData();
+          fd.append('title', editDetailsForm.value.title);
+          fd.append('ai_summary', editDetailsForm.value.ai_summary);
+          fd.append('definition_of_done', editDetailsForm.value.definition_of_done);
+          fd.append('project_group', editDetailsForm.value.project_group);
+          fd.append('priority', editDetailsForm.value.priority);
+          
+          const d = new Date(editDetailsForm.value.deadline);
+          const deadlineIso = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+          fd.append('deadline', deadlineIso);
+          fd.append('user_name', currentUser.value.full_name);
+
+          try {
+            const res = await fetch(`/api/tasks/${editingDetailsTask.value.id}/update-details`, { method: 'POST', body: fd });
+            if (!res.ok) throw new Error('Ошибка обновления параметров');
+            editingDetailsTask.value = null;
+            await loadData();
+            alert('✅ Детали задачи обновлены, уведомление отправлено в чат!');
+          } catch (e) {
+            alert('❌ ' + e.message);
+          }
+        };
+
+        // ДИРЕКТОР: УПРАВЛЕНИЕ КОМАНДОЙ И ЛИДОМ
+        const openManageTeamModal = (task) => {
+          managingTeamTask.value = task;
+          const currentAssignees = (task.assignee_ids && task.assignee_ids.length > 0) ? [...task.assignee_ids] : [task.lead_user_id];
+          teamManageForm.value = {
+            lead_id: task.lead_user_id,
+            assignee_ids: currentAssignees
+          };
+        };
+
+        const onAssigneeCheckboxChange = (uncheckId) => {
+          if (teamManageForm.value.assignee_ids.length === 0) {
+            teamManageForm.value.assignee_ids.push(uncheckId);
+            alert('⚠️ В задаче должен оставаться минимум 1 исполнитель!');
+            return;
+          }
+          // Если снят текущий Лид, выбираем нового Лида из оставшихся
+          if (!teamManageForm.value.assignee_ids.includes(teamManageForm.value.lead_id)) {
+            teamManageForm.value.lead_id = teamManageForm.value.assignee_ids[0];
+          }
+        };
+
+        const saveTaskTeam = async () => {
+          if (!managingTeamTask.value) return;
+          if (teamManageForm.value.assignee_ids.length === 0) {
+            alert('⚠️ Выберите хотя бы одного исполнителя!');
+            return;
+          }
+          if (!teamManageForm.value.assignee_ids.includes(teamManageForm.value.lead_id)) {
+            teamManageForm.value.lead_id = teamManageForm.value.assignee_ids[0];
+          }
+
+          const fd = new FormData();
+          fd.append('lead_id', teamManageForm.value.lead_id);
+          fd.append('assignee_ids', JSON.stringify(teamManageForm.value.assignee_ids));
+          fd.append('user_name', currentUser.value.full_name);
+
+          try {
+            const res = await fetch(`/api/tasks/${managingTeamTask.value.id}/update-team`, { method: 'POST', body: fd });
+            if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.detail || 'Ошибка обновления команды');
+            }
+            managingTeamTask.value = null;
+            await loadData();
+            alert('👥 Состав команды обновлен, отчет отправлен в чат задачи!');
           } catch (e) {
             alert('❌ ' + e.message);
           }
@@ -2387,6 +2703,8 @@ async def index():
           currentUser, loginForm, isLoggingIn, isOnline, ownerTab, deputyTab, empTab, isRecording, isProcessing,
           recordSeconds, textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
           filterProject, filterPriority, filterExecutor, filterUrgentOnly, hasActiveFilters, resetFilters,
+          editingDetailsTask, editDetailsForm, openEditDetailsModal, saveTaskDetails,
+          managingTeamTask, teamManageForm, selectedAssigneesObjects, openManageTeamModal, onAssigneeCheckboxChange, saveTaskTeam,
           inboxTasks, activeTasks, archiveTasks,
           filteredOwnerTasks, filteredDeputyTasks, filteredEmpTasks,
           myActiveTasks, myArchiveTasks, isMyMessage, isPendingMessage,
