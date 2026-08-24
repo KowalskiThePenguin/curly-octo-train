@@ -84,6 +84,8 @@ async def startup():
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result_report TEXT;
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS progress INT DEFAULT 0;
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pending_request VARCHAR(30);
+            ALTER TABLE tasks ADD COLUMN IF NOT EXISTS project_group VARCHAR(100) DEFAULT 'Проект Кормовая Мука';
+            ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignee_ids INT[] DEFAULT '{}';
 
             CREATE TABLE IF NOT EXISTS task_messages (
                 id SERIAL PRIMARY KEY,
@@ -170,7 +172,8 @@ SYSTEM_PROMPT = """
   "ai_summary": "Суть задачи в 2 предложениях",
   "definition_of_done": "1. Первый пункт\\n2. Второй пункт",
   "task_type": "SOLO",
-  "priority": "URGENT"
+  "priority": "URGENT",
+  "project_group": "Проект Кормовая Мука"
 }
 """
 
@@ -199,7 +202,8 @@ def query_gemini_direct(parts_list: list) -> dict:
         "ai_summary": "Поручение принято и передано Директору",
         "definition_of_done": "1. Выполнить поручение в срок",
         "task_type": "SOLO",
-        "priority": "URGENT"
+        "priority": "URGENT",
+        "project_group": "Проект Кормовая Мука"
     }
 
 @app.get("/api/users")
@@ -216,11 +220,14 @@ async def get_tasks(viewer_user_id: int = 1):
         tasks = await conn.fetch("""
             SELECT t.id, t.title, t.raw_input_text, t.ai_summary, t.definition_of_done,
                    t.task_type, t.status, t.priority, t.lead_user_id, t.result_report,
+                   COALESCE(t.project_group, 'Проект Кормовая Мука') as project_group,
+                   COALESCE(t.assignee_ids, '{}') as assignee_ids,
                    COALESCE(t.progress, 0) as progress, t.pending_request,
                    to_char(t.deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as deadline,
                    to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
                    to_char(t.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as completed_at,
                    u.full_name as lead_name,
+                   (SELECT string_agg(u2.full_name, ', ') FROM users u2 WHERE u2.id = ANY(t.assignee_ids)) as team_names,
                    (EXISTS(SELECT 1 FROM media_attachments m WHERE m.task_id = t.id AND m.attachment_type = 'VOICE_ORIGINAL')) as has_voice,
                    (SELECT COUNT(*) FROM task_messages msg 
                     WHERE msg.task_id = t.id 
@@ -279,17 +286,17 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         pool = await get_db()
         async with pool.acquire() as conn:
             task_id = await conn.fetchval("""
-                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, created_by, is_urgent, created_at, progress)
-                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, NOW(), 0)
+                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
+                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", "Голосовое поручение"), "Голосовая аудиозапись Шефа", parsed.get("ai_summary", ""), parsed.get("definition_of_done", ""), parsed.get("task_type", "SOLO"), parsed.get("priority", "URGENT"), user_id, True)
+            """, parsed.get("title", "Голосовое поручение"), "Голосовая аудиозапись Шефа", parsed.get("ai_summary", ""), parsed.get("definition_of_done", ""), parsed.get("task_type", "SOLO"), parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
 
             await conn.execute("""
                 INSERT INTO media_attachments (task_id, sender_id, attachment_type, file_url, transcript)
                 VALUES ($1, $2, 'VOICE_ORIGINAL', $3, $4)
             """, task_id, user_id, audio_b64, parsed.get("ai_summary", ""))
 
-        send_telegram_alert(f"🎙 <b>Новое поручение #{task_id} от Хуршида</b>\n\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        send_telegram_alert(f"🎙 <b>Новое поручение #{task_id} от Хуршида</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         await broadcast_event("new_task")
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
@@ -305,12 +312,12 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
         pool = await get_db()
         async with pool.acquire() as conn:
             task_id = await conn.fetchval("""
-                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, created_by, is_urgent, created_at, progress)
-                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, NOW(), 0)
+                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
+                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), user_id, True)
+            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
 
-        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от Хуршида</b>\n\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от Хуршида</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         await broadcast_event("new_task")
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
@@ -320,7 +327,9 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
 @app.post("/api/tasks/{task_id}/assign")
 async def assign_task(
     task_id: int, 
-    lead_id: int = Form(...), 
+    lead_id: int = Form(...),
+    assignee_ids: str = Form("[]"),
+    project_group: str = Form("Проект Кормовая Мука"),
     priority: str = Form("URGENT"),
     deadline: str = Form(...),
     title: str = Form(None),
@@ -338,29 +347,41 @@ async def assign_task(
         else:
             dt_deadline = datetime.now(timezone.utc) + timedelta(days=1)
 
+        # Парсинг массива исполнителей
+        parsed_assignees = []
+        try:
+            parsed_assignees = json.loads(assignee_ids)
+        except Exception:
+            parsed_assignees = [int(x) for x in assignee_ids.split(",") if x.strip().isdigit()]
+        
+        if lead_id not in parsed_assignees:
+            parsed_assignees.append(lead_id)
+
         pool = await get_db()
         async with pool.acquire() as conn:
             lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
 
             await conn.execute("""
                 UPDATE tasks 
-                SET lead_user_id = $1, 
-                    priority = $2,
-                    deadline = $3,
-                    title = COALESCE($4, title),
-                    ai_summary = COALESCE($5, ai_summary),
-                    definition_of_done = COALESCE($6, definition_of_done),
+                SET lead_user_id = $1,
+                    assignee_ids = $2,
+                    project_group = $3,
+                    priority = $4,
+                    deadline = $5,
+                    title = COALESCE($6, title),
+                    ai_summary = COALESCE($7, ai_summary),
+                    definition_of_done = COALESCE($8, definition_of_done),
                     status = 'IN_PROGRESS',
                     progress = 0
-                WHERE id = $7
-            """, lead_id, priority, dt_deadline, title, ai_summary, definition_of_done, task_id)
+                WHERE id = $9
+            """, lead_id, parsed_assignees, project_group, priority, dt_deadline, title, ai_summary, definition_of_done, task_id)
 
             await conn.execute("""
                 INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content)
                 VALUES ($1, 2, 'DEPUTY', 'Жамолиддин', 'SYSTEM', $2)
-            """, task_id, f"🚀 Задача назначена исполнителю: {lead_name}")
+            """, task_id, f"🚀 Задача назначена в группу [{project_group}]. Лид: {lead_name}")
 
-        send_telegram_alert(f"🚀 <b>Задача #{task_id} передана в работу</b>\n<b>Исполнитель:</b> {lead_name}\n<b>Приоритет:</b> {priority}")
+        send_telegram_alert(f"🚀 <b>Задача #{task_id} передана в работу</b>\n📁 <b>Группа:</b> {project_group}\n👑 <b>Лид:</b> {lead_name}\n<b>Приоритет:</b> {priority}")
         await broadcast_event("task_assigned")
         return {"status": "ok"}
     except Exception as e:
@@ -408,6 +429,11 @@ async def request_stage(
 ):
     pool = await get_db()
     async with pool.acquire() as conn:
+        # Проверка: только Лид задачи может отправлять запросы этапов
+        lead_id = await conn.fetchval("SELECT lead_user_id FROM tasks WHERE id = $1", task_id)
+        if lead_id != user_id:
+            raise HTTPException(status_code=403, detail="Только Лид команды имеет право отправлять запросы на утверждение этапов.")
+
         await conn.execute("""
             UPDATE tasks 
             SET pending_request = $1 
@@ -415,14 +441,14 @@ async def request_stage(
         """, stage, task_id)
 
         target_str = "сдачу в архив" if stage == 'ARCHIVE' else f"этап {stage}%"
-        sys_msg = f"📌 Исполнитель {user_name} запросил подтверждение на {target_str}."
+        sys_msg = f"📌 Лид команды {user_name} запросил подтверждение на {target_str}."
 
         await conn.execute("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
             VALUES ($1, $2, 'EMPLOYEE', $3, 'SYSTEM', $4, NOW())
         """, task_id, user_id, user_name, sys_msg)
 
-    send_telegram_alert(f"📌 <b>Задача #{task_id}: запрос подтверждения</b>\n<b>Исполнитель:</b> {user_name}\n<b>Запрос:</b> {target_str}")
+    send_telegram_alert(f"📌 <b>Задача #{task_id}: запрос подтверждения</b>\n👑 <b>Лид:</b> {user_name}\n<b>Запрос:</b> {target_str}")
     await broadcast_event("stage_requested")
     return {"status": "ok"}
 
@@ -445,7 +471,7 @@ async def confirm_stage_request(
             raise HTTPException(status_code=400, detail="Нет активного запроса на подтверждение")
 
         req_stage = task['pending_request']
-        lead_name = task['lead_name'] or 'Исполнитель'
+        lead_name = task['lead_name'] or 'Лид'
         target_str = "сдачу в архив" if req_stage == 'ARCHIVE' else f"этап {req_stage}%"
 
         if approve:
@@ -462,10 +488,10 @@ async def confirm_stage_request(
                     SET progress = $1, pending_request = NULL 
                     WHERE id = $2
                 """, prog_val, task_id)
-            sys_msg = f"✅ Директор {user_name} подтвердил запрос ({lead_name}: {target_str})."
+            sys_msg = f"✅ Директор {user_name} подтвердил запрос (Лид {lead_name}: {target_str})."
         else:
             await conn.execute("UPDATE tasks SET pending_request = NULL WHERE id = $1", task_id)
-            sys_msg = f"❌ Директор {user_name} отклонил запрос ({lead_name}: {target_str})."
+            sys_msg = f"❌ Директор {user_name} отклонил запрос (Лид {lead_name}: {target_str})."
 
         await conn.execute("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
@@ -687,6 +713,60 @@ async def index():
         </button>
       </header>
 
+      <!-- ПАНЕЛЬ ФИЛЬТРОВ (ПРОЕКТ, ВАЖНОСТЬ, ИСПОЛНИТЕЛЬ, СРОК) -->
+      <div class="bg-slate-900/90 border border-slate-800 p-3 rounded-2xl space-y-2.5 shadow-md">
+        <div class="flex justify-between items-center">
+          <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+            <i class="fa-solid fa-filter text-indigo-400"></i> Фильтры задач
+          </span>
+          <button v-if="hasActiveFilters" @click="resetFilters" class="text-[9px] font-bold text-indigo-400 hover:text-indigo-300">
+            Сбросить все
+          </button>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2 text-xs">
+          <!-- Фильтр по проекту -->
+          <div>
+            <label class="block text-[9px] font-bold text-slate-400 mb-1">Проект:</label>
+            <select v-model="filterProject" class="w-full bg-slate-950 border border-slate-800 text-[11px] p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+              <option value="ALL">Все проекты</option>
+              <option value="Проект Кормовая Мука">Кормовая Мука</option>
+              <option value="Мука Евразия">Мука Евразия</option>
+            </select>
+          </div>
+
+          <!-- Фильтр по важности -->
+          <div>
+            <label class="block text-[9px] font-bold text-slate-400 mb-1">Важность:</label>
+            <select v-model="filterPriority" class="w-full bg-slate-950 border border-slate-800 text-[11px] p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+              <option value="ALL">Все приоритеты</option>
+              <option value="URGENT">🔴 Оперативно</option>
+              <option value="NORMAL">🟡 Умеренно</option>
+              <option value="FUTURE">🔵 На будущее</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2 items-center text-xs">
+          <!-- Фильтр по сотруднику (для Шефа и Директора) -->
+          <div v-if="currentUser.role !== 'EMPLOYEE'">
+            <label class="block text-[9px] font-bold text-slate-400 mb-1">Исполнитель/Лид:</label>
+            <select v-model="filterExecutor" class="w-full bg-slate-950 border border-slate-800 text-[11px] p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+              <option value="ALL">Все сотрудники</option>
+              <option v-for="u in employeesOnly" :key="u.id" :value="u.id">{{ u.full_name }}</option>
+            </select>
+          </div>
+
+          <!-- Тумблер горящих дедлайнов -->
+          <div :class="currentUser.role === 'EMPLOYEE' ? 'col-span-2' : ''" class="pt-2">
+            <button @click="filterUrgentOnly = !filterUrgentOnly" :class="filterUrgentOnly ? 'bg-red-950 border-red-800 text-red-300 font-bold' : 'bg-slate-950 border-slate-800 text-slate-400'" class="w-full py-2 px-3 rounded-xl border text-[11px] flex items-center justify-center gap-1.5 transition">
+              <i class="fa-solid fa-fire text-amber-500"></i>
+              <span>Только горящие (до 4ч)</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
       <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
         <div class="bg-slate-900/90 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl backdrop-blur-md">
@@ -723,14 +803,15 @@ async def index():
         </div>
 
         <div class="space-y-3">
-          <div v-if="displayedOwnerTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
-            В этом разделе пока нет задач.
+          <div v-if="filteredOwnerTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
+            Задачи по выбранным фильтрам не найдены.
           </div>
 
-          <div v-for="t in displayedOwnerTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
+          <div v-for="t in filteredOwnerTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
             <div class="flex justify-between items-start gap-2">
               <div class="flex flex-wrap items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
+                <span class="text-[9px] font-bold px-2 py-0.5 rounded bg-indigo-950/80 border border-indigo-800/80 text-indigo-300">📁 {{ t.project_group }}</span>
                 <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="priorityBadge(t.priority)">{{ priorityLabel(t.priority) }}</span>
                 <span v-if="t.status === 'IN_PROGRESS'" class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
                   ⏰ {{ getDeadlineCountdown(t.deadline) }}
@@ -741,10 +822,9 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПРОГРЕСС-БАР -->
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-1">
               <div class="flex justify-between text-[10px] font-bold">
-                <span class="text-slate-400">Прогресс выполнения:</span>
+                <span class="text-slate-400">Прогресс:</span>
                 <span :class="t.progress >= 70 ? 'text-emerald-400' : (t.progress >= 30 ? 'text-amber-400' : 'text-indigo-400')">{{ t.progress }}%</span>
               </div>
               <div class="w-full bg-slate-950 rounded-full h-1.5 border border-slate-800 overflow-hidden">
@@ -752,7 +832,6 @@ async def index():
               </div>
             </div>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -784,9 +863,10 @@ async def index():
               </div>
             </div>
 
-            <p class="text-xs text-indigo-300 font-semibold px-1">
-              👤 Исполнитель: {{ t.lead_name || 'Не назначен' }}
-            </p>
+            <div class="text-xs space-y-0.5 px-1 font-semibold">
+              <p v-if="t.lead_name" class="text-indigo-300">👑 Лид: {{ t.lead_name }}</p>
+              <p v-if="t.team_names" class="text-slate-400 text-[11px]">👥 Команда: {{ t.team_names }}</p>
+            </div>
 
             <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
@@ -821,14 +901,15 @@ async def index():
         </div>
 
         <div class="space-y-3">
-          <div v-if="displayedDeputyTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
-            В этом разделе пока нет задач.
+          <div v-if="filteredDeputyTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
+            Задачи по выбранным фильтрам не найдены.
           </div>
 
-          <div v-for="t in displayedDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
+          <div v-for="t in filteredDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
             <div class="flex justify-between items-start gap-2">
               <div class="flex flex-wrap items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
+                <span class="text-[9px] font-bold px-2 py-0.5 rounded bg-indigo-950/80 border border-indigo-800/80 text-indigo-300">📁 {{ t.project_group }}</span>
                 <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="priorityBadge(t.priority)">{{ priorityLabel(t.priority) }}</span>
                 <span v-if="t.status === 'IN_PROGRESS'" class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
                   ⏰ {{ getDeadlineCountdown(t.deadline) }}
@@ -839,7 +920,6 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -871,9 +951,10 @@ async def index():
               </div>
             </div>
 
-            <p class="text-xs text-indigo-300 font-semibold px-1">
-              👤 Исполнитель: {{ t.lead_name || 'Не назначен' }}
-            </p>
+            <div class="text-xs space-y-0.5 px-1 font-semibold">
+              <p v-if="t.lead_name" class="text-indigo-300">👑 Лид: {{ t.lead_name }}</p>
+              <p v-if="t.team_names" class="text-slate-400 text-[11px]">👥 Команда: {{ t.team_names }}</p>
+            </div>
 
             <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
@@ -890,13 +971,23 @@ async def index():
               </div>
             </div>
 
-            <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ -->
-            <div v-if="t.status === 'DRAFT'" class="space-y-2 pt-1 border-t border-slate-800">
+            <!-- ФОРМА НАЗНАЧЕНИЯ (ПРОЕКТ + ЛИД + КОМАНДА) -->
+            <div v-if="t.status === 'DRAFT'" class="space-y-2.5 pt-1 border-t border-slate-800">
               <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
               <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
               <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" placeholder="Критерии сдачи (DoD)" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
 
-              <div class="grid grid-cols-2 gap-2 pt-1">
+              <div class="grid grid-cols-2 gap-2">
+                <!-- Выбор проекта -->
+                <div>
+                  <label class="block text-[10px] font-bold text-slate-400 mb-1">Группа проекта:</label>
+                  <select v-model="editDrafts[t.id].project_group" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500 font-bold">
+                    <option value="Проект Кормовая Мука">Кормовая Мука</option>
+                    <option value="Мука Евразия">Мука Евразия</option>
+                  </select>
+                </div>
+
+                <!-- Важность -->
                 <div>
                   <label class="block text-[10px] font-bold text-slate-400 mb-1">Важность:</label>
                   <select v-model="editDrafts[t.id].priority" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
@@ -905,12 +996,24 @@ async def index():
                     <option value="FUTURE">🔵 На будущее</option>
                   </select>
                 </div>
+              </div>
 
-                <div>
-                  <label class="block text-[10px] font-bold text-slate-400 mb-1">Исполнитель:</label>
-                  <select v-model="editDrafts[t.id].lead_id" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
-                    <option v-for="u in employeesOnly" :key="u.id" :value="u.id">{{ u.full_name }}</option>
-                  </select>
+              <!-- Выбор Лида -->
+              <div>
+                <label class="block text-[10px] font-bold text-amber-300 mb-1">👑 Лид команды (Отвечает за сдачу):</label>
+                <select v-model="editDrafts[t.id].lead_id" @change="ensureLeadInAssignees(t.id)" class="w-full bg-slate-950 border border-amber-500/50 text-xs p-2 rounded-xl text-amber-300 font-bold outline-none focus:border-amber-400">
+                  <option v-for="u in employeesOnly" :key="u.id" :value="u.id">{{ u.full_name }} (Лид)</option>
+                </select>
+              </div>
+
+              <!-- Чекбоксы состава команды -->
+              <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800 space-y-1.5">
+                <label class="block text-[10px] font-bold text-slate-400">👥 Состав исполнителей команды:</label>
+                <div class="grid grid-cols-3 gap-1 text-[11px]">
+                  <label v-for="u in employeesOnly" :key="u.id" class="flex items-center gap-1.5 cursor-pointer p-1 rounded hover:bg-slate-900">
+                    <input type="checkbox" :value="u.id" v-model="editDrafts[t.id].assignee_ids" class="rounded bg-slate-800 text-indigo-600 focus:ring-0">
+                    <span :class="editDrafts[t.id].lead_id === u.id ? 'text-amber-300 font-bold' : 'text-slate-300'">{{ u.full_name }}</span>
+                  </label>
                 </div>
               </div>
 
@@ -920,7 +1023,7 @@ async def index():
               </div>
 
               <button @click="assignTask(t.id)" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 rounded-xl text-xs shadow transition mt-1">
-                🚀 Утвердить и отправить исполнителю
+                🚀 Утвердить и отправить команде
               </button>
             </div>
 
@@ -928,7 +1031,7 @@ async def index():
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-2 border-t border-slate-800">
               <div v-if="t.pending_request" class="p-2.5 bg-amber-950/40 border border-amber-800/60 rounded-xl space-y-2 animate-pulse">
                 <div class="flex justify-between items-center text-xs font-bold text-amber-300">
-                  <span>📌 Запрос от {{ t.lead_name }}:</span>
+                  <span>📌 Запрос от Лида ({{ t.lead_name }}):</span>
                   <span class="bg-amber-500 text-slate-950 px-2 py-0.5 rounded text-[10px] font-black">
                     {{ t.pending_request === 'ARCHIVE' ? 'Сдача в архив' : t.pending_request + '%' }}
                   </span>
@@ -999,14 +1102,15 @@ async def index():
         </div>
 
         <div class="space-y-3">
-          <div v-if="displayedEmpTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
-            В этом разделе пока нет задач.
+          <div v-if="filteredEmpTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
+            Задачи по выбранным фильтрам не найдены.
           </div>
 
-          <div v-for="t in displayedEmpTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
+          <div v-for="t in filteredEmpTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
             <div class="flex justify-between items-start gap-2">
               <div class="flex items-center gap-1.5">
                 <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
+                <span class="text-[9px] font-bold px-2 py-0.5 rounded bg-indigo-950/80 border border-indigo-800/80 text-indigo-300">📁 {{ t.project_group }}</span>
                 <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="priorityBadge(t.priority)">{{ priorityLabel(t.priority) }}</span>
               </div>
               <span class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
@@ -1057,6 +1161,11 @@ async def index():
               </div>
             </div>
 
+            <div class="text-xs space-y-0.5 px-1 font-semibold">
+              <p class="text-indigo-300">👑 Лид: {{ t.lead_name }} <span v-if="t.lead_user_id === currentUser.id" class="text-amber-300 font-black">(Вы)</span></p>
+              <p v-if="t.team_names" class="text-slate-400 text-[11px]">👥 Команда: {{ t.team_names }}</p>
+            </div>
+
             <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
                 <span>📅 Создано:</span>
@@ -1073,23 +1182,32 @@ async def index():
             </div>
 
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1 border-t border-slate-800">
-              <div v-if="t.pending_request" class="bg-amber-950/30 border border-amber-800/50 p-2 rounded-xl text-center text-xs text-amber-300 font-bold">
-                ⏳ Запрос на подтверждение ({{ t.pending_request === 'ARCHIVE' ? 'Архив' : t.pending_request + '%' }}) ожидает решения Жамолиддина
+              
+              <!-- КНОПКИ ЗАПРОСА: ВИДНЫ ТОЛЬКО ЛИДУ -->
+              <div v-if="t.lead_user_id === currentUser.id">
+                <div v-if="t.pending_request" class="bg-amber-950/30 border border-amber-800/50 p-2 rounded-xl text-center text-xs text-amber-300 font-bold">
+                  ⏳ Ваш запрос ({{ t.pending_request === 'ARCHIVE' ? 'Архив' : t.pending_request + '%' }}) ожидает решения Жамолиддина
+                </div>
+
+                <div v-else class="space-y-1">
+                  <span class="text-[10px] font-bold text-amber-300 block">👑 Вы Лид: отправить запрос Жамолиддину:</span>
+                  <div class="grid grid-cols-3 gap-1.5">
+                    <button @click="requestStage(t.id, '30')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold py-2 rounded-xl text-xs transition">
+                      📌 30%
+                    </button>
+                    <button @click="requestStage(t.id, '70')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold py-2 rounded-xl text-xs transition">
+                      📌 70%
+                    </button>
+                    <button @click="requestStage(t.id, 'ARCHIVE')" class="bg-emerald-900/80 hover:bg-emerald-800 text-emerald-200 font-bold py-2 rounded-xl text-xs transition">
+                      🏁 В архив
+                    </button>
+                  </div>
+                </div>
               </div>
 
-              <div v-else class="space-y-1">
-                <span class="text-[10px] font-bold text-slate-400 block">Отправить запрос Жамолиддину:</span>
-                <div class="grid grid-cols-3 gap-1.5">
-                  <button @click="requestStage(t.id, '30')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold py-2 rounded-xl text-xs transition">
-                    📌 30%
-                  </button>
-                  <button @click="requestStage(t.id, '70')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold py-2 rounded-xl text-xs transition">
-                    📌 70%
-                  </button>
-                  <button @click="requestStage(t.id, 'ARCHIVE')" class="bg-emerald-900/80 hover:bg-emerald-800 text-emerald-200 font-bold py-2 rounded-xl text-xs transition">
-                    🏁 В архив
-                  </button>
-                </div>
+              <!-- СООБЩЕНИЕ ДЛЯ УЧАСТНИКОВ КОМАНДЫ (НЕ ЛИДОВ) -->
+              <div v-else class="bg-slate-950 p-2 rounded-xl border border-slate-800 text-[11px] text-slate-400">
+                👥 Вы состоите в команде. Запросы на утверждение этапов отправляет Лид (<strong class="text-indigo-300">{{ t.lead_name }}</strong>).
               </div>
 
               <div class="grid grid-cols-2 gap-2 pt-1">
@@ -1115,12 +1233,9 @@ async def index():
 
     </div>
 
-    <!-- ========================================== -->
-    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (ENTERPRISE VIEW) -->
-    <!-- ========================================== -->
+    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ -->
     <div v-if="activeChatTask" class="fixed inset-0 bg-slate-950 z-50 flex flex-col h-[100dvh] w-full max-w-md mx-auto overscroll-contain">
       
-      <!-- Шапка чата -->
       <div class="p-3.5 border-b border-slate-800/80 flex justify-between items-center bg-slate-900/90 backdrop-blur-xl shrink-0 shadow-lg">
         <div class="flex items-center gap-2.5">
           <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-indigo-500 text-white flex items-center justify-center font-bold text-xs shadow-md shadow-indigo-600/30">
@@ -1129,7 +1244,7 @@ async def index():
           <div>
             <h3 class="text-xs font-bold text-white truncate max-w-[230px] leading-tight">{{ activeChatTask.title }}</h3>
             <div class="flex items-center gap-1.5 mt-0.5">
-              <span class="text-[9px] font-semibold text-indigo-300/80">{{ statusLabel(activeChatTask.status) }} • {{ activeChatTask.progress || 0 }}%</span>
+              <span class="text-[9px] font-semibold text-indigo-300/80">{{ activeChatTask.project_group }} • {{ activeChatTask.progress || 0 }}%</span>
               <span v-if="!isOnline" class="text-[8px] bg-amber-500/20 text-amber-300 px-1 py-0.2 rounded border border-amber-500/40">Офлайн</span>
             </div>
           </div>
@@ -1139,9 +1254,7 @@ async def index():
         </button>
       </div>
 
-      <!-- Лента сообщений -->
       <div ref="chatContainer" @scroll="onChatScroll" class="flex-1 overflow-y-auto overscroll-contain p-3.5 space-y-3 bg-slate-950 relative">
-        
         <div v-if="isChatLoading" class="flex flex-col items-center justify-center h-full text-slate-400 py-16 space-y-2.5">
           <i class="fa-solid fa-circle-notch fa-spin text-2xl text-indigo-500"></i>
           <span class="text-xs font-semibold tracking-wide">Загрузка диалога...</span>
@@ -1159,14 +1272,12 @@ async def index():
               <span>{{ m.sender_name }} ({{ formatRoleName(m.sender_role) }})</span>
               <div class="flex items-center gap-1">
                 <span>{{ formatLocalTimeOnly(m.created_at) }}</span>
-                <!-- TELEGRAM-STYLE ИКОНКА ЧАСОВ -->
                 <i v-if="isPendingMessage(m)" class="fa-regular fa-clock text-[9px] text-amber-300 opacity-90 animate-pulse ml-0.5"></i>
               </div>
             </div>
 
             <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
 
-            <!-- АУДИОСООБЩЕНИЕ С ВОЛНАМИ -->
             <div v-if="m.message_type === 'VOICE'" class="pt-1">
               <div class="flex items-center gap-2.5 bg-black/20 p-2 rounded-xl border border-white/5">
                 <button @click="togglePlayAudio('msg_' + m.id, m.media_url)" :class="isMyMessage(m) ? 'bg-white text-indigo-600' : 'bg-indigo-600 text-white'" class="w-8 h-8 rounded-full flex items-center justify-center text-xs shrink-0 shadow transition">
@@ -1187,7 +1298,6 @@ async def index():
               </div>
             </div>
 
-            <!-- Фотография -->
             <div v-if="m.message_type === 'IMAGE'" class="pt-1">
               <div @click="openImageLightbox(m.media_url)" class="relative group cursor-pointer overflow-hidden rounded-xl border border-white/10">
                 <img :src="m.media_url" class="rounded-xl max-h-52 w-full object-cover group-hover:scale-105 transition duration-200">
@@ -1209,7 +1319,6 @@ async def index():
         </div>
       </div>
 
-      <!-- КНОПКА ВОЗВРАТА ВНИЗ С БЕЙДЖЕМ НЕПРОЧИТАННЫХ -->
       <button v-if="userScrolledUp" @click="scrollToBottomSmooth" class="fixed bottom-20 right-4 w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-2xl flex items-center justify-center text-sm transition duration-200 z-50 border border-indigo-400/40 animate-bounce">
         <i class="fa-solid fa-arrow-down"></i>
         <span v-if="newMessagesBelowCount > 0" class="absolute -top-1.5 -right-1.5 bg-red-500 text-white text-[10px] font-black min-w-[20px] h-5 px-1 rounded-full flex items-center justify-center border-2 border-slate-950 shadow-md animate-pulse">
@@ -1217,7 +1326,6 @@ async def index():
         </span>
       </button>
 
-      <!-- ПАНЕЛЬ УПРАВЛЕНИЯ ГОЛОСОВЫМ -->
       <div v-if="recordedVoiceUrl" class="p-3 bg-slate-900 border-t border-slate-800 space-y-2.5 shrink-0">
         <div class="flex justify-between items-center text-[11px] font-bold text-slate-300">
           <span class="flex items-center gap-1.5 text-indigo-400">
@@ -1254,7 +1362,6 @@ async def index():
         </div>
       </div>
 
-      <!-- ПАНЕЛЬ АКТИВНОЙ ЗАПИСИ ГОЛОСА -->
       <div v-else-if="isRecordingVoice" class="p-3 bg-slate-900 border-t border-slate-800 flex items-center justify-between shrink-0 animate-pulse">
         <div class="flex items-center gap-2 text-xs font-bold text-red-400">
           <div class="w-3 h-3 rounded-full bg-red-500 animate-ping"></div>
@@ -1270,13 +1377,11 @@ async def index():
         </div>
       </div>
 
-      <!-- ПАНЕЛЬ ТОЛЬКО ДЛЯ ЧТЕНИЯ В АРХИВЕ -->
       <div v-else-if="activeChatTask.status === 'ARCHIVED'" class="p-3 bg-slate-900 border-t border-slate-800 text-center text-xs text-slate-400 font-semibold flex items-center justify-center gap-2 shrink-0">
         <i class="fa-solid fa-lock text-slate-500"></i>
         <span>Задача закрыта в архив. Чат доступен только для чтения.</span>
       </div>
 
-      <!-- СТАНДАРТНАЯ СТРОКА ВВОДА -->
       <div v-else class="p-2.5 border-t border-slate-800/80 bg-slate-900/90 backdrop-blur-md space-y-2 shrink-0">
         <div class="flex items-center gap-1.5">
           <label class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 flex items-center justify-center cursor-pointer hover:bg-slate-700 text-sm transition">
@@ -1343,6 +1448,12 @@ async def index():
         const sseConnected = ref(false);
         let timerInterval = null;
 
+        // ПЕРЕМЕННЫЕ ФИЛЬТРОВ
+        const filterProject = ref('ALL');
+        const filterPriority = ref('ALL');
+        const filterExecutor = ref('ALL');
+        const filterUrgentOnly = ref(false);
+
         const tasks = ref([]);
         const users = ref([]);
         let mediaRecorder = null;
@@ -1372,7 +1483,7 @@ async def index():
         let chatVoiceTimer = null;
         let chatVoiceStream = null;
 
-        // ЕДИНЫЙ ПЛЕЕР АУДИО С ВОЛНАМИ
+        // ЕДИНЫЙ ПЛЕЕР АУДИО
         const activeAudioId = ref(null);
         const isAudioPlaying = ref(false);
         const audioCurrentTime = ref(0);
@@ -1389,6 +1500,36 @@ async def index():
 
         const employeesOnly = computed(() => users.value.filter(u => u.role === 'EMPLOYEE'));
 
+        const hasActiveFilters = computed(() => {
+          return filterProject.value !== 'ALL' || filterPriority.value !== 'ALL' || filterExecutor.value !== 'ALL' || filterUrgentOnly.value;
+        });
+
+        const resetFilters = () => {
+          filterProject.value = 'ALL';
+          filterPriority.value = 'ALL';
+          filterExecutor.value = 'ALL';
+          filterUrgentOnly.value = false;
+        };
+
+        // УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ФИЛЬТРАЦИИ
+        const applyTaskFilters = (taskList) => {
+          return taskList.filter(t => {
+            if (filterProject.value !== 'ALL' && t.project_group !== filterProject.value) return false;
+            if (filterPriority.value !== 'ALL' && t.priority !== filterPriority.value) return false;
+            if (filterExecutor.value !== 'ALL') {
+              const execId = parseInt(filterExecutor.value);
+              const isMatch = t.lead_user_id === execId || (t.assignee_ids && t.assignee_ids.includes(execId));
+              if (!isMatch) return false;
+            }
+            if (filterUrgentOnly.value) {
+              if (!t.deadline) return false;
+              const diff = new Date(t.deadline).getTime() - Date.now();
+              if (diff > 4 * 3600 * 1000) return false;
+            }
+            return true;
+          });
+        };
+
         const inboxTasks = computed(() => tasks.value.filter(t => t.status === 'DRAFT'));
         const activeTasks = computed(() => tasks.value.filter(t => t.status === 'IN_PROGRESS'));
         const archiveTasks = computed(() => tasks.value.filter(t => t.status === 'ARCHIVED'));
@@ -1398,14 +1539,20 @@ async def index():
           if (ownerTab.value === 'active') return activeTasks.value;
           return archiveTasks.value;
         });
+        const filteredOwnerTasks = computed(() => applyTaskFilters(displayedOwnerTasks.value));
 
         const displayedDeputyTasks = computed(() => {
           if (deputyTab.value === 'inbox') return inboxTasks.value;
           if (deputyTab.value === 'active') return activeTasks.value;
           return archiveTasks.value;
         });
+        const filteredDeputyTasks = computed(() => applyTaskFilters(displayedDeputyTasks.value));
 
-        const myTasks = computed(() => tasks.value.filter(t => t.lead_user_id === currentUser.value?.id));
+        // Задачи исполнителя (он Лид или состоит в команде assignee_ids)
+        const myTasks = computed(() => tasks.value.filter(t => {
+          if (!currentUser.value) return false;
+          return t.lead_user_id === currentUser.value.id || (t.assignee_ids && t.assignee_ids.includes(currentUser.value.id));
+        }));
         const myActiveTasks = computed(() => myTasks.value.filter(t => t.status === 'IN_PROGRESS'));
         const myArchiveTasks = computed(() => myTasks.value.filter(t => t.status === 'ARCHIVED'));
 
@@ -1413,6 +1560,7 @@ async def index():
           if (empTab.value === 'active') return myActiveTasks.value;
           return myArchiveTasks.value;
         });
+        const filteredEmpTasks = computed(() => applyTaskFilters(displayedEmpTasks.value));
 
         const isMyMessage = (m) => {
           if (!currentUser.value) return false;
@@ -1421,6 +1569,13 @@ async def index():
 
         const isPendingMessage = (m) => {
           return m.status === 'pending' || String(m.id).startsWith('temp_');
+        };
+
+        const ensureLeadInAssignees = (taskId) => {
+          const draft = editDrafts.value[taskId];
+          if (draft && draft.lead_id && !draft.assignee_ids.includes(draft.lead_id)) {
+            draft.assignee_ids.push(draft.lead_id);
+          }
         };
 
         const formatLocalDT = (isoStr) => {
@@ -1472,7 +1627,6 @@ async def index():
           return bars;
         };
 
-        // ПЛЕЕР: Полное управление аудио без залипаний
         const togglePlayAudio = (id, url) => {
           if (activeAudioId.value === id && globalAudio && globalAudio.src === url) {
             if (isAudioPlaying.value) {
@@ -1591,6 +1745,7 @@ async def index():
             
             const empList = rUsers.filter(u => u.role === 'EMPLOYEE');
             const defaultDL = getDefaultLocalDateTimeInput();
+            const defaultLeadId = empList[0]?.id || 3;
 
             rTasks.forEach(t => {
               if (!editDrafts.value[t.id]) {
@@ -1600,12 +1755,17 @@ async def index():
                   const offset = d.getTimezoneOffset() * 60000;
                   initialDL = new Date(d.getTime() - offset).toISOString().slice(0, 16);
                 }
+                const curLead = t.lead_user_id || defaultLeadId;
+                const curAssignees = (t.assignee_ids && t.assignee_ids.length > 0) ? [...t.assignee_ids] : [curLead];
+
                 editDrafts.value[t.id] = {
                   title: t.title,
                   ai_summary: t.ai_summary,
                   definition_of_done: t.definition_of_done,
                   priority: t.priority || 'URGENT',
-                  lead_id: t.lead_user_id || empList[0]?.id || 3,
+                  project_group: t.project_group || 'Проект Кормовая Мука',
+                  lead_id: curLead,
+                  assignee_ids: curAssignees,
                   deadline: initialDL
                 };
               }
@@ -1694,7 +1854,13 @@ async def index():
         const assignTask = async (id) => {
           const draft = editDrafts.value[id] || {};
           const fd = new FormData();
-          fd.append('lead_id', draft.lead_id || employeesOnly.value[0]?.id || 3);
+          const leadId = draft.lead_id || employeesOnly.value[0]?.id || 3;
+          let assignees = Array.isArray(draft.assignee_ids) ? [...draft.assignee_ids] : [leadId];
+          if (!assignees.includes(leadId)) assignees.push(leadId);
+
+          fd.append('lead_id', leadId);
+          fd.append('assignee_ids', JSON.stringify(assignees));
+          fd.append('project_group', draft.project_group || 'Проект Кормовая Мука');
           fd.append('priority', draft.priority || 'URGENT');
           
           const d = new Date(draft.deadline);
@@ -1710,7 +1876,7 @@ async def index():
             if (!res.ok) throw new Error('Ошибка назначения');
             await loadData();
             deputyTab.value = 'active';
-            alert('🚀 Задача утверждена и переведена в работу!');
+            alert('🚀 Задача утверждена и передана команде!');
           } catch (e) {
             alert('❌ ' + e.message);
           }
@@ -1733,7 +1899,12 @@ async def index():
           fd.append('stage', stage);
           fd.append('user_id', currentUser.value.id);
           fd.append('user_name', currentUser.value.full_name);
-          await fetch(`/api/tasks/${taskId}/request-stage`, { method: 'POST', body: fd });
+          const res = await fetch(`/api/tasks/${taskId}/request-stage`, { method: 'POST', body: fd });
+          if (!res.ok) {
+            const err = await res.json();
+            alert('❌ ' + (err.detail || 'Ошибка отправки запроса'));
+            return;
+          }
           await loadData();
           alert('📌 Запрос успешно отправлен Директору!');
         };
@@ -1825,7 +1996,6 @@ async def index():
           }
         };
 
-        // Сохранение и синхронизация офлайн-очереди
         const saveQueueToStorage = () => {
           const serializable = pendingQueue.value
             .filter(item => item.localMsg.message_type === 'TEXT')
@@ -1952,9 +2122,8 @@ async def index():
           flushPendingQueue();
         };
 
-        // Запись аудио с гарантированным сбросом старых сессий
         const startVoiceRecording = async () => {
-          cancelVoiceRecording(); // Полный сброс перед стартом
+          cancelVoiceRecording();
           try {
             chatVoiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
             chatVoiceRecorder = new MediaRecorder(chatVoiceStream);
@@ -1975,7 +2144,6 @@ async def index():
               recordedVoiceUrl.value = URL.createObjectURL(blob);
               isRecordingVoice.value = false;
 
-              // Останавливаем аппаратный микрофон
               if (chatVoiceStream) {
                 chatVoiceStream.getTracks().forEach(t => t.stop());
                 chatVoiceStream = null;
@@ -1994,7 +2162,6 @@ async def index():
           }
         };
 
-        // Полное уничтожение временной аудиозаписи
         const cancelVoiceRecording = () => {
           if (chatVoiceTimer) {
             clearInterval(chatVoiceTimer);
@@ -2008,7 +2175,6 @@ async def index():
             chatVoiceStream = null;
           }
 
-          // Глушим текущий плеер если он играл предпрослушивание
           if (globalAudio) {
             globalAudio.pause();
             globalAudio.src = '';
@@ -2054,7 +2220,6 @@ async def index():
 
           chatMessages.value.push(localMsg);
           
-          // Сброс без отзыва URL чтобы локальное сообщение могло играть в плеере
           if (chatVoiceTimer) clearInterval(chatVoiceTimer);
           isRecordingVoice.value = false;
           recordVoiceSeconds.value = 0;
@@ -2221,14 +2386,16 @@ async def index():
         return {
           currentUser, loginForm, isLoggingIn, isOnline, ownerTab, deputyTab, empTab, isRecording, isProcessing,
           recordSeconds, textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
+          filterProject, filterPriority, filterExecutor, filterUrgentOnly, hasActiveFilters, resetFilters,
           inboxTasks, activeTasks, archiveTasks,
-          displayedOwnerTasks, displayedDeputyTasks,
-          myActiveTasks, myArchiveTasks, displayedEmpTasks, isMyMessage, isPendingMessage,
+          filteredOwnerTasks, filteredDeputyTasks, filteredEmpTasks,
+          myActiveTasks, myArchiveTasks, isMyMessage, isPendingMessage,
           activeChatTask, chatMessages, chatInput, isChatLoading, chatContainer, previewImageUrl,
           isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl, userScrolledUp, newMessagesBelowCount,
           activeAudioId, isAudioPlaying, audioCurrentTime, audioDuration, audioProgress,
           togglePlayAudio, seekAudio, handleTouchSeek, getWaveformBars, formatAudioTime,
           handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, setDirectStage, requestStage, confirmStageRequest,
+          ensureLeadInAssignees,
           openChat, closeChat, sendChatMessage, uploadChatImage, openImageLightbox,
           startVoiceRecording, stopVoiceRecording, cancelVoiceRecording, confirmSendVoice, sendRedFlag,
           onChatScroll, scrollToBottomSmooth,
@@ -2241,4 +2408,3 @@ async def index():
   </script>
 </body>
 </html>"""
-
