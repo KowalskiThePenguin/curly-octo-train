@@ -626,7 +626,6 @@ async def index():
 
       <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
-        
         <div class="bg-slate-900/90 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl backdrop-blur-md">
           <h2 class="text-base font-bold text-white">Голосовое поручение</h2>
           
@@ -680,9 +679,27 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <div v-if="t.has_voice" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
-              <audio :src="'/api/tasks/' + t.id + '/voice'" controls preload="none" class="w-full h-8"></audio>
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ВОЛНАМИ -->
+            <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
+              <div class="flex items-center gap-3">
+                <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
+                  <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+                </button>
+                <div class="flex-1 space-y-1">
+                  <div @click="seekAudio('task_' + t.id, $event)" @touchmove="handleTouchSeek('task_' + t.id, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                    <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
+                         :style="{ height: h + '%' }" 
+                         :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                         class="w-1 rounded-full transition-colors"></div>
+                  </div>
+                  <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос Шефа' }}</span>
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioDuration) : '' }}</span>
+                  </div>
+                </div>
+              </div>
             </div>
+
             <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2.5 rounded-xl border border-amber-900/40">
               <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
             </p>
@@ -755,9 +772,27 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <div v-if="t.has_voice" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
-              <audio :src="'/api/tasks/' + t.id + '/voice'" controls preload="none" class="w-full h-8"></audio>
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ВОЛНАМИ -->
+            <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
+              <div class="flex items-center gap-3">
+                <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
+                  <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+                </button>
+                <div class="flex-1 space-y-1">
+                  <div @click="seekAudio('task_' + t.id, $event)" @touchmove="handleTouchSeek('task_' + t.id, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                    <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
+                         :style="{ height: h + '%' }" 
+                         :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                         class="w-1 rounded-full transition-colors"></div>
+                  </div>
+                  <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос Шефа' }}</span>
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioDuration) : '' }}</span>
+                  </div>
+                </div>
+              </div>
             </div>
+
             <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2.5 rounded-xl border border-amber-900/40">
               <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
             </p>
@@ -788,7 +823,6 @@ async def index():
               </div>
             </div>
 
-            <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ -->
             <div v-if="t.status === 'DRAFT'" class="space-y-2 pt-1 border-t border-slate-800">
               <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
               <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
@@ -822,7 +856,6 @@ async def index():
               </button>
             </div>
 
-            <!-- СДАНО НА ПРОВЕРКУ -->
             <div v-if="t.status === 'REVIEW'" class="space-y-2 pt-1 border-t border-amber-800/40">
               <div class="p-2.5 bg-amber-950/30 rounded-xl border border-amber-800/60 text-xs space-y-1.5">
                 <p class="text-amber-300 font-bold">📝 Отчет исполнителя ({{ t.lead_name }}):</p>
@@ -901,9 +934,27 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <div v-if="t.has_voice" class="bg-slate-950 p-2 rounded-xl border border-slate-800">
-              <audio :src="'/api/tasks/' + t.id + '/voice'" controls preload="none" class="w-full h-8"></audio>
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ВОЛНАМИ -->
+            <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
+              <div class="flex items-center gap-3">
+                <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
+                  <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+                </button>
+                <div class="flex-1 space-y-1">
+                  <div @click="seekAudio('task_' + t.id, $event)" @touchmove="handleTouchSeek('task_' + t.id, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                    <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
+                         :style="{ height: h + '%' }" 
+                         :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                         class="w-1 rounded-full transition-colors"></div>
+                  </div>
+                  <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос Шефа' }}</span>
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioDuration) : '' }}</span>
+                  </div>
+                </div>
+              </div>
             </div>
+
             <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2.5 rounded-xl border border-amber-900/40">
               <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
             </p>
@@ -1010,12 +1061,27 @@ async def index():
               <span>{{ formatLocalTimeOnly(m.created_at) }}</span>
             </div>
 
-            <!-- Текст -->
             <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
 
-            <!-- Аудиосообщение с кастомным интерфейсом -->
+            <!-- АУДИОСООБЩЕНИЕ С ВОЛНАМИ И СКРАББИНГОМ -->
             <div v-if="m.message_type === 'VOICE'" class="pt-1">
-              <audio :src="m.media_url" controls class="h-8 w-52 rounded-lg"></audio>
+              <div class="flex items-center gap-2.5 bg-black/20 p-2 rounded-xl border border-white/5">
+                <button @click="togglePlayAudio('msg_' + m.id, m.media_url)" :class="isMyMessage(m) ? 'bg-white text-indigo-600' : 'bg-indigo-600 text-white'" class="w-8 h-8 rounded-full flex items-center justify-center text-xs shrink-0 shadow transition">
+                  <i :class="activeAudioId === 'msg_' + m.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+                </button>
+                <div class="flex-1 space-y-1">
+                  <div @click="seekAudio('msg_' + m.id, $event)" @touchmove="handleTouchSeek('msg_' + m.id, $event)" class="h-5 flex items-center gap-0.5 cursor-pointer py-1">
+                    <div v-for="(h, idx) in getWaveformBars(m.id)" :key="idx" 
+                         :style="{ height: h + '%' }" 
+                         :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? (isMyMessage(m) ? 'bg-white' : 'bg-indigo-400') : (isMyMessage(m) ? 'bg-indigo-400/50' : 'bg-slate-700')"
+                         class="w-1 rounded-full transition-colors"></div>
+                  </div>
+                  <div class="flex justify-between text-[9px] font-mono opacity-80">
+                    <span>{{ activeAudioId === 'msg_' + m.id ? formatAudioTime(audioCurrentTime) : 'Голосовое' }}</span>
+                    <span>{{ activeAudioId === 'msg_' + m.id ? formatAudioTime(audioDuration) : '' }}</span>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <!-- Фотография с открытием Lightbox -->
@@ -1038,22 +1104,38 @@ async def index():
         </div>
       </div>
 
-      <!-- ПАНЕЛЬ УПРАВЛЕНИЯ ГОЛОСОВЫМ ПЕРЕД ОТПРАВКОЙ -->
-      <div v-if="recordedVoiceUrl" class="p-3 bg-slate-900 border-t border-slate-800 space-y-2 shrink-0 animate-fadeIn">
+      <!-- ПАНЕЛЬ УПРАВЛЕНИЯ ГОЛОСОВЫМ ПЕРЕД ОТПРАВКОЙ (С ВОЛНАМИ) -->
+      <div v-if="recordedVoiceUrl" class="p-3 bg-slate-900 border-t border-slate-800 space-y-2.5 shrink-0">
         <div class="flex justify-between items-center text-[11px] font-bold text-slate-300">
           <span class="flex items-center gap-1.5 text-indigo-400">
-            <i class="fa-solid fa-microphone-lines"></i> Прослушать запись перед отправкой:
+            <i class="fa-solid fa-microphone-lines"></i> Прослушать перед отправкой:
           </span>
           <span class="font-mono text-xs text-slate-400">{{ formatTime(recordVoiceSeconds) }}</span>
         </div>
 
-        <audio :src="recordedVoiceUrl" controls class="w-full h-8 rounded-lg"></audio>
+        <div class="flex items-center gap-3 bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
+          <button @click="togglePlayAudio('preview_voice', recordedVoiceUrl)" class="w-9 h-9 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-xs shrink-0 shadow transition">
+            <i :class="activeAudioId === 'preview_voice' && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+          </button>
+          <div class="flex-1 space-y-1">
+            <div @click="seekAudio('preview_voice', $event)" @touchmove="handleTouchSeek('preview_voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+              <div v-for="(h, idx) in getWaveformBars(999)" :key="idx" 
+                   :style="{ height: h + '%' }" 
+                   :class="(activeAudioId === 'preview_voice' && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                   class="w-1 rounded-full transition-colors"></div>
+            </div>
+            <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+              <span>{{ activeAudioId === 'preview_voice' ? formatAudioTime(audioCurrentTime) : '0:00' }}</span>
+              <span>{{ activeAudioId === 'preview_voice' ? formatAudioTime(audioDuration) : formatTime(recordVoiceSeconds) }}</span>
+            </div>
+          </div>
+        </div>
 
-        <div class="grid grid-cols-2 gap-2 pt-1">
-          <button @click="cancelVoiceRecording" class="py-2 rounded-xl bg-red-950/60 hover:bg-red-900/80 border border-red-800/60 text-red-300 text-xs font-bold flex items-center justify-center gap-1.5 transition">
+        <div class="grid grid-cols-2 gap-2 pt-0.5">
+          <button @click="cancelVoiceRecording" class="py-2.5 rounded-xl bg-red-950/60 hover:bg-red-900/80 border border-red-800/60 text-red-300 text-xs font-bold flex items-center justify-center gap-1.5 transition">
             <i class="fa-solid fa-trash-can"></i> Удалить
           </button>
-          <button @click="confirmSendVoice" class="py-2 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow transition">
+          <button @click="confirmSendVoice" class="py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow transition">
             <i class="fa-solid fa-paper-plane"></i> Отправить
           </button>
         </div>
@@ -1069,7 +1151,7 @@ async def index():
           <button @click="cancelVoiceRecording" class="w-8 h-8 rounded-xl bg-slate-800 text-slate-400 flex items-center justify-center text-xs hover:text-red-300">
             <i class="fa-solid fa-xmark"></i>
           </button>
-          <button @click="stopVoiceRecording" class="px-3 py-1.5 rounded-xl bg-red-600 text-white text-xs font-bold flex items-center gap-1 shadow">
+          <button @click="stopVoiceRecording" class="px-3.5 py-2 rounded-xl bg-red-600 text-white text-xs font-bold flex items-center gap-1.5 shadow">
             <i class="fa-solid fa-stop"></i> Завершить
           </button>
         </div>
@@ -1084,7 +1166,6 @@ async def index():
       <!-- СТАНДАРТНАЯ СТРОКА ВВОДА -->
       <div v-else class="p-2.5 border-t border-slate-800/80 bg-slate-900/90 backdrop-blur-md space-y-2 shrink-0">
         <div class="flex items-center gap-1.5">
-          
           <label class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 flex items-center justify-center cursor-pointer hover:bg-slate-700 text-sm transition">
             <i class="fa-solid fa-paperclip"></i>
             <input type="file" accept="image/*" @change="uploadChatImage" class="hidden">
@@ -1104,9 +1185,7 @@ async def index():
 
     </div>
 
-    <!-- ========================================== -->
-    <!-- LIGHTBOX ДЛЯ ПОЛНОЭКРАННОГО ПРЕДОСМОТРА ФОТО -->
-    <!-- ========================================== -->
+    <!-- LIGHTBOX ДЛЯ ПРЕДОСМОТРА ФОТО -->
     <div v-if="previewImageUrl" class="fixed inset-0 bg-black/95 backdrop-blur-2xl z-[60] flex flex-col justify-between p-4" @click.self="previewImageUrl = null">
       <div class="flex justify-between items-center text-white shrink-0">
         <span class="text-xs font-bold opacity-75">Просмотр фото</span>
@@ -1171,6 +1250,14 @@ async def index():
         let chatVoiceRecorder = null;
         let chatVoiceChunks = [];
         let chatVoiceTimer = null;
+
+        // ЕДИНЫЙ ПЛЕЕР АУДИО С ВОЛНАМИ
+        const activeAudioId = ref(null);
+        const isAudioPlaying = ref(false);
+        const audioCurrentTime = ref(0);
+        const audioDuration = ref(0);
+        const audioProgress = ref(0);
+        let globalAudio = null;
 
         const roleBadgeTitle = computed(() => {
           if (!currentUser.value) return '';
@@ -1238,15 +1325,104 @@ async def index():
           });
         };
 
+        const formatAudioTime = (seconds) => {
+          if (!seconds || isNaN(seconds)) return '0:00';
+          const s = Math.floor(seconds);
+          const mins = Math.floor(s / 60);
+          const secs = s % 60;
+          return `${mins}:${secs.toString().padStart(2, '0')}`;
+        };
+
         const getDefaultLocalDateTimeInput = () => {
           const now = new Date();
           const offset = now.getTimezoneOffset() * 60000;
           return new Date(now.getTime() - offset).toISOString().slice(0, 16);
         };
 
-        const scrollToBottom = () => {
-          if (chatContainer.value) {
-            chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+        // ДЕТЕРМИНИРОВАННЫЕ ВОЛНЫ АУДИО
+        const getWaveformBars = (id) => {
+          const count = 28;
+          const bars = [];
+          let seed = ((typeof id === 'number' ? id : 42) * 9301 + 49297) % 233280;
+          for (let i = 0; i < count; i++) {
+            seed = (seed * 9301 + 49297) % 233280;
+            const rnd = seed / 233280;
+            const h = Math.floor(25 + Math.sin(i * 0.45) * 20 + rnd * 55);
+            bars.push(Math.min(100, Math.max(15, h)));
+          }
+          return bars;
+        };
+
+        // ПЛЕЕР: Воспроизведение, пауза, перемотка
+        const togglePlayAudio = (id, url) => {
+          if (activeAudioId.value === id && globalAudio) {
+            if (isAudioPlaying.value) {
+              globalAudio.pause();
+              isAudioPlaying.value = false;
+            } else {
+              globalAudio.play();
+              isAudioPlaying.value = true;
+            }
+            return;
+          }
+
+          if (globalAudio) {
+            globalAudio.pause();
+            globalAudio = null;
+          }
+
+          activeAudioId.value = id;
+          isAudioPlaying.value = true;
+          audioCurrentTime.value = 0;
+          audioProgress.value = 0;
+
+          globalAudio = new Audio(url);
+          globalAudio.onloadedmetadata = () => {
+            audioDuration.value = globalAudio.duration;
+          };
+          globalAudio.ontimeupdate = () => {
+            if (globalAudio && globalAudio.duration) {
+              audioCurrentTime.value = globalAudio.currentTime;
+              audioDuration.value = globalAudio.duration;
+              audioProgress.value = globalAudio.currentTime / globalAudio.duration;
+            }
+          };
+          globalAudio.onended = () => {
+            isAudioPlaying.value = false;
+            audioProgress.value = 0;
+            audioCurrentTime.value = 0;
+          };
+          globalAudio.play().catch(e => {
+            console.error("Audio error:", e);
+            isAudioPlaying.value = false;
+          });
+        };
+
+        const seekAudio = (id, event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          const clickX = event.clientX - rect.left;
+          const ratio = Math.max(0, Math.min(1, clickX / rect.width));
+
+          if (activeAudioId.value === id && globalAudio && globalAudio.duration) {
+            globalAudio.currentTime = ratio * globalAudio.duration;
+            audioProgress.value = ratio;
+            audioCurrentTime.value = globalAudio.currentTime;
+          }
+        };
+
+        const handleTouchSeek = (id, event) => {
+          if (event.touches && event.touches[0]) {
+            const touch = event.touches[0];
+            const target = event.currentTarget;
+            const rect = target.getBoundingClientRect();
+            const touchX = touch.clientX - rect.left;
+            const ratio = Math.max(0, Math.min(1, touchX / rect.width));
+
+            if (activeAudioId.value === id && globalAudio && globalAudio.duration) {
+              globalAudio.currentTime = ratio * globalAudio.duration;
+              audioProgress.value = ratio;
+              audioCurrentTime.value = globalAudio.currentTime;
+            }
           }
         };
 
@@ -1273,6 +1449,7 @@ async def index():
         };
 
         const handleLogout = () => {
+          if (globalAudio) globalAudio.pause();
           currentUser.value = null;
           localStorage.removeItem('task_auth_user');
           loginForm.value = { username: '', password: '' };
@@ -1319,7 +1496,9 @@ async def index():
           evtSource.onopen = () => { sseConnected.value = true; };
           evtSource.onmessage = () => {
             loadData();
-            if (activeChatTask.value) loadMessages();
+            if (activeChatTask.value) {
+              loadMessages(false); // Подгружаем без принудительного скролла вниз
+            }
           };
           evtSource.onerror = () => {
             sseConnected.value = false;
@@ -1441,6 +1620,7 @@ async def index():
           await loadData();
         };
 
+        // УМНЫЙ СКРОЛЛ ЧАТА
         const openChat = async (task) => {
           activeChatTask.value = task;
           chatMessages.value = [];
@@ -1449,26 +1629,38 @@ async def index():
           document.body.classList.add('overflow-hidden');
           task.unread_count = 0;
           
-          await loadMessages();
+          await loadMessages(true);
           isChatLoading.value = false;
-          await nextTick();
-          scrollToBottom();
         };
 
         const closeChat = () => {
+          if (globalAudio) globalAudio.pause();
           activeChatTask.value = null;
           cancelVoiceRecording();
           document.body.classList.remove('overflow-hidden');
           loadData();
         };
 
-        const loadMessages = async () => {
+        const loadMessages = async (forceScrollBottom = false) => {
           if (!activeChatTask.value || !currentUser.value) return;
+          
+          let wasNearBottom = true;
+          if (chatContainer.value && !forceScrollBottom) {
+            const threshold = 100;
+            const position = chatContainer.value.scrollTop + chatContainer.value.clientHeight;
+            wasNearBottom = (chatContainer.value.scrollHeight - position) <= threshold;
+          }
+
           try {
             const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages?viewer_user_id=${currentUser.value.id}`);
             chatMessages.value = await res.json();
+            
             await nextTick();
-            scrollToBottom();
+            if (forceScrollBottom || wasNearBottom) {
+              if (chatContainer.value) {
+                chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+              }
+            }
           } catch (e) {
             console.error(e);
           }
@@ -1488,10 +1680,9 @@ async def index():
             return;
           }
           chatInput.value = '';
-          await loadMessages();
+          await loadMessages(true);
         };
 
-        // ЗАПИСЬ И ПРЕДПРОСЛУШИВАНИЕ АУДИОСООБЩЕНИЯ
         const startVoiceRecording = async () => {
           try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1552,7 +1743,7 @@ async def index():
           
           await fetch(`/api/tasks/${activeChatTask.value.id}/messages/voice`, { method: 'POST', body: fd });
           cancelVoiceRecording();
-          await loadMessages();
+          await loadMessages(true);
         };
 
         const uploadChatImage = async (e) => {
@@ -1564,7 +1755,7 @@ async def index():
           fd.append('sender_name', currentUser.value.full_name);
           fd.append('file', file);
           await fetch(`/api/tasks/${activeChatTask.value.id}/messages/image`, { method: 'POST', body: fd });
-          await loadMessages();
+          await loadMessages(true);
         };
 
         const openImageLightbox = (url) => {
@@ -1652,6 +1843,8 @@ async def index():
           myActiveTasks, myReviewTasks, myArchiveTasks, displayedEmpTasks, isMyMessage,
           activeChatTask, chatMessages, chatInput, isChatLoading, chatContainer, previewImageUrl,
           isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl,
+          activeAudioId, isAudioPlaying, audioCurrentTime, audioDuration, audioProgress,
+          togglePlayAudio, seekAudio, handleTouchSeek, getWaveformBars, formatAudioTime,
           handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, submitTaskForReview, rejectTask,
           completeTask, openChat, closeChat, sendChatMessage, uploadChatImage, openImageLightbox,
           startVoiceRecording, stopVoiceRecording, cancelVoiceRecording, confirmSendVoice, sendRedFlag,
@@ -1664,4 +1857,3 @@ async def index():
   </script>
 </body>
 </html>"""
-
