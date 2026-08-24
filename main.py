@@ -367,11 +367,10 @@ async def assign_task(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# ПРЯМОЕ УПРАВЛЕНИЕ ЭТАПАМИ ДИРЕКТОРОМ (30% / 70% / АРХИВ)
 @app.post("/api/tasks/{task_id}/set-stage")
 async def set_stage(
     task_id: int,
-    stage: str = Form(...), # '30', '70', 'ARCHIVE'
+    stage: str = Form(...),
     user_name: str = Form("Жамолиддин")
 ):
     pool = await get_db()
@@ -400,11 +399,10 @@ async def set_stage(
     await broadcast_event("stage_updated")
     return {"status": "ok"}
 
-# ЗАПРОС ЭТАПА ИСПОЛНИТЕЛЕМ (30% / 70% / АРХИВ)
 @app.post("/api/tasks/{task_id}/request-stage")
 async def request_stage(
     task_id: int,
-    stage: str = Form(...), # '30', '70', 'ARCHIVE'
+    stage: str = Form(...),
     user_id: int = Form(...),
     user_name: str = Form(...)
 ):
@@ -428,7 +426,6 @@ async def request_stage(
     await broadcast_event("stage_requested")
     return {"status": "ok"}
 
-# ПОДТВЕРЖДЕНИЕ / ОТКЛОНЕНИЕ ЗАПРОСА ДИРЕКТОРОМ
 @app.post("/api/tasks/{task_id}/confirm-stage-request")
 async def confirm_stage_request(
     task_id: int,
@@ -537,7 +534,7 @@ async def send_text_msg(
         """, task_id, sender_id, msg_id)
 
     await broadcast_event(f"chat_{task_id}")
-    return {"status": "ok"}
+    return {"status": "ok", "id": msg_id}
 
 @app.post("/api/tasks/{task_id}/messages/voice")
 async def send_voice_msg(
@@ -567,7 +564,7 @@ async def send_voice_msg(
         """, task_id, sender_id, msg_id)
 
     await broadcast_event(f"chat_{task_id}")
-    return {"status": "ok"}
+    return {"status": "ok", "id": msg_id}
 
 @app.post("/api/tasks/{task_id}/messages/image")
 async def send_image_msg(
@@ -597,7 +594,7 @@ async def send_image_msg(
         """, task_id, sender_id, msg_id)
 
     await broadcast_event(f"chat_{task_id}")
-    return {"status": "ok"}
+    return {"status": "ok", "id": msg_id}
 
 @app.post("/api/tasks/{task_id}/red-flag")
 async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(1), sender_name: str = Form("Исполнитель")):
@@ -928,10 +925,9 @@ async def index():
               </button>
             </div>
 
-            <!-- УПРАВЛЕНИЕ ЭТАПАМИ 30% / 70% / АРХИВ ДЛЯ ДИРЕКТОРА -->
+            <!-- УПРАВЛЕНИЕ ЭТАПАМИ ДЛЯ ДИРЕКТОРА -->
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-2 border-t border-slate-800">
               
-              <!-- Блок подтверждения запроса от исполнителя -->
               <div v-if="t.pending_request" class="p-2.5 bg-amber-950/40 border border-amber-800/60 rounded-xl space-y-2 animate-pulse">
                 <div class="flex justify-between items-center text-xs font-bold text-amber-300">
                   <span>📌 Запрос от {{ t.lead_name }}:</span>
@@ -949,7 +945,6 @@ async def index():
                 </div>
               </div>
 
-              <!-- Прямые кнопки Директора 30% / 70% / Архив -->
               <div>
                 <span class="text-[10px] font-bold text-slate-400 block mb-1">Установить этап напрямую:</span>
                 <div class="grid grid-cols-3 gap-1.5">
@@ -1023,7 +1018,6 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПРОГРЕСС-БАР -->
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-1">
               <div class="flex justify-between text-[10px] font-bold">
                 <span class="text-slate-400">Прогресс:</span>
@@ -1080,7 +1074,6 @@ async def index():
               </div>
             </div>
 
-            <!-- КНОПКИ ЗАПРОСА 30% / 70% / АРХИВ ДЛЯ ИСПОЛНИТЕЛЯ -->
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1 border-t border-slate-800">
               
               <div v-if="t.pending_request" class="bg-amber-950/30 border border-amber-800/50 p-2 rounded-xl text-center text-xs text-amber-300 font-bold">
@@ -1164,11 +1157,16 @@ async def index():
             
             <div class="flex justify-between items-center gap-3 text-[9px] opacity-75 font-semibold">
               <span>{{ m.sender_name }} ({{ formatRoleName(m.sender_role) }})</span>
-              <span>{{ formatLocalTimeOnly(m.created_at) }}</span>
+              <div class="flex items-center gap-1">
+                <span>{{ formatLocalTimeOnly(m.created_at) }}</span>
+                <!-- TELEGRAM-STYLE ИКОНКА ЧАСОВ ПРИ ОФФЛАЙН/ОТПРАВКЕ -->
+                <i v-if="isPendingMessage(m)" class="fa-regular fa-clock text-[9px] text-amber-300 opacity-90 animate-pulse ml-0.5"></i>
+              </div>
             </div>
 
             <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
 
+            <!-- АУДИОСООБЩЕНИЕ С ВОЛНАМИ -->
             <div v-if="m.message_type === 'VOICE'" class="pt-1">
               <div class="flex items-center gap-2.5 bg-black/20 p-2 rounded-xl border border-white/5">
                 <button @click="togglePlayAudio('msg_' + m.id, m.media_url)" :class="isMyMessage(m) ? 'bg-white text-indigo-600' : 'bg-indigo-600 text-white'" class="w-8 h-8 rounded-full flex items-center justify-center text-xs shrink-0 shadow transition">
@@ -1189,6 +1187,7 @@ async def index():
               </div>
             </div>
 
+            <!-- Фотография -->
             <div v-if="m.message_type === 'IMAGE'" class="pt-1">
               <div @click="openImageLightbox(m.media_url)" class="relative group cursor-pointer overflow-hidden rounded-xl border border-white/10">
                 <img :src="m.media_url" class="rounded-xl max-h-52 w-full object-cover group-hover:scale-105 transition duration-200">
@@ -1199,8 +1198,11 @@ async def index():
             </div>
 
             <div class="text-right text-[10px] leading-none pt-0.5">
-              <span v-if="isMyMessage(m)" :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
-                {{ m.is_read ? '✓✓' : '✓' }}
+              <span v-if="isMyMessage(m)">
+                <span v-if="isPendingMessage(m)" class="text-[9px] text-amber-300 font-semibold opacity-90">Отправка...</span>
+                <span v-else :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
+                  {{ m.is_read ? '✓✓' : '✓' }}
+                </span>
               </span>
             </div>
           </div>
@@ -1210,7 +1212,6 @@ async def index():
       <!-- КНОПКА ВОЗВРАТА ВНИЗ С БЕЙДЖЕМ НЕПРОЧИТАННЫХ (TELEGRAM STYLE) -->
       <button v-if="userScrolledUp" @click="scrollToBottomSmooth" class="fixed bottom-20 right-4 w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-2xl flex items-center justify-center text-sm transition duration-200 z-50 border border-indigo-400/40 animate-bounce">
         <i class="fa-solid fa-arrow-down"></i>
-        <!-- Метка непрочитанных внутри чата -->
         <span v-if="newMessagesBelowCount > 0" class="absolute -top-1.5 -right-1.5 bg-red-500 text-white text-[10px] font-black min-w-[20px] h-5 px-1 rounded-full flex items-center justify-center border-2 border-slate-950 shadow-md animate-pulse">
           {{ newMessagesBelowCount }}
         </span>
@@ -1356,6 +1357,10 @@ async def index():
         const userScrolledUp = ref(false);
         const newMessagesBelowCount = ref(0);
 
+        // ОФЛАЙН ОЧЕРЕДЬ СООБЩЕНИЙ (TELEGRAM QUEUE)
+        const pendingQueue = ref([]);
+        let isFlushingQueue = false;
+
         // ГОЛОСОВОЙ КОНТРОЛЬ ПЕРЕД ОТПРАВКОЙ
         const isRecordingVoice = ref(false);
         const recordVoiceSeconds = ref(0);
@@ -1410,6 +1415,10 @@ async def index():
         const isMyMessage = (m) => {
           if (!currentUser.value) return false;
           return m.sender_id === currentUser.value.id;
+        };
+
+        const isPendingMessage = (m) => {
+          return m.status === 'pending' || String(m.id).startsWith('temp_');
         };
 
         const formatLocalDT = (isoStr) => {
@@ -1699,7 +1708,6 @@ async def index():
           }
         };
 
-        // ДИРЕКТОР: Прямая установка 30% / 70% / Архив
         const setDirectStage = async (taskId, stage) => {
           const label = stage === 'ARCHIVE' ? 'в архив' : `на ${stage}%`;
           if (!confirm(`Перевести задачу ${label}?`)) return;
@@ -1710,7 +1718,6 @@ async def index():
           await loadData();
         };
 
-        // ИСПОЛНИТЕЛЬ: Запрос 30% / 70% / Архив
         const requestStage = async (taskId, stage) => {
           const label = stage === 'ARCHIVE' ? 'сдачу в архив' : `этап ${stage}%`;
           if (!confirm(`Отправить запрос Жамолиддину на ${label}?`)) return;
@@ -1723,7 +1730,6 @@ async def index():
           alert('📌 Запрос успешно отправлен Директору!');
         };
 
-        // ДИРЕКТОР: Подтверждение / отклонение запроса исполнителя
         const confirmStageRequest = async (taskId, approve) => {
           const fd = new FormData();
           fd.append('approve', approve);
@@ -1732,7 +1738,6 @@ async def index():
           await loadData();
         };
 
-        // ОТСЛЕЖИВАНИЕ СКРОЛЛА И БЕЙДЖА НЕПРОЧИТАННЫХ В ЧАТЕ
         const onChatScroll = () => {
           if (!chatContainer.value) return;
           const { scrollTop, scrollHeight, clientHeight } = chatContainer.value;
@@ -1775,55 +1780,113 @@ async def index():
           loadData();
         };
 
+        // Загрузка сообщений с сохранением локальных pending-сообщений
         const loadMessages = async (forceScrollBottom = false) => {
           if (!activeChatTask.value || !currentUser.value) return;
 
           try {
             const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages?viewer_user_id=${currentUser.value.id}`);
-            const newMsgs = await res.json();
+            const serverMsgs = await res.json();
             
-            const prevLen = chatMessages.value.length;
-            const newLen = newMsgs.length;
+            // Сохраняем локальные сообщения, которые еще отправляются в фоне
+            const currentPending = pendingQueue.value
+              .filter(q => q.taskId === activeChatTask.value.id)
+              .map(q => q.localMsg);
 
-            if (newLen > prevLen) {
-              const addedCount = newLen - prevLen;
-              chatMessages.value = newMsgs;
-              await nextTick();
-              
-              if (forceScrollBottom || !userScrolledUp.value) {
-                if (chatContainer.value) {
-                  chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
-                }
-                newMessagesBelowCount.value = 0;
-              } else {
-                // Если пользователь просматривает историю вверху, увеличиваем бейдж на кнопке ↓
-                newMessagesBelowCount.value += addedCount;
+            const combined = [...serverMsgs, ...currentPending];
+
+            const prevLen = chatMessages.value.length;
+            const newLen = combined.length;
+
+            chatMessages.value = combined;
+            await nextTick();
+
+            if (forceScrollBottom || !userScrolledUp.value) {
+              if (chatContainer.value) {
+                chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
               }
-            } else {
-              chatMessages.value = newMsgs;
+            } else if (newLen > prevLen) {
+              newMessagesBelowCount.value += (newLen - prevLen);
             }
           } catch (e) {
             console.error(e);
           }
         };
 
+        // ФОНОВАЯ ОБРАБОТКА ОЧЕРЕДИ ОТПРАВКИ (OUTBOX FLUSHER)
+        const flushPendingQueue = async () => {
+          if (isFlushingQueue || pendingQueue.value.length === 0) return;
+          isFlushingQueue = true;
+
+          try {
+            while (pendingQueue.value.length > 0) {
+              const item = pendingQueue.value[0];
+              try {
+                const res = await fetch(item.endpoint, { method: 'POST', body: item.formData });
+                if (!res.ok) throw new Error("HTTP error " + res.status);
+                
+                // Успешно отправлено
+                pendingQueue.value.shift();
+                if (activeChatTask.value && activeChatTask.value.id === item.taskId) {
+                  await loadMessages(false);
+                }
+              } catch (netErr) {
+                // Если нет сети — прерываем цикл, оставляем иконку часов и ждем восстановления сети
+                console.warn("Сеть недоступна, сообщение в очереди:", netErr);
+                break;
+              }
+            }
+          } finally {
+            isFlushingQueue = false;
+          }
+        };
+
+        // МГНОВЕННАЯ ОТПРАВКА ТЕКСТА (OPTIMISTIC UI + QUEUE)
         const sendChatMessage = async () => {
-          if (!chatInput.value.trim() || !activeChatTask.value || !currentUser.value) return;
+          const text = chatInput.value.trim();
+          if (!text || !activeChatTask.value || !currentUser.value) return;
+
+          const tempId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+          const taskId = activeChatTask.value.id;
+
+          const localMsg = {
+            id: tempId,
+            task_id: taskId,
+            sender_id: currentUser.value.id,
+            sender_role: currentUser.value.role,
+            sender_name: currentUser.value.full_name,
+            message_type: 'TEXT',
+            content: text,
+            media_url: null,
+            created_at: new Date().toISOString(),
+            is_read: false,
+            status: 'pending'
+          };
+
+          // 1. Мгновенно отображаем в чате
+          chatMessages.value.push(localMsg);
+          chatInput.value = '';
+          userScrolledUp.value = false;
+          await nextTick();
+          if (chatContainer.value) chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+
+          // 2. Добавляем в очередь
           const fd = new FormData();
           fd.append('sender_id', currentUser.value.id);
           fd.append('sender_role', currentUser.value.role);
           fd.append('sender_name', currentUser.value.full_name);
-          fd.append('content', chatInput.value);
-          const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages/text`, { method: 'POST', body: fd });
-          if (!res.ok) {
-            const err = await res.json();
-            alert('❌ ' + (err.detail || 'Ошибка отправки'));
-            return;
-          }
-          chatInput.value = '';
-          userScrolledUp.value = false;
-          newMessagesBelowCount.value = 0;
-          await loadMessages(true);
+          fd.append('content', text);
+
+          pendingQueue.value.push({
+            tempId,
+            taskId,
+            endpoint: `/api/tasks/${taskId}/messages/text`,
+            formData: fd,
+            localMsg
+          });
+
+          // 3. Запускаем фоновую отправку
+          flushPendingQueue();
         };
 
         const startVoiceRecording = async () => {
@@ -1876,33 +1939,95 @@ async def index():
           }
         };
 
+        // МГНОВЕННАЯ ОТПРАВКА ГОЛОСОВОГО (OPTIMISTIC UI + QUEUE)
         const confirmSendVoice = async () => {
           if (!recordedVoiceBlob.value || !activeChatTask.value || !currentUser.value) return;
+
+          const tempId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+          const taskId = activeChatTask.value.id;
+          const blob = recordedVoiceBlob.value;
+          const localUrl = recordedVoiceUrl.value;
+
+          const localMsg = {
+            id: tempId,
+            task_id: taskId,
+            sender_id: currentUser.value.id,
+            sender_role: currentUser.value.role,
+            sender_name: currentUser.value.full_name,
+            message_type: 'VOICE',
+            content: 'Голосовое сообщение',
+            media_url: localUrl,
+            created_at: new Date().toISOString(),
+            is_read: false,
+            status: 'pending'
+          };
+
+          chatMessages.value.push(localMsg);
+          cancelVoiceRecording();
+          userScrolledUp.value = false;
+          await nextTick();
+          if (chatContainer.value) chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+
           const fd = new FormData();
           fd.append('sender_id', currentUser.value.id);
           fd.append('sender_role', currentUser.value.role);
           fd.append('sender_name', currentUser.value.full_name);
-          fd.append('audio', recordedVoiceBlob.value, 'voice.webm');
-          
-          await fetch(`/api/tasks/${activeChatTask.value.id}/messages/voice`, { method: 'POST', body: fd });
-          cancelVoiceRecording();
-          userScrolledUp.value = false;
-          newMessagesBelowCount.value = 0;
-          await loadMessages(true);
+          fd.append('audio', blob, 'voice.webm');
+
+          pendingQueue.value.push({
+            tempId,
+            taskId,
+            endpoint: `/api/tasks/${taskId}/messages/voice`,
+            formData: fd,
+            localMsg
+          });
+
+          flushPendingQueue();
         };
 
+        // МГНОВЕННАЯ ОТПРАВКА ФОТО (OPTIMISTIC UI + QUEUE)
         const uploadChatImage = async (e) => {
           const file = e.target.files[0];
           if (!file || !activeChatTask.value || !currentUser.value) return;
+
+          const tempId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+          const taskId = activeChatTask.value.id;
+          const localUrl = URL.createObjectURL(file);
+
+          const localMsg = {
+            id: tempId,
+            task_id: taskId,
+            sender_id: currentUser.value.id,
+            sender_role: currentUser.value.role,
+            sender_name: currentUser.value.full_name,
+            message_type: 'IMAGE',
+            content: 'Прикрепленное фото',
+            media_url: localUrl,
+            created_at: new Date().toISOString(),
+            is_read: false,
+            status: 'pending'
+          };
+
+          chatMessages.value.push(localMsg);
+          userScrolledUp.value = false;
+          await nextTick();
+          if (chatContainer.value) chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+
           const fd = new FormData();
           fd.append('sender_id', currentUser.value.id);
           fd.append('sender_role', currentUser.value.role);
           fd.append('sender_name', currentUser.value.full_name);
           fd.append('file', file);
-          await fetch(`/api/tasks/${activeChatTask.value.id}/messages/image`, { method: 'POST', body: fd });
-          userScrolledUp.value = false;
-          newMessagesBelowCount.value = 0;
-          await loadMessages(true);
+
+          pendingQueue.value.push({
+            tempId,
+            taskId,
+            endpoint: `/api/tasks/${taskId}/messages/image`,
+            formData: fd,
+            localMsg
+          });
+
+          flushPendingQueue();
         };
 
         const openImageLightbox = (url) => {
@@ -1978,6 +2103,10 @@ async def index():
           }
           loadData();
           setupSSE();
+
+          // Слушатель восстановления сети и периодический ретрай очереди
+          window.addEventListener('online', flushPendingQueue);
+          setInterval(flushPendingQueue, 4000);
         });
 
         return {
@@ -1985,7 +2114,7 @@ async def index():
           recordSeconds, textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
           inboxTasks, activeTasks, archiveTasks,
           displayedOwnerTasks, displayedDeputyTasks,
-          myActiveTasks, myArchiveTasks, displayedEmpTasks, isMyMessage,
+          myActiveTasks, myArchiveTasks, displayedEmpTasks, isMyMessage, isPendingMessage,
           activeChatTask, chatMessages, chatInput, isChatLoading, chatContainer, previewImageUrl,
           isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl, userScrolledUp, newMessagesBelowCount,
           activeAudioId, isAudioPlaying, audioCurrentTime, audioDuration, audioProgress,
@@ -2003,3 +2132,4 @@ async def index():
   </script>
 </body>
 </html>"""
+
