@@ -875,7 +875,6 @@ async def index():
               👤 Исполнитель: {{ t.lead_name || 'Не назначен' }}
             </p>
 
-            <!-- ДАТЫ И ЧАСЫ НА КАРТОЧКЕ -->
             <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
               <div class="flex justify-between">
                 <span>📅 Создано:</span>
@@ -927,7 +926,6 @@ async def index():
 
             <!-- УПРАВЛЕНИЕ ЭТАПАМИ ДЛЯ ДИРЕКТОРА -->
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-2 border-t border-slate-800">
-              
               <div v-if="t.pending_request" class="p-2.5 bg-amber-950/40 border border-amber-800/60 rounded-xl space-y-2 animate-pulse">
                 <div class="flex justify-between items-center text-xs font-bold text-amber-300">
                   <span>📌 Запрос от {{ t.lead_name }}:</span>
@@ -1075,7 +1073,6 @@ async def index():
             </div>
 
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1 border-t border-slate-800">
-              
               <div v-if="t.pending_request" class="bg-amber-950/30 border border-amber-800/50 p-2 rounded-xl text-center text-xs text-amber-300 font-bold">
                 ⏳ Запрос на подтверждение ({{ t.pending_request === 'ARCHIVE' ? 'Архив' : t.pending_request + '%' }}) ожидает решения Жамолиддина
               </div>
@@ -1131,7 +1128,10 @@ async def index():
           </div>
           <div>
             <h3 class="text-xs font-bold text-white truncate max-w-[230px] leading-tight">{{ activeChatTask.title }}</h3>
-            <span class="text-[9px] font-semibold text-indigo-300/80">{{ statusLabel(activeChatTask.status) }} • {{ activeChatTask.progress || 0 }}%</span>
+            <div class="flex items-center gap-1.5 mt-0.5">
+              <span class="text-[9px] font-semibold text-indigo-300/80">{{ statusLabel(activeChatTask.status) }} • {{ activeChatTask.progress || 0 }}%</span>
+              <span v-if="!isOnline" class="text-[8px] bg-amber-500/20 text-amber-300 px-1 py-0.2 rounded border border-amber-500/40">Офлайн</span>
+            </div>
           </div>
         </div>
         <button @click="closeChat" class="w-8 h-8 rounded-full bg-slate-800/80 text-slate-300 flex items-center justify-center text-sm hover:text-white transition">
@@ -1159,7 +1159,7 @@ async def index():
               <span>{{ m.sender_name }} ({{ formatRoleName(m.sender_role) }})</span>
               <div class="flex items-center gap-1">
                 <span>{{ formatLocalTimeOnly(m.created_at) }}</span>
-                <!-- TELEGRAM-STYLE ИКОНКА ЧАСОВ ПРИ ОФФЛАЙН/ОТПРАВКЕ -->
+                <!-- TELEGRAM-STYLE ИКОНКА ЧАСОВ -->
                 <i v-if="isPendingMessage(m)" class="fa-regular fa-clock text-[9px] text-amber-300 opacity-90 animate-pulse ml-0.5"></i>
               </div>
             </div>
@@ -1199,7 +1199,7 @@ async def index():
 
             <div class="text-right text-[10px] leading-none pt-0.5">
               <span v-if="isMyMessage(m)">
-                <span v-if="isPendingMessage(m)" class="text-[9px] text-amber-300 font-semibold opacity-90">Отправка...</span>
+                <span v-if="isPendingMessage(m)" class="text-[9px] text-amber-300 font-semibold opacity-90">В очереди...</span>
                 <span v-else :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
                   {{ m.is_read ? '✓✓' : '✓' }}
                 </span>
@@ -1209,7 +1209,7 @@ async def index():
         </div>
       </div>
 
-      <!-- КНОПКА ВОЗВРАТА ВНИЗ С БЕЙДЖЕМ НЕПРОЧИТАННЫХ (TELEGRAM STYLE) -->
+      <!-- КНОПКА ВОЗВРАТА ВНИЗ С БЕЙДЖЕМ НЕПРОЧИТАННЫХ -->
       <button v-if="userScrolledUp" @click="scrollToBottomSmooth" class="fixed bottom-20 right-4 w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-2xl flex items-center justify-center text-sm transition duration-200 z-50 border border-indigo-400/40 animate-bounce">
         <i class="fa-solid fa-arrow-down"></i>
         <span v-if="newMessagesBelowCount > 0" class="absolute -top-1.5 -right-1.5 bg-red-500 text-white text-[10px] font-black min-w-[20px] h-5 px-1 rounded-full flex items-center justify-center border-2 border-slate-950 shadow-md animate-pulse">
@@ -1330,6 +1330,7 @@ async def index():
         const currentUser = ref(null);
         const loginForm = ref({ username: '', password: '' });
         const isLoggingIn = ref(false);
+        const isOnline = ref(navigator.onLine);
 
         const ownerTab = ref('inbox');
         const deputyTab = ref('inbox');
@@ -1357,7 +1358,7 @@ async def index():
         const userScrolledUp = ref(false);
         const newMessagesBelowCount = ref(0);
 
-        // ОФЛАЙН ОЧЕРЕДЬ СООБЩЕНИЙ (TELEGRAM QUEUE)
+        // ОФЛАЙН ОЧЕРЕДЬ
         const pendingQueue = ref([]);
         let isFlushingQueue = false;
 
@@ -1369,6 +1370,7 @@ async def index():
         let chatVoiceRecorder = null;
         let chatVoiceChunks = [];
         let chatVoiceTimer = null;
+        let chatVoiceStream = null;
 
         // ЕДИНЫЙ ПЛЕЕР АУДИО С ВОЛНАМИ
         const activeAudioId = ref(null);
@@ -1470,8 +1472,9 @@ async def index():
           return bars;
         };
 
+        // ПЛЕЕР: Полное управление аудио без залипаний
         const togglePlayAudio = (id, url) => {
-          if (activeAudioId.value === id && globalAudio) {
+          if (activeAudioId.value === id && globalAudio && globalAudio.src === url) {
             if (isAudioPlaying.value) {
               globalAudio.pause();
               isAudioPlaying.value = false;
@@ -1484,6 +1487,7 @@ async def index():
 
           if (globalAudio) {
             globalAudio.pause();
+            globalAudio.src = '';
             globalAudio = null;
           }
 
@@ -1509,7 +1513,7 @@ async def index():
             audioCurrentTime.value = 0;
           };
           globalAudio.play().catch(e => {
-            console.error("Audio error:", e);
+            console.error("Audio playback error:", e);
             isAudioPlaying.value = false;
           });
         };
@@ -1565,7 +1569,11 @@ async def index():
         };
 
         const handleLogout = () => {
-          if (globalAudio) globalAudio.pause();
+          if (globalAudio) {
+            globalAudio.pause();
+            globalAudio.src = '';
+            globalAudio = null;
+          }
           currentUser.value = null;
           localStorage.removeItem('task_auth_user');
           loginForm.value = { username: '', password: '' };
@@ -1603,7 +1611,7 @@ async def index():
               }
             });
           } catch (e) {
-            console.error("Ошибка загрузки:", e);
+            console.error("Ошибка загрузки данных:", e);
           }
         };
 
@@ -1773,14 +1781,19 @@ async def index():
         };
 
         const closeChat = () => {
-          if (globalAudio) globalAudio.pause();
+          if (globalAudio) {
+            globalAudio.pause();
+            globalAudio.src = '';
+            globalAudio = null;
+          }
+          activeAudioId.value = null;
+          isAudioPlaying.value = false;
           activeChatTask.value = null;
           cancelVoiceRecording();
           document.body.classList.remove('overflow-hidden');
           loadData();
         };
 
-        // Загрузка сообщений с сохранением локальных pending-сообщений
         const loadMessages = async (forceScrollBottom = false) => {
           if (!activeChatTask.value || !currentUser.value) return;
 
@@ -1788,7 +1801,6 @@ async def index():
             const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages?viewer_user_id=${currentUser.value.id}`);
             const serverMsgs = await res.json();
             
-            // Сохраняем локальные сообщения, которые еще отправляются в фоне
             const currentPending = pendingQueue.value
               .filter(q => q.taskId === activeChatTask.value.id)
               .map(q => q.localMsg);
@@ -1813,7 +1825,61 @@ async def index():
           }
         };
 
-        // ФОНОВАЯ ОБРАБОТКА ОЧЕРЕДИ ОТПРАВКИ (OUTBOX FLUSHER)
+        // Сохранение и синхронизация офлайн-очереди
+        const saveQueueToStorage = () => {
+          const serializable = pendingQueue.value
+            .filter(item => item.localMsg.message_type === 'TEXT')
+            .map(item => ({
+              tempId: item.tempId,
+              taskId: item.taskId,
+              endpoint: item.endpoint,
+              content: item.localMsg.content,
+              sender_id: item.localMsg.sender_id,
+              sender_role: item.localMsg.sender_role,
+              sender_name: item.localMsg.sender_name,
+              created_at: item.localMsg.created_at
+            }));
+          localStorage.setItem('task_pending_queue', JSON.stringify(serializable));
+        };
+
+        const restoreQueueFromStorage = () => {
+          try {
+            const saved = localStorage.getItem('task_pending_queue');
+            if (saved) {
+              const parsed = JSON.parse(saved);
+              parsed.forEach(item => {
+                const fd = new FormData();
+                fd.append('sender_id', item.sender_id);
+                fd.append('sender_role', item.sender_role);
+                fd.append('sender_name', item.sender_name);
+                fd.append('content', item.content);
+
+                const localMsg = {
+                  id: item.tempId,
+                  task_id: item.taskId,
+                  sender_id: item.sender_id,
+                  sender_role: item.sender_role,
+                  sender_name: item.sender_name,
+                  message_type: 'TEXT',
+                  content: item.content,
+                  media_url: null,
+                  created_at: item.created_at,
+                  is_read: false,
+                  status: 'pending'
+                };
+
+                pendingQueue.value.push({
+                  tempId: item.tempId,
+                  taskId: item.taskId,
+                  endpoint: item.endpoint,
+                  formData: fd,
+                  localMsg
+                });
+              });
+            }
+          } catch (e) {}
+        };
+
         const flushPendingQueue = async () => {
           if (isFlushingQueue || pendingQueue.value.length === 0) return;
           isFlushingQueue = true;
@@ -1823,16 +1889,16 @@ async def index():
               const item = pendingQueue.value[0];
               try {
                 const res = await fetch(item.endpoint, { method: 'POST', body: item.formData });
-                if (!res.ok) throw new Error("HTTP error " + res.status);
+                if (!res.ok) throw new Error("HTTP " + res.status);
                 
-                // Успешно отправлено
                 pendingQueue.value.shift();
+                saveQueueToStorage();
+
                 if (activeChatTask.value && activeChatTask.value.id === item.taskId) {
                   await loadMessages(false);
                 }
               } catch (netErr) {
-                // Если нет сети — прерываем цикл, оставляем иконку часов и ждем восстановления сети
-                console.warn("Сеть недоступна, сообщение в очереди:", netErr);
+                console.warn("Офлайн-режим. Сообщение сохранено в очереди:", netErr);
                 break;
               }
             }
@@ -1841,7 +1907,6 @@ async def index():
           }
         };
 
-        // МГНОВЕННАЯ ОТПРАВКА ТЕКСТА (OPTIMISTIC UI + QUEUE)
         const sendChatMessage = async () => {
           const text = chatInput.value.trim();
           if (!text || !activeChatTask.value || !currentUser.value) return;
@@ -1863,14 +1928,12 @@ async def index():
             status: 'pending'
           };
 
-          // 1. Мгновенно отображаем в чате
           chatMessages.value.push(localMsg);
           chatInput.value = '';
           userScrolledUp.value = false;
           await nextTick();
           if (chatContainer.value) chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
 
-          // 2. Добавляем в очередь
           const fd = new FormData();
           fd.append('sender_id', currentUser.value.id);
           fd.append('sender_role', currentUser.value.role);
@@ -1885,19 +1948,19 @@ async def index():
             localMsg
           });
 
-          // 3. Запускаем фоновую отправку
+          saveQueueToStorage();
           flushPendingQueue();
         };
 
+        // Запись аудио с гарантированным сбросом старых сессий
         const startVoiceRecording = async () => {
+          cancelVoiceRecording(); // Полный сброс перед стартом
           try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            chatVoiceRecorder = new MediaRecorder(stream);
+            chatVoiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            chatVoiceRecorder = new MediaRecorder(chatVoiceStream);
             chatVoiceChunks = [];
             recordVoiceSeconds.value = 0;
             isRecordingVoice.value = true;
-            recordedVoiceBlob.value = null;
-            recordedVoiceUrl.value = null;
 
             chatVoiceTimer = setInterval(() => recordVoiceSeconds.value++, 1000);
 
@@ -1906,11 +1969,17 @@ async def index():
             };
 
             chatVoiceRecorder.onstop = () => {
-              clearInterval(chatVoiceTimer);
+              if (chatVoiceTimer) clearInterval(chatVoiceTimer);
               const blob = new Blob(chatVoiceChunks, { type: chatVoiceRecorder.mimeType || 'audio/webm' });
               recordedVoiceBlob.value = blob;
               recordedVoiceUrl.value = URL.createObjectURL(blob);
               isRecordingVoice.value = false;
+
+              // Останавливаем аппаратный микрофон
+              if (chatVoiceStream) {
+                chatVoiceStream.getTracks().forEach(t => t.stop());
+                chatVoiceStream = null;
+              }
             };
 
             chatVoiceRecorder.start();
@@ -1920,16 +1989,38 @@ async def index():
         };
 
         const stopVoiceRecording = () => {
-          if (chatVoiceRecorder && isRecordingVoice.value) {
+          if (chatVoiceRecorder && isRecordingVoice.value && chatVoiceRecorder.state !== 'inactive') {
             chatVoiceRecorder.stop();
           }
         };
 
+        // Полное уничтожение временной аудиозаписи
         const cancelVoiceRecording = () => {
-          if (chatVoiceTimer) clearInterval(chatVoiceTimer);
-          if (chatVoiceRecorder && isRecordingVoice.value) {
+          if (chatVoiceTimer) {
+            clearInterval(chatVoiceTimer);
+            chatVoiceTimer = null;
+          }
+          if (chatVoiceRecorder && isRecordingVoice.value && chatVoiceRecorder.state !== 'inactive') {
             chatVoiceRecorder.stop();
           }
+          if (chatVoiceStream) {
+            chatVoiceStream.getTracks().forEach(t => t.stop());
+            chatVoiceStream = null;
+          }
+
+          // Глушим текущий плеер если он играл предпрослушивание
+          if (globalAudio) {
+            globalAudio.pause();
+            globalAudio.src = '';
+            globalAudio = null;
+          }
+          if (activeAudioId.value === 'preview_voice') {
+            activeAudioId.value = null;
+            isAudioPlaying.value = false;
+            audioCurrentTime.value = 0;
+            audioProgress.value = 0;
+          }
+
           isRecordingVoice.value = false;
           recordVoiceSeconds.value = 0;
           recordedVoiceBlob.value = null;
@@ -1939,7 +2030,6 @@ async def index():
           }
         };
 
-        // МГНОВЕННАЯ ОТПРАВКА ГОЛОСОВОГО (OPTIMISTIC UI + QUEUE)
         const confirmSendVoice = async () => {
           if (!recordedVoiceBlob.value || !activeChatTask.value || !currentUser.value) return;
 
@@ -1963,7 +2053,14 @@ async def index():
           };
 
           chatMessages.value.push(localMsg);
-          cancelVoiceRecording();
+          
+          // Сброс без отзыва URL чтобы локальное сообщение могло играть в плеере
+          if (chatVoiceTimer) clearInterval(chatVoiceTimer);
+          isRecordingVoice.value = false;
+          recordVoiceSeconds.value = 0;
+          recordedVoiceBlob.value = null;
+          recordedVoiceUrl.value = null;
+
           userScrolledUp.value = false;
           await nextTick();
           if (chatContainer.value) chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
@@ -1985,7 +2082,6 @@ async def index():
           flushPendingQueue();
         };
 
-        // МГНОВЕННАЯ ОТПРАВКА ФОТО (OPTIMISTIC UI + QUEUE)
         const uploadChatImage = async (e) => {
           const file = e.target.files[0];
           if (!file || !activeChatTask.value || !currentUser.value) return;
@@ -2101,16 +2197,29 @@ async def index():
               currentUser.value = JSON.parse(saved);
             } catch (e) {}
           }
+          restoreQueueFromStorage();
           loadData();
           setupSSE();
 
-          // Слушатель восстановления сети и периодический ретрай очереди
-          window.addEventListener('online', flushPendingQueue);
+          window.addEventListener('online', () => {
+            isOnline.value = true;
+            flushPendingQueue();
+            loadData();
+          });
+          window.addEventListener('offline', () => {
+            isOnline.value = false;
+          });
+          document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') {
+              flushPendingQueue();
+              loadData();
+            }
+          });
           setInterval(flushPendingQueue, 4000);
         });
 
         return {
-          currentUser, loginForm, isLoggingIn, ownerTab, deputyTab, empTab, isRecording, isProcessing,
+          currentUser, loginForm, isLoggingIn, isOnline, ownerTab, deputyTab, empTab, isRecording, isProcessing,
           recordSeconds, textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
           inboxTasks, activeTasks, archiveTasks,
           displayedOwnerTasks, displayedDeputyTasks,
