@@ -399,6 +399,7 @@ async def reject_review(task_id: int, reason: str = Form(...)):
     await broadcast_event("task_rejected")
     return {"status": "ok"}
 
+# GET сообщений БЕЗ вызова SSE-триггера для предотвращения циклов
 @app.get("/api/tasks/{task_id}/messages")
 async def get_messages(task_id: int, viewer_user_id: int = 1):
     pool = await get_db()
@@ -426,7 +427,6 @@ async def get_messages(task_id: int, viewer_user_id: int = 1):
             ORDER BY msg.id ASC
         """, task_id)
 
-        await broadcast_event("read_receipt")
         return [dict(r) for r in rows]
 
 async def check_task_not_archived(conn, task_id: int):
@@ -679,7 +679,7 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ВОЛНАМИ -->
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -772,7 +772,6 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ВОЛНАМИ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -934,7 +933,6 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ВОЛНАМИ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1020,7 +1018,7 @@ async def index():
     </div>
 
     <!-- ========================================== -->
-    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (ENTERPRISE TELEGRAM VIEW) -->
+    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (ENTERPRISE VIEW) -->
     <!-- ========================================== -->
     <div v-if="activeChatTask" class="fixed inset-0 bg-slate-950 z-50 flex flex-col h-[100dvh] w-full max-w-md mx-auto overscroll-contain">
       
@@ -1041,7 +1039,7 @@ async def index():
       </div>
 
       <!-- Лента сообщений -->
-      <div ref="chatContainer" class="flex-1 overflow-y-auto overscroll-contain p-3.5 space-y-3 bg-slate-950">
+      <div ref="chatContainer" @scroll="onChatScroll" class="flex-1 overflow-y-auto overscroll-contain p-3.5 space-y-3 bg-slate-950 relative">
         
         <div v-if="isChatLoading" class="flex flex-col items-center justify-center h-full text-slate-400 py-16 space-y-2.5">
           <i class="fa-solid fa-circle-notch fa-spin text-2xl text-indigo-500"></i>
@@ -1063,7 +1061,7 @@ async def index():
 
             <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
 
-            <!-- АУДИОСООБЩЕНИЕ С ВОЛНАМИ И СКРАББИНГОМ -->
+            <!-- АУДИОСООБЩЕНИЕ С ВОЛНАМИ -->
             <div v-if="m.message_type === 'VOICE'" class="pt-1">
               <div class="flex items-center gap-2.5 bg-black/20 p-2 rounded-xl border border-white/5">
                 <button @click="togglePlayAudio('msg_' + m.id, m.media_url)" :class="isMyMessage(m) ? 'bg-white text-indigo-600' : 'bg-indigo-600 text-white'" class="w-8 h-8 rounded-full flex items-center justify-center text-xs shrink-0 shadow transition">
@@ -1084,7 +1082,7 @@ async def index():
               </div>
             </div>
 
-            <!-- Фотография с открытием Lightbox -->
+            <!-- Фотография -->
             <div v-if="m.message_type === 'IMAGE'" class="pt-1">
               <div @click="openImageLightbox(m.media_url)" class="relative group cursor-pointer overflow-hidden rounded-xl border border-white/10">
                 <img :src="m.media_url" class="rounded-xl max-h-52 w-full object-cover group-hover:scale-105 transition duration-200">
@@ -1094,7 +1092,6 @@ async def index():
               </div>
             </div>
 
-            <!-- Галочки прочтения в стиле Telegram -->
             <div class="text-right text-[10px] leading-none pt-0.5">
               <span v-if="isMyMessage(m)" :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
                 {{ m.is_read ? '✓✓' : '✓' }}
@@ -1104,7 +1101,12 @@ async def index():
         </div>
       </div>
 
-      <!-- ПАНЕЛЬ УПРАВЛЕНИЯ ГОЛОСОВЫМ ПЕРЕД ОТПРАВКОЙ (С ВОЛНАМИ) -->
+      <!-- КНОПКА ВОЗВРАТА К ПОСЛЕДНИМ СООБЩЕНИЯМ (TELEGRAM STYLE) -->
+      <button v-if="userScrolledUp" @click="scrollToBottomSmooth" class="fixed bottom-20 right-4 w-9 h-9 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-xl shadow-indigo-600/40 flex items-center justify-center text-xs transition duration-200 z-50 border border-indigo-400/30 animate-bounce">
+        <i class="fa-solid fa-arrow-down"></i>
+      </button>
+
+      <!-- ПАНЕЛЬ УПРАВЛЕНИЯ ГОЛОСОВЫМ -->
       <div v-if="recordedVoiceUrl" class="p-3 bg-slate-900 border-t border-slate-800 space-y-2.5 shrink-0">
         <div class="flex justify-between items-center text-[11px] font-bold text-slate-300">
           <span class="flex items-center gap-1.5 text-indigo-400">
@@ -1241,6 +1243,7 @@ async def index():
         const isChatLoading = ref(false);
         const chatContainer = ref(null);
         const previewImageUrl = ref(null);
+        const userScrolledUp = ref(false);
 
         // ГОЛОСОВОЙ КОНТРОЛЬ ПЕРЕД ОТПРАВКОЙ
         const isRecordingVoice = ref(false);
@@ -1339,7 +1342,6 @@ async def index():
           return new Date(now.getTime() - offset).toISOString().slice(0, 16);
         };
 
-        // ДЕТЕРМИНИРОВАННЫЕ ВОЛНЫ АУДИО
         const getWaveformBars = (id) => {
           const count = 28;
           const bars = [];
@@ -1353,7 +1355,6 @@ async def index():
           return bars;
         };
 
-        // ПЛЕЕР: Воспроизведение, пауза, перемотка
         const togglePlayAudio = (id, url) => {
           if (activeAudioId.value === id && globalAudio) {
             if (isAudioPlaying.value) {
@@ -1494,10 +1495,10 @@ async def index():
         const setupSSE = () => {
           const evtSource = new EventSource('/api/events');
           evtSource.onopen = () => { sseConnected.value = true; };
-          evtSource.onmessage = () => {
+          evtSource.onmessage = (event) => {
             loadData();
             if (activeChatTask.value) {
-              loadMessages(false); // Подгружаем без принудительного скролла вниз
+              loadMessages(false);
             }
           };
           evtSource.onerror = () => {
@@ -1620,11 +1621,28 @@ async def index():
           await loadData();
         };
 
-        // УМНЫЙ СКРОЛЛ ЧАТА
+        // ОТСЛЕЖИВАНИЕ СКРОЛЛА
+        const onChatScroll = () => {
+          if (!chatContainer.value) return;
+          const { scrollTop, scrollHeight, clientHeight } = chatContainer.value;
+          userScrolledUp.value = (scrollHeight - scrollTop - clientHeight) > 60;
+        };
+
+        const scrollToBottomSmooth = () => {
+          if (chatContainer.value) {
+            chatContainer.value.scrollTo({
+              top: chatContainer.value.scrollHeight,
+              behavior: 'smooth'
+            });
+            userScrolledUp.value = false;
+          }
+        };
+
         const openChat = async (task) => {
           activeChatTask.value = task;
           chatMessages.value = [];
           isChatLoading.value = true;
+          userScrolledUp.value = false;
           cancelVoiceRecording();
           document.body.classList.add('overflow-hidden');
           task.unread_count = 0;
@@ -1643,22 +1661,22 @@ async def index():
 
         const loadMessages = async (forceScrollBottom = false) => {
           if (!activeChatTask.value || !currentUser.value) return;
-          
-          let wasNearBottom = true;
-          if (chatContainer.value && !forceScrollBottom) {
-            const threshold = 100;
-            const position = chatContainer.value.scrollTop + chatContainer.value.clientHeight;
-            wasNearBottom = (chatContainer.value.scrollHeight - position) <= threshold;
-          }
 
           try {
             const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages?viewer_user_id=${currentUser.value.id}`);
-            chatMessages.value = await res.json();
+            const newMsgs = await res.json();
             
-            await nextTick();
-            if (forceScrollBottom || wasNearBottom) {
-              if (chatContainer.value) {
-                chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+            const currentJson = JSON.stringify(chatMessages.value);
+            const newJson = JSON.stringify(newMsgs);
+
+            if (currentJson !== newJson) {
+              chatMessages.value = newMsgs;
+              await nextTick();
+              
+              if (forceScrollBottom || !userScrolledUp.value) {
+                if (chatContainer.value) {
+                  chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+                }
               }
             }
           } catch (e) {
@@ -1680,6 +1698,7 @@ async def index():
             return;
           }
           chatInput.value = '';
+          userScrolledUp.value = false;
           await loadMessages(true);
         };
 
@@ -1743,6 +1762,7 @@ async def index():
           
           await fetch(`/api/tasks/${activeChatTask.value.id}/messages/voice`, { method: 'POST', body: fd });
           cancelVoiceRecording();
+          userScrolledUp.value = false;
           await loadMessages(true);
         };
 
@@ -1755,6 +1775,7 @@ async def index():
           fd.append('sender_name', currentUser.value.full_name);
           fd.append('file', file);
           await fetch(`/api/tasks/${activeChatTask.value.id}/messages/image`, { method: 'POST', body: fd });
+          userScrolledUp.value = false;
           await loadMessages(true);
         };
 
@@ -1842,12 +1863,13 @@ async def index():
           displayedOwnerTasks, displayedDeputyTasks,
           myActiveTasks, myReviewTasks, myArchiveTasks, displayedEmpTasks, isMyMessage,
           activeChatTask, chatMessages, chatInput, isChatLoading, chatContainer, previewImageUrl,
-          isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl,
+          isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl, userScrolledUp,
           activeAudioId, isAudioPlaying, audioCurrentTime, audioDuration, audioProgress,
           togglePlayAudio, seekAudio, handleTouchSeek, getWaveformBars, formatAudioTime,
           handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, submitTaskForReview, rejectTask,
           completeTask, openChat, closeChat, sendChatMessage, uploadChatImage, openImageLightbox,
           startVoiceRecording, stopVoiceRecording, cancelVoiceRecording, confirmSendVoice, sendRedFlag,
+          onChatScroll, scrollToBottomSmooth,
           formatLocalDT, formatLocalTimeOnly,
           getDeadlineCountdown, getDeadlineBadge, priorityBadge, priorityLabel, statusBadge, statusLabel,
           formatRoleName, formatTime
