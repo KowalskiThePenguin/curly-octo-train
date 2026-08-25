@@ -212,12 +212,28 @@ SYSTEM_PROMPT = """
 """
 
 def query_gemini_direct(parts_list: list) -> dict:
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    if not GEMINI_API_KEY:
+        print("[Gemini Error] GEMINI_API_KEY не задан в переменных окружения Render!")
+        return {
+            "title": "Новое поручение",
+            "ai_summary": "Поручение принято и зарегистрировано в системе",
+            "definition_of_done": "1. Выполнить поручение в срок",
+            "task_type": "SOLO",
+            "priority": "URGENT",
+            "project_group": "Проект Кормовая Мука"
+        }
+
+    # Стабильные рабочие модели Gemini
+    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    
     for model_name in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_name}:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{"parts": parts_list}],
-            "generationConfig": {"temperature": 0.2}
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json"
+            }
         }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -225,10 +241,20 @@ def query_gemini_direct(parts_list: list) -> dict:
             with urllib.request.urlopen(req, timeout=20) as resp:
                 res_json = json.loads(resp.read().decode("utf-8"))
                 raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                
+                # Очистка от возможных markdown-тегов
+                clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+                match = re.search(r'\{.*\}', clean_text, re.DOTALL)
                 if match:
-                    return json.loads(match.group(0))
-        except Exception:
+                    parsed = json.loads(match.group(0))
+                    print(f"[Gemini Success] Использована модель {model_name}")
+                    return parsed
+        except urllib.error.HTTPError as he:
+            err_body = he.read().decode("utf-8", errors="ignore")
+            print(f"[Gemini HTTP {he.code}] Модель {model_name} вернула ошибку: {err_body}")
+            continue
+        except Exception as e:
+            print(f"[Gemini Error] Ошибка с моделью {model_name}: {e}")
             continue
 
     return {
