@@ -213,7 +213,6 @@ SYSTEM_PROMPT = """
 
 def query_gemini_direct(parts_list: list) -> dict:
     raw_key = os.getenv("GEMINI_API_KEY", "")
-    # Автоматическая очистка ключа от случайных скобок, кавычек и пробелов
     clean_key = raw_key.strip().strip("[]'\"")
 
     if not clean_key:
@@ -227,7 +226,8 @@ def query_gemini_direct(parts_list: list) -> dict:
             "project_group": "Проект Кормовая Мука"
         }
 
-    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    # Актуальные модели Gemini
+    models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
     
     for model_name in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={clean_key}"
