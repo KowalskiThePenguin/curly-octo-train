@@ -315,7 +315,7 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), user_id, True)
+            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
 
         send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от Хуршида</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         await broadcast_event("new_task")
@@ -389,7 +389,6 @@ async def assign_task(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# РЕДАКТИРОВАНИЕ ДЕТАЛЕЙ ЗАДАЧИ С ПОЛНЫМ ДИФФОМ (БЫЛО -> СТАЛО)
 @app.post("/api/tasks/{task_id}/update-details")
 async def update_task_details(
     task_id: int,
@@ -461,7 +460,6 @@ async def update_task_details(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ И ЛИДА С ДИФФОМ
 @app.post("/api/tasks/{task_id}/update-team")
 async def update_task_team(
     task_id: int,
@@ -950,18 +948,18 @@ async def index():
               </div>
             </div>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ПЕРЕМОТКОЙ -->
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
                   <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
                 </button>
                 <div class="flex-1 space-y-1">
-                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove.prevent="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
                          :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
-                         class="w-1 rounded-full transition-colors"></div>
+                         class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[10px] text-slate-400 font-mono">
                     <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос Шефа' }}</span>
@@ -1038,18 +1036,18 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ПЕРЕМОТКОЙ -->
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
                   <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
                 </button>
                 <div class="flex-1 space-y-1">
-                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove.prevent="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
                          :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
-                         class="w-1 rounded-full transition-colors"></div>
+                         class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[10px] text-slate-400 font-mono">
                     <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос Шефа' }}</span>
@@ -1254,18 +1252,18 @@ async def index():
               </div>
             </div>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА С ПЕРЕМОТКОЙ -->
+            <!-- ПЛЕЕР ГОЛОСА ШЕФА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
                   <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
                 </button>
                 <div class="flex-1 space-y-1">
-                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove.prevent="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
                          :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
-                         class="w-1 rounded-full transition-colors"></div>
+                         class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[10px] text-slate-400 font-mono">
                     <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос Шефа' }}</span>
@@ -1505,11 +1503,11 @@ async def index():
                   <i :class="activeAudioId === 'msg_' + m.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
                 </button>
                 <div class="flex-1 space-y-1">
-                  <div @click="seekAudio('msg_' + m.id, m.media_url, $event)" @touchmove="handleTouchSeek('msg_' + m.id, m.media_url, $event)" class="h-5 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div @click="seekAudio('msg_' + m.id, m.media_url, $event)" @touchmove.prevent="handleTouchSeek('msg_' + m.id, m.media_url, $event)" class="h-5 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(m.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
                          :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? (isMyMessage(m) ? 'bg-white' : 'bg-indigo-400') : (isMyMessage(m) ? 'bg-indigo-400/50' : 'bg-slate-700')"
-                         class="w-1 rounded-full transition-colors"></div>
+                         class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[9px] font-mono opacity-80">
                     <span>{{ activeAudioId === 'msg_' + m.id ? formatAudioTime(audioCurrentTime) : 'Голосовое' }}</span>
@@ -1560,11 +1558,11 @@ async def index():
             <i :class="activeAudioId === 'preview_voice' && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
           </button>
           <div class="flex-1 space-y-1">
-            <div @click="seekAudio('preview_voice', recordedVoiceUrl, $event)" @touchmove="handleTouchSeek('preview_voice', recordedVoiceUrl, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+            <div @click="seekAudio('preview_voice', recordedVoiceUrl, $event)" @touchmove.prevent="handleTouchSeek('preview_voice', recordedVoiceUrl, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
               <div v-for="(h, idx) in getWaveformBars(999)" :key="idx" 
                    :style="{ height: h + '%' }" 
                    :class="(activeAudioId === 'preview_voice' && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
-                   class="w-1 rounded-full transition-colors"></div>
+                   class="w-1 rounded-full transition-colors pointer-events-none"></div>
             </div>
             <div class="flex justify-between text-[10px] text-slate-400 font-mono">
               <span>{{ activeAudioId === 'preview_voice' ? formatAudioTime(audioCurrentTime) : '0:00' }}</span>
@@ -1722,6 +1720,7 @@ async def index():
         const audioDuration = ref(0);
         const audioProgress = ref(0);
         let globalAudio = null;
+        const voiceBlobCache = {};
 
         const roleBadgeTitle = computed(() => {
           if (!currentUser.value) return '';
@@ -1861,16 +1860,33 @@ async def index():
           return bars;
         };
 
-        // УНИВЕРСАЛЬНЫЙ ПЛЕЕР С ПОЛНОЙ ПЕРЕМОТКОЙ
-        const playAudioAt = (id, url, targetRatio = null) => {
+        // ПРЕВРАЩЕНИЕ HTTP-ПОТОКОВ В ЛОКАЛЬНЫЙ BLOB ДЛЯ МГНОВЕННОЙ ПЕРЕМОТКИ
+        const resolveAudioUrl = async (url) => {
+          if (!url) return '';
+          if (url.startsWith('data:') || url.startsWith('blob:')) return url;
+          if (voiceBlobCache[url]) return voiceBlobCache[url];
+          try {
+            const res = await fetch(url);
+            const blob = await res.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            voiceBlobCache[url] = blobUrl;
+            return blobUrl;
+          } catch (e) {
+            return url;
+          }
+        };
+
+        const playAudioAt = async (id, rawUrl, targetRatio = null) => {
+          const url = await resolveAudioUrl(rawUrl);
+
           if (activeAudioId.value === id && globalAudio) {
-            if (targetRatio !== null && globalAudio.duration) {
+            if (targetRatio !== null && globalAudio.duration && !isNaN(globalAudio.duration)) {
               globalAudio.currentTime = targetRatio * globalAudio.duration;
               audioCurrentTime.value = globalAudio.currentTime;
               audioProgress.value = targetRatio;
             }
             if (!isAudioPlaying.value) {
-              globalAudio.play();
+              globalAudio.play().catch(() => {});
               isAudioPlaying.value = true;
             }
             return;
@@ -1888,27 +1904,36 @@ async def index():
           audioProgress.value = targetRatio || 0;
 
           globalAudio = new Audio(url);
-          globalAudio.onloadedmetadata = () => {
-            audioDuration.value = globalAudio.duration;
-            if (targetRatio !== null) {
-              globalAudio.currentTime = targetRatio * globalAudio.duration;
-              audioCurrentTime.value = globalAudio.currentTime;
+
+          const applyTargetTime = () => {
+            if (globalAudio && globalAudio.duration && !isNaN(globalAudio.duration)) {
+              audioDuration.value = globalAudio.duration;
+              if (targetRatio !== null) {
+                globalAudio.currentTime = targetRatio * globalAudio.duration;
+                audioCurrentTime.value = globalAudio.currentTime;
+              }
             }
           };
+
+          globalAudio.onloadedmetadata = applyTargetTime;
+          globalAudio.oncanplay = applyTargetTime;
+
           globalAudio.ontimeupdate = () => {
-            if (globalAudio && globalAudio.duration) {
+            if (globalAudio && globalAudio.duration && !isNaN(globalAudio.duration)) {
               audioCurrentTime.value = globalAudio.currentTime;
               audioDuration.value = globalAudio.duration;
               audioProgress.value = globalAudio.currentTime / globalAudio.duration;
             }
           };
+
           globalAudio.onended = () => {
             isAudioPlaying.value = false;
             audioProgress.value = 0;
             audioCurrentTime.value = 0;
           };
+
           globalAudio.play().catch(e => {
-            console.error("Audio error:", e);
+            console.error("Audio playback error:", e);
             isAudioPlaying.value = false;
           });
         };
@@ -1919,7 +1944,7 @@ async def index():
               globalAudio.pause();
               isAudioPlaying.value = false;
             } else {
-              globalAudio.play();
+              globalAudio.play().catch(() => {});
               isAudioPlaying.value = true;
             }
             return;
@@ -1928,6 +1953,7 @@ async def index():
         };
 
         const seekAudio = (id, url, event) => {
+          event.stopPropagation();
           const rect = event.currentTarget.getBoundingClientRect();
           const clickX = event.clientX - rect.left;
           const ratio = Math.max(0, Math.min(1, clickX / rect.width));
@@ -1935,10 +1961,10 @@ async def index():
         };
 
         const handleTouchSeek = (id, url, event) => {
+          event.stopPropagation();
           if (event.touches && event.touches[0]) {
             const touch = event.touches[0];
-            const target = event.currentTarget;
-            const rect = target.getBoundingClientRect();
+            const rect = event.currentTarget.getBoundingClientRect();
             const touchX = touch.clientX - rect.left;
             const ratio = Math.max(0, Math.min(1, touchX / rect.width));
             playAudioAt(id, url, ratio);
