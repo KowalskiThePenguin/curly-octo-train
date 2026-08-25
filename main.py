@@ -7,11 +7,24 @@ import traceback
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import asyncpg
 
 app = FastAPI()
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response: Response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0, private"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -21,6 +34,7 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 db_pool = None
 sse_subscribers = set()
+FAILED_LOGIN_ATTEMPTS = {}
 
 async def broadcast_event(event_type: str = "update"):
     for queue in list(sse_subscribers):
@@ -106,6 +120,10 @@ async def startup():
                 last_read_msg_id INT DEFAULT 0,
                 PRIMARY KEY (task_id, user_id)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks (status, priority, deadline);
+            CREATE INDEX IF NOT EXISTS idx_task_messages_task_id ON task_messages (task_id, id ASC);
+            CREATE INDEX IF NOT EXISTS idx_task_user_reads ON task_user_reads (task_id, user_id);
         """)
 
         await conn.execute("UPDATE users SET is_active = FALSE")
@@ -149,7 +167,16 @@ async def events_stream(request: Request):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.post("/api/login")
-async def login(username: str = Form(...), password: str = Form(...)):
+async def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    client_ip = request.client.host if request.client else "unknown"
+    now = datetime.now(timezone.utc)
+    
+    if client_ip in FAILED_LOGIN_ATTEMPTS:
+        attempts, lock_until = FAILED_LOGIN_ATTEMPTS[client_ip]
+        if lock_until and now < lock_until:
+            wait_sec = int((lock_until - now).total_seconds())
+            raise HTTPException(status_code=429, detail=f"Слишком много попыток. Подождите {wait_sec} сек.")
+    
     pool = await get_db()
     async with pool.acquire() as conn:
         user = await conn.fetchrow("""
@@ -161,7 +188,13 @@ async def login(username: str = Form(...), password: str = Form(...)):
         """, username, password)
         
         if not user:
+            attempts, _ = FAILED_LOGIN_ATTEMPTS.get(client_ip, (0, None))
+            attempts += 1
+            lock = now + timedelta(minutes=10) if attempts >= 5 else None
+            FAILED_LOGIN_ATTEMPTS[client_ip] = (attempts, lock)
             raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+        
+        FAILED_LOGIN_ATTEMPTS.pop(client_ip, None)
         return {"status": "ok", "user": dict(user)}
 
 SYSTEM_PROMPT = """
@@ -217,11 +250,18 @@ async def get_users():
 async def get_tasks(viewer_user_id: int = 1):
     pool = await get_db()
     async with pool.acquire() as conn:
-        tasks = await conn.fetch("""
+        viewer = await conn.fetchrow("SELECT role FROM users WHERE id = $1", viewer_user_id)
+        role = viewer['role'] if viewer else 'EMPLOYEE'
+
+        where_clause = ""
+        if role == 'EMPLOYEE':
+            where_clause = "WHERE (t.lead_user_id = $1 OR $1 = ANY(t.assignee_ids))"
+
+        query = f"""
             SELECT t.id, t.title, t.raw_input_text, t.ai_summary, t.definition_of_done,
                    t.task_type, t.status, t.priority, t.lead_user_id, t.result_report,
                    COALESCE(t.project_group, 'Проект Кормовая Мука') as project_group,
-                   COALESCE(t.assignee_ids, '{}') as assignee_ids,
+                   COALESCE(t.assignee_ids, '{{}}') as assignee_ids,
                    COALESCE(t.progress, 0) as progress, t.pending_request,
                    to_char(t.deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as deadline,
                    to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
@@ -236,6 +276,7 @@ async def get_tasks(viewer_user_id: int = 1):
                    ) as unread_count
             FROM tasks t
             LEFT JOIN users u ON u.id = t.lead_user_id
+            {where_clause}
             ORDER BY 
                 CASE WHEN t.status = 'ARCHIVED' THEN 2 ELSE 1 END ASC,
                 CASE 
@@ -247,7 +288,8 @@ async def get_tasks(viewer_user_id: int = 1):
                 CASE WHEN t.deadline IS NULL THEN 1 ELSE 0 END ASC,
                 t.deadline ASC,
                 t.id DESC
-        """, viewer_user_id)
+        """
+        tasks = await conn.fetch(query, viewer_user_id)
         return [dict(t) for t in tasks]
 
 @app.get("/api/tasks/{task_id}/voice")
@@ -315,7 +357,7 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
+            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), user_id, True)
 
         send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от Хуршида</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         await broadcast_event("new_task")
@@ -444,10 +486,7 @@ async def update_task_details(
                 if old_task['ai_summary'] != ai_summary or old_task['definition_of_done'] != definition_of_done:
                     changes.append("• ТЗ и критерии сдачи (DoD) обновлены")
 
-            if changes:
-                sys_msg = f"✏️ Директор {user_name} изменил параметры задачи:\n" + "\n".join(changes)
-            else:
-                sys_msg = f"✏️ Директор {user_name} сохранил параметры задачи без изменений."
+            sys_msg = f"✏️ Директор {user_name} изменил параметры задачи:\n" + "\n".join(changes) if changes else f"✏️ Директор {user_name} сохранил параметры задачи без изменений."
 
             await conn.execute("""
                 INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
@@ -470,17 +509,14 @@ async def update_task_team(
     try:
         parsed_assignees = json.loads(assignee_ids)
         if not parsed_assignees or len(parsed_assignees) == 0:
-            raise HTTPException(status_code=400, detail="Нельзя убрать всех исполнителей. В задаче должен остаться минимум 1 человек.")
+            raise HTTPException(status_code=400, detail="В задаче должен оставаться минимум 1 исполнитель.")
         
         if lead_id not in parsed_assignees:
             lead_id = parsed_assignees[0]
 
         pool = await get_db()
         async with pool.acquire() as conn:
-            old_task = await conn.fetchrow("""
-                SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1
-            """, task_id)
-
+            old_task = await conn.fetchrow("SELECT lead_user_id FROM tasks WHERE id = $1", task_id)
             old_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", old_task['lead_user_id']) if old_task else 'Не назначен'
             new_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
             
@@ -555,12 +591,7 @@ async def request_stage(
         if lead_id != user_id:
             raise HTTPException(status_code=403, detail="Только Лид команды имеет право отправлять запросы на утверждение этапов.")
 
-        await conn.execute("""
-            UPDATE tasks 
-            SET pending_request = $1 
-            WHERE id = $2
-        """, stage, task_id)
-
+        await conn.execute("UPDATE tasks SET pending_request = $1 WHERE id = $2", stage, task_id)
         target_str = "сдачу в архив" if stage == 'ARCHIVE' else f"этап {stage}%"
         sys_msg = f"📌 Лид команды {user_name} запросил подтверждение на {target_str}."
 
@@ -589,7 +620,7 @@ async def confirm_stage_request(
         """, task_id)
         
         if not task or not task['pending_request']:
-            raise HTTPException(status_code=400, detail="Нет активного запроса на подтверждение")
+            raise HTTPException(status_code=400, detail="Нет активного запроса")
 
         req_stage = task['pending_request']
         lead_name = task['lead_name'] or 'Лид'
@@ -597,18 +628,9 @@ async def confirm_stage_request(
 
         if approve:
             if req_stage == 'ARCHIVE':
-                await conn.execute("""
-                    UPDATE tasks 
-                    SET status = 'ARCHIVED', progress = 100, completed_at = NOW(), pending_request = NULL 
-                    WHERE id = $1
-                """, task_id)
+                await conn.execute("UPDATE tasks SET status = 'ARCHIVED', progress = 100, completed_at = NOW(), pending_request = NULL WHERE id = $1", task_id)
             else:
-                prog_val = int(req_stage)
-                await conn.execute("""
-                    UPDATE tasks 
-                    SET progress = $1, pending_request = NULL 
-                    WHERE id = $2
-                """, prog_val, task_id)
+                await conn.execute("UPDATE tasks SET progress = $1, pending_request = NULL WHERE id = $2", int(req_stage), task_id)
             sys_msg = f"✅ Директор {user_name} подтвердил запрос (Лид {lead_name}: {target_str})."
         else:
             await conn.execute("UPDATE tasks SET pending_request = NULL WHERE id = $1", task_id)
@@ -747,10 +769,7 @@ async def send_image_msg(
 async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(1), sender_name: str = Form("Исполнитель")):
     pool = await get_db()
     async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE tasks SET priority = 'URGENT', is_urgent = TRUE, risks_notes = $1 WHERE id = $2
-        """, f"🚨 RED FLAG: {reason}", task_id)
-        
+        await conn.execute("UPDATE tasks SET priority = 'URGENT', is_urgent = TRUE, risks_notes = $1 WHERE id = $2", f"🚨 RED FLAG: {reason}", task_id)
         msg_id = await conn.fetchval("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
             VALUES ($1, $2, 'EMPLOYEE', $3, 'REDFLAG', $4, NOW())
@@ -787,15 +806,59 @@ async def index():
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased select-none">
   <div id="app" v-cloak class="max-w-md mx-auto p-3.5 pb-24">
     
-    <!-- ЭКРАН ВХОДА -->
-    <div v-if="!currentUser" class="min-h-[85vh] flex flex-col justify-center px-2">
+    <!-- 1. ЭКРАН РАЗБЛОКИРОВКИ ПО PIN-КОДУ (ЕСЛИ ЕСТЬ ЗАШИФРОВАННЫЙ СЕЙФ) -->
+    <div v-if="hasEncryptedVault && !isUnlocked" class="min-h-[85vh] flex flex-col justify-center px-4">
+      <div class="bg-slate-900/90 border border-slate-800 p-6 rounded-3xl space-y-5 shadow-2xl text-center backdrop-blur-xl">
+        <div class="w-14 h-14 bg-gradient-to-tr from-amber-600 to-amber-500 rounded-2xl flex items-center justify-center text-white text-2xl mx-auto shadow-lg shadow-amber-600/30">
+          <i class="fa-solid fa-lock"></i>
+        </div>
+        <div>
+          <h2 class="text-base font-black tracking-wide text-white">ЗАШИФРОВАННЫЙ СЕЙФ</h2>
+          <p class="text-xs text-slate-400 mt-1">Введите 4-значный PIN для быстрой расшифровки</p>
+        </div>
+
+        <!-- Точки индикации PIN -->
+        <div class="flex justify-center gap-3 py-1">
+          <div v-for="i in 4" :key="i" 
+               :class="pinInput.length >= i ? 'bg-amber-400 scale-110 shadow-lg shadow-amber-400/50' : 'bg-slate-800 border border-slate-700'"
+               class="w-3.5 h-3.5 rounded-full transition-all duration-150"></div>
+        </div>
+
+        <div v-if="pinError" class="text-xs text-red-400 font-semibold animate-pulse">
+          ❌ Неверный PIN-код
+        </div>
+
+        <!-- Цифровая клавиатура -->
+        <div class="grid grid-cols-3 gap-2.5 max-w-[240px] mx-auto pt-1">
+          <button v-for="n in [1,2,3,4,5,6,7,8,9]" :key="n" @click="pressPinDigit(n)" class="h-12 rounded-2xl bg-slate-800/80 hover:bg-slate-700 active:scale-95 text-white text-base font-black border border-slate-700/50 shadow transition">
+            {{ n }}
+          </button>
+          <button @click="clearPin" class="h-12 rounded-2xl bg-red-950/40 text-red-400 font-bold border border-red-800/30 active:scale-95 text-xs transition">
+            Сброс
+          </button>
+          <button @click="pressPinDigit(0)" class="h-12 rounded-2xl bg-slate-800/80 hover:bg-slate-700 active:scale-95 text-white text-base font-black border border-slate-700/50 shadow transition">
+            0
+          </button>
+          <button @click="backspacePin" class="h-12 rounded-2xl bg-slate-800/80 text-slate-300 active:scale-95 text-sm flex items-center justify-center border border-slate-700/50 transition">
+            <i class="fa-solid fa-delete-left"></i>
+          </button>
+        </div>
+
+        <button @click="resetVaultAndRelogin" class="text-[11px] text-slate-400 hover:text-indigo-300 pt-2 block mx-auto underline">
+          Войти под другим логином / сбросить сейф
+        </button>
+      </div>
+    </div>
+
+    <!-- 2. ЭКРАН ПЕРВИЧНОГО ВХОДА С УСТАНОВКОЙ PIN -->
+    <div v-else-if="!currentUser" class="min-h-[85vh] flex flex-col justify-center px-2">
       <div class="bg-slate-900/90 border border-slate-800 p-6 rounded-3xl space-y-4 shadow-2xl text-center backdrop-blur-xl">
         <div class="w-14 h-14 bg-gradient-to-tr from-indigo-600 to-indigo-500 rounded-2xl flex items-center justify-center text-white text-2xl mx-auto shadow-lg shadow-indigo-600/30">
           <i class="fa-solid fa-shield-halved"></i>
         </div>
         <div>
           <h2 class="text-lg font-black tracking-wide text-white">TASK CONTROL OS</h2>
-          <p class="text-xs text-slate-400 mt-0.5">Вход в персональный кабинет</p>
+          <p class="text-xs text-slate-400 mt-0.5">Вход с созданием локального шифрования</p>
         </div>
 
         <form @submit.prevent="handleLogin" class="text-left space-y-3 pt-2">
@@ -809,15 +872,20 @@ async def index():
             <input v-model="loginForm.password" type="password" required placeholder="••••" class="w-full bg-slate-950/80 border border-slate-700/80 text-xs p-3 rounded-xl text-white font-medium focus:border-indigo-500 outline-none">
           </div>
 
+          <div>
+            <label class="block text-[10px] font-bold text-amber-300 uppercase mb-1">Придумайте 4-значный PIN (для входа при F5):</label>
+            <input v-model="loginForm.pin" type="password" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" required placeholder="1234" class="w-full bg-slate-950/80 border border-amber-500/50 text-xs p-3 rounded-xl text-amber-300 font-bold focus:border-amber-400 outline-none tracking-widest text-center">
+          </div>
+
           <button type="submit" :disabled="isLoggingIn" class="w-full bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-bold py-3 rounded-xl text-xs shadow-lg shadow-indigo-600/30 transition mt-2 flex items-center justify-center gap-2">
             <i v-if="isLoggingIn" class="fa-solid fa-circle-notch fa-spin"></i>
-            <span>{{ isLoggingIn ? 'Вход...' : 'Войти в кабинет' }}</span>
+            <span>{{ isLoggingIn ? 'Создание сейфа...' : 'Войти и зашифровать сейф' }}</span>
           </button>
         </form>
       </div>
     </div>
 
-    <!-- ОСНОВНОЙ ИНТЕРФЕЙС -->
+    <!-- 3. ОСНОВНОЙ РАБОЧИЙ ИНТЕРФЕЙС -->
     <div v-else class="space-y-4">
       
       <!-- ХЕДЕР -->
@@ -940,7 +1008,7 @@ async def index():
 
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-1">
               <div class="flex justify-between text-[10px] font-bold">
-                <span class="text-slate-400">Прогресс:</span>
+                <span class="text-slate-400">Прогресс выполнения:</span>
                 <span :class="t.progress >= 70 ? 'text-emerald-400' : (t.progress >= 30 ? 'text-amber-400' : 'text-indigo-400')">{{ t.progress }}%</span>
               </div>
               <div class="w-full bg-slate-950 rounded-full h-1.5 border border-slate-800 overflow-hidden">
@@ -948,7 +1016,6 @@ async def index():
               </div>
             </div>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1036,7 +1103,6 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1252,7 +1318,6 @@ async def index():
               </div>
             </div>
 
-            <!-- ПЛЕЕР ГОЛОСА ШЕФА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1649,12 +1714,75 @@ async def index():
 
   <script>
     const { createApp, ref, computed, onMounted, nextTick } = Vue;
+
+    // КРИПТОГРАФИЧЕСКИЙ ДВИЖОК (WEB CRYPTO API AES-GCM 256-BIT)
+    const CryptoEngine = {
+      async deriveKey(pin, saltBase64) {
+        const enc = new TextEncoder();
+        const pinKey = await crypto.subtle.importKey(
+          'raw',
+          enc.encode(pin),
+          { name: 'PBKDF2' },
+          false,
+          ['deriveKey']
+        );
+        const salt = saltBase64 ? Uint8Array.from(atob(saltBase64), c => c.charCodeAt(0)) : crypto.getRandomValues(new Uint8Array(16));
+        const key = await crypto.subtle.deriveKey(
+          {
+            name: 'PBKDF2',
+            salt: salt,
+            iterations: 100000,
+            hash: 'SHA-256'
+          },
+          pinKey,
+          { name: 'AES-GCM', length: 256 },
+          false,
+          ['encrypt', 'decrypt']
+        );
+        return { key, saltBase64: btoa(String.fromCharCode(...salt)) };
+      },
+
+      async encrypt(dataObj, key) {
+        const enc = new TextEncoder();
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const encodedData = enc.encode(JSON.stringify(dataObj));
+        const ciphertext = await crypto.subtle.encrypt(
+          { name: 'AES-GCM', iv: iv },
+          key,
+          encodedData
+        );
+        return {
+          iv: btoa(String.fromCharCode(...iv)),
+          cipher: btoa(String.fromCharCode(...new Uint8Array(ciphertext)))
+        };
+      },
+
+      async decrypt(encryptedObj, key) {
+        const dec = new TextDecoder();
+        const iv = Uint8Array.from(atob(encryptedObj.iv), c => c.charCodeAt(0));
+        const cipher = Uint8Array.from(atob(encryptedObj.cipher), c => c.charCodeAt(0));
+        const decrypted = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: iv },
+          key,
+          cipher
+        );
+        return JSON.parse(dec.decode(decrypted));
+      }
+    };
+
     createApp({
       setup() {
         const currentUser = ref(null);
-        const loginForm = ref({ username: '', password: '' });
+        const loginForm = ref({ username: '', password: '', pin: '1234' });
         const isLoggingIn = ref(false);
         const isOnline = ref(navigator.onLine);
+
+        // PIN & СЕЙФ СОСТОЯНИЕ
+        const hasEncryptedVault = ref(false);
+        const isUnlocked = ref(false);
+        const pinInput = ref('');
+        const pinError = ref(false);
+        let currentVaultKey = null;
 
         const ownerTab = ref('inbox');
         const deputyTab = ref('inbox');
@@ -1667,7 +1795,7 @@ async def index():
         const sseConnected = ref(false);
         let timerInterval = null;
 
-        // ПЕРЕМЕННЫЕ ФИЛЬТРОВ
+        // ФИЛЬТРЫ
         const filterProject = ref('ALL');
         const filterPriority = ref('ALL');
         const filterExecutor = ref('ALL');
@@ -1689,7 +1817,7 @@ async def index():
         let mediaRecorder = null;
         let audioChunks = [];
 
-        // ЧАТ ПЕРЕМЕННЫЕ
+        // ЧАТ
         const activeChatTask = ref(null);
         const chatMessages = ref([]);
         const chatInput = ref('');
@@ -1703,7 +1831,7 @@ async def index():
         const pendingQueue = ref([]);
         let isFlushingQueue = false;
 
-        // ГОЛОСОВОЙ КОНТРОЛЬ ПЕРЕД ОТПРАВКОЙ
+        // ГОЛОС
         const isRecordingVoice = ref(false);
         const recordVoiceSeconds = ref(0);
         const recordedVoiceBlob = ref(null);
@@ -1713,7 +1841,7 @@ async def index():
         let chatVoiceTimer = null;
         let chatVoiceStream = null;
 
-        // ЕДИНЫЙ ПЛЕЕР АУДИО
+        // ПЛЕЕР
         const activeAudioId = ref(null);
         const isAudioPlaying = ref(false);
         const audioCurrentTime = ref(0);
@@ -1860,7 +1988,6 @@ async def index():
           return bars;
         };
 
-        // ПРЕВРАЩЕНИЕ HTTP-ПОТОКОВ В ЛОКАЛЬНЫЙ BLOB ДЛЯ МГНОВЕННОЙ ПЕРЕМОТКИ
         const resolveAudioUrl = async (url) => {
           if (!url) return '';
           if (url.startsWith('data:') || url.startsWith('blob:')) return url;
@@ -1971,7 +2098,23 @@ async def index():
           }
         };
 
+        // СОХРАНЕНИЕ СЕЙФА В ЛОКАЛЬНУЮ ПАМЯТЬ В ЗАШИФРОВАННОМ ВИДЕ
+        const saveEncryptedVault = async (dataPayload) => {
+          if (!currentVaultKey) return;
+          try {
+            const encrypted = await CryptoEngine.encrypt(dataPayload, currentVaultKey);
+            localStorage.setItem('task_encrypted_vault', JSON.stringify(encrypted));
+          } catch (e) {
+            console.error("Vault encrypt error:", e);
+          }
+        };
+
+        // ВХОД ПО ЛОГИНУ И СОЗДАНИЕ СЕЙФА
         const handleLogin = async () => {
+          if (!loginForm.value.pin || loginForm.value.pin.length !== 4) {
+            alert('⚠️ Введите 4-значный PIN для создания сейфа');
+            return;
+          }
           isLoggingIn.value = true;
           try {
             const fd = new FormData();
@@ -1984,13 +2127,91 @@ async def index():
             }
             const data = await res.json();
             currentUser.value = data.user;
-            localStorage.setItem('task_auth_user', JSON.stringify(data.user));
+
+            // Генерация ключа из PIN и сохранение маркера проверки
+            const { key, saltBase64 } = await CryptoEngine.deriveKey(loginForm.value.pin, null);
+            currentVaultKey = key;
+            localStorage.setItem('task_vault_salt', saltBase64);
+
+            const verificationCipher = await CryptoEngine.encrypt({ check: 'VAULT_OK' }, key);
+            localStorage.setItem('task_vault_verifier', JSON.stringify(verificationCipher));
+
+            hasEncryptedVault.value = true;
+            isUnlocked.value = true;
+
             await loadData();
+            await saveEncryptedVault({ user: data.user, tasks: tasks.value });
           } catch (e) {
             alert('❌ ' + e.message);
           } finally {
             isLoggingIn.value = false;
           }
+        };
+
+        // РАЗБЛОКИРОВКА ПО PIN-КОДУ
+        const pressPinDigit = async (d) => {
+          if (pinInput.value.length >= 4) return;
+          pinInput.value += d;
+          pinError.value = false;
+
+          if (pinInput.value.length === 4) {
+            await tryUnlockWithPin(pinInput.value);
+          }
+        };
+
+        const backspacePin = () => {
+          pinInput.value = pinInput.value.slice(0, -1);
+          pinError.value = false;
+        };
+
+        const clearPin = () => {
+          pinInput.value = '';
+          pinError.value = false;
+        };
+
+        const tryUnlockWithPin = async (pin) => {
+          try {
+            const salt = localStorage.getItem('task_vault_salt');
+            const verifierRaw = localStorage.getItem('task_vault_verifier');
+            const vaultRaw = localStorage.getItem('task_encrypted_vault');
+
+            if (!salt || !verifierRaw || !vaultRaw) {
+              resetVaultAndRelogin();
+              return;
+            }
+
+            const { key } = await CryptoEngine.deriveKey(pin, salt);
+            const verifier = JSON.parse(verifierRaw);
+            const verified = await CryptoEngine.decrypt(verifier, key);
+
+            if (verified && verified.check === 'VAULT_OK') {
+              currentVaultKey = key;
+              const decryptedVault = await CryptoEngine.decrypt(JSON.parse(vaultRaw), key);
+
+              currentUser.value = decryptedVault.user;
+              tasks.value = decryptedVault.tasks || [];
+              isUnlocked.value = true;
+
+              // Фоновая синхронизация с сервером
+              loadData();
+            } else {
+              throw new Error("Invalid PIN");
+            }
+          } catch (e) {
+            pinError.value = true;
+            pinInput.value = '';
+          }
+        };
+
+        const resetVaultAndRelogin = () => {
+          localStorage.removeItem('task_vault_salt');
+          localStorage.removeItem('task_vault_verifier');
+          localStorage.removeItem('task_encrypted_vault');
+          hasEncryptedVault.value = false;
+          isUnlocked.value = false;
+          currentUser.value = null;
+          pinInput.value = '';
+          currentVaultKey = null;
         };
 
         const handleLogout = () => {
@@ -1999,9 +2220,7 @@ async def index():
             globalAudio.src = '';
             globalAudio = null;
           }
-          currentUser.value = null;
-          localStorage.removeItem('task_auth_user');
-          loginForm.value = { username: '', password: '' };
+          resetVaultAndRelogin();
         };
 
         const loadData = async () => {
@@ -2041,8 +2260,13 @@ async def index():
                 };
               }
             });
+
+            // Обновляем зашифрованный сейф
+            if (currentVaultKey) {
+              await saveEncryptedVault({ user: currentUser.value, tasks: tasks.value });
+            }
           } catch (e) {
-            console.error("Ошибка загрузки данных:", e);
+            console.error("Sync error:", e);
           }
         };
 
@@ -2363,60 +2587,6 @@ async def index():
           }
         };
 
-        const saveQueueToStorage = () => {
-          const serializable = pendingQueue.value
-            .filter(item => item.localMsg.message_type === 'TEXT')
-            .map(item => ({
-              tempId: item.tempId,
-              taskId: item.taskId,
-              endpoint: item.endpoint,
-              content: item.localMsg.content,
-              sender_id: item.localMsg.sender_id,
-              sender_role: item.localMsg.sender_role,
-              sender_name: item.localMsg.sender_name,
-              created_at: item.localMsg.created_at
-            }));
-          localStorage.setItem('task_pending_queue', JSON.stringify(serializable));
-        };
-
-        const restoreQueueFromStorage = () => {
-          try {
-            const saved = localStorage.getItem('task_pending_queue');
-            if (saved) {
-              const parsed = JSON.parse(saved);
-              parsed.forEach(item => {
-                const fd = new FormData();
-                fd.append('sender_id', item.sender_id);
-                fd.append('sender_role', item.sender_role);
-                fd.append('sender_name', item.sender_name);
-                fd.append('content', item.content);
-
-                const localMsg = {
-                  id: item.tempId,
-                  task_id: item.taskId,
-                  sender_id: item.sender_id,
-                  sender_role: item.sender_role,
-                  sender_name: item.sender_name,
-                  message_type: 'TEXT',
-                  content: item.content,
-                  media_url: null,
-                  created_at: item.created_at,
-                  is_read: false,
-                  status: 'pending'
-                };
-
-                pendingQueue.value.push({
-                  tempId: item.tempId,
-                  taskId: item.taskId,
-                  endpoint: item.endpoint,
-                  formData: fd,
-                  localMsg
-                });
-              });
-            }
-          } catch (e) {}
-        };
-
         const flushPendingQueue = async () => {
           if (isFlushingQueue || pendingQueue.value.length === 0) return;
           isFlushingQueue = true;
@@ -2429,13 +2599,11 @@ async def index():
                 if (!res.ok) throw new Error("HTTP " + res.status);
                 
                 pendingQueue.value.shift();
-                saveQueueToStorage();
-
                 if (activeChatTask.value && activeChatTask.value.id === item.taskId) {
                   await loadMessages(false);
                 }
               } catch (netErr) {
-                console.warn("Офлайн-режим. Сообщение сохранено в очереди:", netErr);
+                console.warn("Офлайн-режим. Сообщение сохранено в оперативной памяти:", netErr);
                 break;
               }
             }
@@ -2485,7 +2653,6 @@ async def index():
             localMsg
           });
 
-          saveQueueToStorage();
           flushPendingQueue();
         };
 
@@ -2711,14 +2878,12 @@ async def index():
         const formatTime = (s) => `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
 
         onMounted(() => {
-          const saved = localStorage.getItem('task_auth_user');
-          if (saved) {
-            try {
-              currentUser.value = JSON.parse(saved);
-            } catch (e) {}
+          const salt = localStorage.getItem('task_vault_salt');
+          const vault = localStorage.getItem('task_encrypted_vault');
+          if (salt && vault) {
+            hasEncryptedVault.value = true;
           }
-          restoreQueueFromStorage();
-          loadData();
+
           setupSSE();
 
           window.addEventListener('online', () => {
@@ -2739,7 +2904,9 @@ async def index():
         });
 
         return {
-          currentUser, loginForm, isLoggingIn, isOnline, ownerTab, deputyTab, empTab, isRecording, isProcessing,
+          currentUser, loginForm, isLoggingIn, isOnline, hasEncryptedVault, isUnlocked, pinInput, pinError,
+          pressPinDigit, backspacePin, clearPin, resetVaultAndRelogin,
+          ownerTab, deputyTab, empTab, isRecording, isProcessing,
           recordSeconds, textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
           filterProject, filterPriority, filterExecutor, filterUrgentOnly, hasActiveFilters, resetFilters,
           editingDetailsTask, editDetailsForm, openEditDetailsModal, saveTaskDetails,
