@@ -100,6 +100,7 @@ async def startup():
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pending_request VARCHAR(30);
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS project_group VARCHAR(100) DEFAULT 'Проект Кормовая Мука';
             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS assignee_ids INT[] DEFAULT '{}';
+            ALTER TABLE tasks ADD COLUMN IF NOT EXISTS created_by INT DEFAULT 1;
 
             CREATE TABLE IF NOT EXISTS task_messages (
                 id SERIAL PRIMARY KEY,
@@ -198,7 +199,7 @@ async def login(request: Request, username: str = Form(...), password: str = For
         return {"status": "ok", "user": dict(user)}
 
 SYSTEM_PROMPT = """
-Ты — операционный директор компании. Преврати поручение владельца в четкое техническое задание для Замдиректора.
+Ты — операционный директор компании. Преврати поручение руководства в четкое техническое задание для команды.
 Верни ТОЛЬКО валидный JSON (без markdown):
 {
   "title": "Краткий заголовок (до 6 слов)",
@@ -232,7 +233,7 @@ def query_gemini_direct(parts_list: list) -> dict:
 
     return {
         "title": "Новое поручение",
-        "ai_summary": "Поручение принято и передано Директору",
+        "ai_summary": "Поручение принято и зарегистрировано в системе",
         "definition_of_done": "1. Выполнить поручение в срок",
         "task_type": "SOLO",
         "priority": "URGENT",
@@ -260,6 +261,9 @@ async def get_tasks(viewer_user_id: int = 1):
         query = f"""
             SELECT t.id, t.title, t.raw_input_text, t.ai_summary, t.definition_of_done,
                    t.task_type, t.status, t.priority, t.lead_user_id, t.result_report,
+                   t.created_by,
+                   c.full_name as creator_name,
+                   c.role as creator_role,
                    COALESCE(t.project_group, 'Проект Кормовая Мука') as project_group,
                    COALESCE(t.assignee_ids, '{{}}') as assignee_ids,
                    COALESCE(t.progress, 0) as progress, t.pending_request,
@@ -276,6 +280,7 @@ async def get_tasks(viewer_user_id: int = 1):
                    ) as unread_count
             FROM tasks t
             LEFT JOIN users u ON u.id = t.lead_user_id
+            LEFT JOIN users c ON c.id = t.created_by
             {where_clause}
             ORDER BY 
                 CASE WHEN t.status = 'ARCHIVED' THEN 2 ELSE 1 END ASC,
@@ -327,18 +332,21 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
 
         pool = await get_db()
         async with pool.acquire() as conn:
+            creator = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
+            creator_name = creator['full_name'] if creator else "Руководство"
+
             task_id = await conn.fetchval("""
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", "Голосовое поручение"), "Голосовая аудиозапись Шефа", parsed.get("ai_summary", ""), parsed.get("definition_of_done", ""), parsed.get("task_type", "SOLO"), parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
+            """, parsed.get("title", "Голосовое поручение"), f"Голосовая аудиозапись ({creator_name})", parsed.get("ai_summary", ""), parsed.get("definition_of_done", ""), parsed.get("task_type", "SOLO"), parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
 
             await conn.execute("""
                 INSERT INTO media_attachments (task_id, sender_id, attachment_type, file_url, transcript)
                 VALUES ($1, $2, 'VOICE_ORIGINAL', $3, $4)
             """, task_id, user_id, audio_b64, parsed.get("ai_summary", ""))
 
-        send_telegram_alert(f"🎙 <b>Новое поручение #{task_id} от Хуршида</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        send_telegram_alert(f"🎙 <b>Новое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         await broadcast_event("new_task")
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
@@ -348,18 +356,21 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
 @app.post("/api/tasks/create-text")
 async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
     try:
-        parts = [{"text": f"Поручение шефа: {text}\n{SYSTEM_PROMPT}"}]
+        parts = [{"text": f"Поручение руководства: {text}\n{SYSTEM_PROMPT}"}]
         parsed = query_gemini_direct(parts)
 
         pool = await get_db()
         async with pool.acquire() as conn:
+            creator = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
+            creator_name = creator['full_name'] if creator else "Руководство"
+
             task_id = await conn.fetchval("""
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), user_id, True)
+            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
 
-        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от Хуршида</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         await broadcast_event("new_task")
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
@@ -806,7 +817,7 @@ async def index():
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased select-none">
   <div id="app" v-cloak class="max-w-md mx-auto p-3.5 pb-24">
     
-    <!-- 1. ЭКРАН РАЗБЛОКИРОВКИ ПО PIN-КОДУ (ЕСЛИ ЕСТЬ ЗАШИФРОВАННЫЙ СЕЙФ) -->
+    <!-- 1. ЭКРАН РАЗБЛОКИРОВКИ ПО PIN-КОДУ -->
     <div v-if="hasEncryptedVault && !isUnlocked" class="min-h-[85vh] flex flex-col justify-center px-4">
       <div class="bg-slate-900/90 border border-slate-800 p-6 rounded-3xl space-y-5 shadow-2xl text-center backdrop-blur-xl">
         <div class="w-14 h-14 bg-gradient-to-tr from-amber-600 to-amber-500 rounded-2xl flex items-center justify-center text-white text-2xl mx-auto shadow-lg shadow-amber-600/30">
@@ -817,7 +828,6 @@ async def index():
           <p class="text-xs text-slate-400 mt-1">Введите 4-значный PIN для быстрой расшифровки</p>
         </div>
 
-        <!-- Точки индикации PIN -->
         <div class="flex justify-center gap-3 py-1">
           <div v-for="i in 4" :key="i" 
                :class="pinInput.length >= i ? 'bg-amber-400 scale-110 shadow-lg shadow-amber-400/50' : 'bg-slate-800 border border-slate-700'"
@@ -828,7 +838,6 @@ async def index():
           ❌ Неверный PIN-код
         </div>
 
-        <!-- Цифровая клавиатура -->
         <div class="grid grid-cols-3 gap-2.5 max-w-[240px] mx-auto pt-1">
           <button v-for="n in [1,2,3,4,5,6,7,8,9]" :key="n" @click="pressPinDigit(n)" class="h-12 rounded-2xl bg-slate-800/80 hover:bg-slate-700 active:scale-95 text-white text-base font-black border border-slate-700/50 shadow transition">
             {{ n }}
@@ -850,7 +859,7 @@ async def index():
       </div>
     </div>
 
-    <!-- 2. ЭКРАН ПЕРВИЧНОГО ВХОДА С УСТАНОВКОЙ PIN -->
+    <!-- 2. ЭКРАН ПЕРВИЧНОГО ВХОДА -->
     <div v-else-if="!currentUser" class="min-h-[85vh] flex flex-col justify-center px-2">
       <div class="bg-slate-900/90 border border-slate-800 p-6 rounded-3xl space-y-4 shadow-2xl text-center backdrop-blur-xl">
         <div class="w-14 h-14 bg-gradient-to-tr from-indigo-600 to-indigo-500 rounded-2xl flex items-center justify-center text-white text-2xl mx-auto shadow-lg shadow-indigo-600/30">
@@ -954,6 +963,7 @@ async def index():
 
       <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
+        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ -->
         <div class="bg-slate-900/90 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl backdrop-blur-md">
           <h2 class="text-base font-bold text-white">Голосовое поручение</h2>
           
@@ -1004,6 +1014,12 @@ async def index():
               </div>
             </div>
 
+            <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
+            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5">
+              <i class="fa-solid fa-user-tie"></i>
+              <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+            </div>
+
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-1">
@@ -1016,6 +1032,7 @@ async def index():
               </div>
             </div>
 
+            <!-- ПЛЕЕР ГОЛОСА АВТОРА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1029,7 +1046,7 @@ async def index():
                          class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[10px] text-slate-400 font-mono">
-                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос Шефа' }}</span>
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос автора' }}</span>
                     <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioDuration) : '' }}</span>
                   </div>
                 </div>
@@ -1078,6 +1095,37 @@ async def index():
 
       <!-- 2. КАБИНЕТ ДИРЕКТОРА (ЖАМОЛИДДИН) -->
       <div v-if="currentUser.role === 'DEPUTY'" class="space-y-4">
+        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ ДИРЕКТОРОМ -->
+        <div class="bg-slate-900/90 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl backdrop-blur-md">
+          <div class="flex items-center justify-center gap-2">
+            <i class="fa-solid fa-bolt text-amber-400"></i>
+            <h2 class="text-base font-bold text-white">Создать поручение (Директор)</h2>
+          </div>
+          
+          <div class="flex justify-center py-1">
+            <button @click="toggleRecord" :class="isRecording ? 'bg-red-500 animate-pulse scale-105' : 'bg-gradient-to-tr from-amber-600 to-amber-500 active:scale-95'" class="w-20 h-20 rounded-full flex flex-col items-center justify-center text-white shadow-2xl transition duration-200">
+              <i :class="isRecording ? 'fa-solid fa-stop text-xl' : 'fa-solid fa-microphone text-2xl'"></i>
+              <span v-if="isRecording" class="text-[10px] font-mono font-bold mt-1">{{ formatTime(recordSeconds) }}</span>
+            </button>
+          </div>
+
+          <div v-if="isProcessing" class="text-xs text-amber-400 font-semibold animate-pulse">
+            <i class="fa-solid fa-circle-notch fa-spin mr-1"></i> ИИ формирует ТЗ...
+          </div>
+          <p v-else class="text-[11px] font-semibold" :class="isRecording ? 'text-red-400' : 'text-slate-400'">
+            {{ isRecording ? 'Идет запись... Нажмите для завершения' : 'Нажмите микрофон и надиктуйте поручение' }}
+          </p>
+
+          <div class="pt-2.5 border-t border-slate-800 text-left space-y-1.5">
+            <div class="flex gap-1.5">
+              <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите задачу текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-amber-500">
+              <button @click="sendTextTask" class="bg-amber-600 hover:bg-amber-500 px-3 rounded-xl text-white font-bold text-xs">
+                <i class="fa-solid fa-paper-plane"></i>
+              </button>
+            </div>
+          </div>
+        </div>
+
         <div class="grid grid-cols-3 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
           <button @click="deputyTab = 'inbox'" :class="deputyTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
           <button @click="deputyTab = 'active'" :class="deputyTab === 'active' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">В работе ({{ activeTasks.length }})</button>
@@ -1101,8 +1149,15 @@ async def index():
               </div>
             </div>
 
+            <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
+            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5">
+              <i class="fa-solid fa-user-tie"></i>
+              <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+            </div>
+
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
+            <!-- ПЛЕЕР ГОЛОСА АВТОРА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1116,7 +1171,7 @@ async def index():
                          class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[10px] text-slate-400 font-mono">
-                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос Шефа' }}</span>
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос автора' }}</span>
                     <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioDuration) : '' }}</span>
                   </div>
                 </div>
@@ -1306,6 +1361,12 @@ async def index():
               </span>
             </div>
 
+            <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
+            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5">
+              <i class="fa-solid fa-user-tie"></i>
+              <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+            </div>
+
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-1">
@@ -1318,6 +1379,7 @@ async def index():
               </div>
             </div>
 
+            <!-- ПЛЕЕР ГОЛОСА АВТОРА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1331,7 +1393,7 @@ async def index():
                          class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[10px] text-slate-400 font-mono">
-                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос Шефа' }}</span>
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос автора' }}</span>
                     <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioDuration) : '' }}</span>
                   </div>
                 </div>
@@ -1571,7 +1633,7 @@ async def index():
                   <div @click="seekAudio('msg_' + m.id, m.media_url, $event)" @touchmove.prevent="handleTouchSeek('msg_' + m.id, m.media_url, $event)" class="h-5 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(m.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
-                         :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? (isMyMessage(m) ? 'bg-white' : 'bg-indigo-400') : (isMyMessage(m) ? 'bg-indigo-400/50' : 'bg-slate-700')"
+                         :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
                          class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[9px] font-mono opacity-80">
@@ -1715,7 +1777,6 @@ async def index():
   <script>
     const { createApp, ref, computed, onMounted, nextTick } = Vue;
 
-    // КРИПТОГРАФИЧЕСКИЙ ДВИЖОК (WEB CRYPTO API AES-GCM 256-BIT)
     const CryptoEngine = {
       async deriveKey(pin, saltBase64) {
         const enc = new TextEncoder();
@@ -1777,7 +1838,7 @@ async def index():
         const isLoggingIn = ref(false);
         const isOnline = ref(navigator.onLine);
 
-        // PIN & СЕЙФ СОСТОЯНИЕ
+        // PIN & СЕЙФ
         const hasEncryptedVault = ref(false);
         const isUnlocked = ref(false);
         const pinInput = ref('');
@@ -2098,7 +2159,6 @@ async def index():
           }
         };
 
-        // СОХРАНЕНИЕ СЕЙФА В ЛОКАЛЬНУЮ ПАМЯТЬ В ЗАШИФРОВАННОМ ВИДЕ
         const saveEncryptedVault = async (dataPayload) => {
           if (!currentVaultKey) return;
           try {
@@ -2109,7 +2169,6 @@ async def index():
           }
         };
 
-        // ВХОД ПО ЛОГИНУ И СОЗДАНИЕ СЕЙФА
         const handleLogin = async () => {
           if (!loginForm.value.pin || loginForm.value.pin.length !== 4) {
             alert('⚠️ Введите 4-значный PIN для создания сейфа');
@@ -2128,7 +2187,6 @@ async def index():
             const data = await res.json();
             currentUser.value = data.user;
 
-            // Генерация ключа из PIN и сохранение маркера проверки
             const { key, saltBase64 } = await CryptoEngine.deriveKey(loginForm.value.pin, null);
             currentVaultKey = key;
             localStorage.setItem('task_vault_salt', saltBase64);
@@ -2148,7 +2206,6 @@ async def index():
           }
         };
 
-        // РАЗБЛОКИРОВКА ПО PIN-КОДУ
         const pressPinDigit = async (d) => {
           if (pinInput.value.length >= 4) return;
           pinInput.value += d;
@@ -2192,7 +2249,6 @@ async def index():
               tasks.value = decryptedVault.tasks || [];
               isUnlocked.value = true;
 
-              // Фоновая синхронизация с сервером
               loadData();
             } else {
               throw new Error("Invalid PIN");
@@ -2261,7 +2317,6 @@ async def index():
               }
             });
 
-            // Обновляем зашифрованный сейф
             if (currentVaultKey) {
               await saveEncryptedVault({ user: currentUser.value, tasks: tasks.value });
             }
@@ -2286,6 +2341,7 @@ async def index():
           };
         };
 
+        // СОЗДАНИЕ ЗАДАЧИ АВТОРОМ (ШЕФОМ ИЛИ ДИРЕКТОРОМ)
         const toggleRecord = async () => {
           if (!isRecording.value) {
             try {
@@ -2308,7 +2364,7 @@ async def index():
                   const res = await fetch('/api/tasks/create-voice', { method: 'POST', body: fd });
                   if (!res.ok) throw new Error('Ошибка создания');
                   await loadData();
-                  alert('✅ Поручение создано и передано Жамолиддину!');
+                  alert('✅ Поручение создано и добавлено во Входящие!');
                 } catch (err) {
                   alert('❌ ' + err.message);
                 } finally {
@@ -2338,7 +2394,7 @@ async def index():
             if (!res.ok) throw new Error('Ошибка создания');
             textInput.value = '';
             await loadData();
-            alert('✅ Поручение создано и передано Жамолиддину!');
+            alert('✅ Поручение создано и добавлено во Входящие!');
           } catch (e) {
             alert('❌ ' + e.message);
           } finally {
