@@ -226,6 +226,7 @@ def query_gemini_direct(parts_list: list) -> dict:
             "project_group": "Проект Кормовая Мука"
         }
 
+    # Актуальные модели Gemini
     models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
     
     for model_name in models:
@@ -243,4 +244,2774 @@ def query_gemini_direct(parts_list: list) -> dict:
             with urllib.request.urlopen(req, timeout=20) as resp:
                 res_json = json.loads(resp.read().decode("utf-8"))
                 raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                clean_text = raw_text.replace("```json", "").replace("
+                clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+                match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+                if match:
+                    parsed = json.loads(match.group(0))
+                    print(f"[Gemini Success] ТЗ успешно сформировано моделью {model_name}")
+                    return parsed
+        except urllib.error.HTTPError as he:
+            err_body = he.read().decode("utf-8", errors="ignore")
+            print(f"[Gemini HTTP {he.code}] Модель {model_name}: {err_body}")
+            continue
+        except Exception as e:
+            print(f"[Gemini Error] Модель {model_name}: {e}")
+            continue
+
+    return {
+        "title": "Новое поручение",
+        "ai_summary": "Поручение принято и зарегистрировано в системе",
+        "definition_of_done": "1. Выполнить поручение в срок",
+        "task_type": "SOLO",
+        "priority": "URGENT",
+        "project_group": "Проект Кормовая Мука"
+    }
+
+@app.get("/api/users")
+async def get_users():
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        users = await conn.fetch("SELECT id, full_name, role, department, username FROM users WHERE is_active = TRUE ORDER BY id ASC")
+        return [dict(u) for u in users]
+
+@app.get("/api/tasks")
+async def get_tasks(viewer_user_id: int = 1):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        viewer = await conn.fetchrow("SELECT role FROM users WHERE id = $1", viewer_user_id)
+        role = viewer['role'] if viewer else 'EMPLOYEE'
+
+        where_clause = ""
+        if role == 'EMPLOYEE':
+            where_clause = "WHERE (t.lead_user_id = $1 OR $1 = ANY(t.assignee_ids))"
+
+        query = f"""
+            SELECT t.id, t.title, t.raw_input_text, t.ai_summary, t.definition_of_done,
+                   t.task_type, t.status, t.priority, t.lead_user_id, t.result_report,
+                   t.created_by,
+                   c.full_name as creator_name,
+                   c.role as creator_role,
+                   COALESCE(t.project_group, 'Проект Кормовая Мука') as project_group,
+                   COALESCE(t.assignee_ids, '{{}}') as assignee_ids,
+                   COALESCE(t.progress, 0) as progress, t.pending_request,
+                   to_char(t.deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as deadline,
+                   to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
+                   to_char(t.completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as completed_at,
+                   u.full_name as lead_name,
+                   (SELECT string_agg(u2.full_name, ', ') FROM users u2 WHERE u2.id = ANY(t.assignee_ids)) as team_names,
+                   (EXISTS(SELECT 1 FROM media_attachments m WHERE m.task_id = t.id AND m.attachment_type = 'VOICE_ORIGINAL')) as has_voice,
+                   (SELECT COUNT(*) FROM task_messages msg 
+                    WHERE msg.task_id = t.id 
+                      AND msg.sender_id != $1 
+                      AND msg.id > COALESCE((SELECT last_read_msg_id FROM task_user_reads r WHERE r.task_id = t.id AND r.user_id = $1), 0)
+                   ) as unread_count
+            FROM tasks t
+            LEFT JOIN users u ON u.id = t.lead_user_id
+            LEFT JOIN users c ON c.id = t.created_by
+            {where_clause}
+            ORDER BY 
+                CASE WHEN t.status = 'ARCHIVED' THEN 2 ELSE 1 END ASC,
+                CASE 
+                    WHEN t.priority = 'URGENT' THEN 1 
+                    WHEN t.priority = 'NORMAL' THEN 2 
+                    WHEN t.priority = 'FUTURE' THEN 3 
+                    ELSE 4 
+                END ASC,
+                CASE WHEN t.deadline IS NULL THEN 1 ELSE 0 END ASC,
+                t.deadline ASC,
+                t.id DESC
+        """
+        tasks = await conn.fetch(query, viewer_user_id)
+        return [dict(t) for t in tasks]
+
+@app.get("/api/tasks/{task_id}/voice")
+async def get_task_voice(task_id: int):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        audio_b64 = await conn.fetchval("""
+            SELECT file_url FROM media_attachments 
+            WHERE task_id = $1 AND attachment_type = 'VOICE_ORIGINAL' 
+            LIMIT 1
+        """, task_id)
+        if not audio_b64:
+            raise HTTPException(status_code=404, detail="Аудио не найдено")
+        header, encoded = audio_b64.split(",", 1)
+        mime = "audio/webm"
+        if "audio/" in header:
+            mime = header.split(";")[0].replace("data:", "")
+        return Response(content=base64.b64decode(encoded), media_type=mime)
+
+@app.post("/api/tasks/create-voice")
+async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1)):
+    try:
+        audio_bytes = await audio.read()
+        mime = audio.content_type or "audio/webm"
+        if "octet-stream" in mime:
+            mime = "audio/webm"
+
+        b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+        parts = [
+            {"inlineData": {"mimeType": mime, "data": b64_audio}},
+            {"text": SYSTEM_PROMPT}
+        ]
+        parsed = query_gemini_direct(parts)
+        audio_b64 = f"data:{mime};base64," + b64_audio
+
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            creator = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
+            creator_name = creator['full_name'] if creator else "Руководство"
+
+            task_id = await conn.fetchval("""
+                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
+                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
+                RETURNING id
+            """, parsed.get("title", "Голосовое поручение"), f"Голосовая аудиозапись ({creator_name})", parsed.get("ai_summary", ""), parsed.get("definition_of_done", ""), parsed.get("task_type", "SOLO"), parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
+
+            await conn.execute("""
+                INSERT INTO media_attachments (task_id, sender_id, attachment_type, file_url, transcript)
+                VALUES ($1, $2, 'VOICE_ORIGINAL', $3, $4)
+            """, task_id, user_id, audio_b64, parsed.get("ai_summary", ""))
+
+        send_telegram_alert(f"🎙 <b>Новое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        await broadcast_event("new_task")
+        return {"status": "ok", "task_id": task_id}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+@app.post("/api/tasks/create-text")
+async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
+    try:
+        parts = [{"text": f"Поручение руководства: {text}\n{SYSTEM_PROMPT}"}]
+        parsed = query_gemini_direct(parts)
+
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            creator = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
+            creator_name = creator['full_name'] if creator else "Руководство"
+
+            task_id = await conn.fetchval("""
+                INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
+                VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
+                RETURNING id
+            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
+
+        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        await broadcast_event("new_task")
+        return {"status": "ok", "task_id": task_id}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+@app.post("/api/tasks/{task_id}/assign")
+async def assign_task(
+    task_id: int, 
+    lead_id: int = Form(...), 
+    assignee_ids: str = Form("[]"),
+    project_group: str = Form("Проект Кормовая Мука"),
+    priority: str = Form("URGENT"),
+    deadline: str = Form(...),
+    title: str = Form(None),
+    ai_summary: str = Form(None),
+    definition_of_done: str = Form(None)
+):
+    try:
+        dt_deadline = None
+        if deadline:
+            try:
+                clean_dl = deadline.replace("Z", "+00:00")
+                dt_deadline = datetime.fromisoformat(clean_dl)
+            except Exception:
+                dt_deadline = datetime.now(timezone.utc) + timedelta(days=1)
+        else:
+            dt_deadline = datetime.now(timezone.utc) + timedelta(days=1)
+
+        parsed_assignees = []
+        try:
+            parsed_assignees = json.loads(assignee_ids)
+        except Exception:
+            parsed_assignees = [int(x) for x in assignee_ids.split(",") if x.strip().isdigit()]
+        
+        if lead_id not in parsed_assignees:
+            parsed_assignees.append(lead_id)
+
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
+            team_rows = await conn.fetch("SELECT full_name FROM users WHERE id = ANY($1)", parsed_assignees)
+            team_str = ", ".join([r['full_name'] for r in team_rows])
+
+            await conn.execute("""
+                UPDATE tasks 
+                SET lead_user_id = $1, 
+                    assignee_ids = $2,
+                    project_group = $3,
+                    priority = $4,
+                    deadline = $5,
+                    title = COALESCE($6, title),
+                    ai_summary = COALESCE($7, ai_summary),
+                    definition_of_done = COALESCE($8, definition_of_done),
+                    status = 'IN_PROGRESS',
+                    progress = 0
+                WHERE id = $9
+            """, lead_id, parsed_assignees, project_group, priority, dt_deadline, title, ai_summary, definition_of_done, task_id)
+
+            await conn.execute("""
+                INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content)
+                VALUES ($1, 2, 'DEPUTY', 'Жамолиддин', 'SYSTEM', $2)
+            """, task_id, f"🚀 Задача утверждена и передана в работу.\n📁 Группа: {project_group}\n👑 Лид: {lead_name}\n👥 Команда: {team_str}")
+
+        send_telegram_alert(f"🚀 <b>Задача #{task_id} передана в работу</b>\n📁 <b>Группа:</b> {project_group}\n👑 <b>Лид:</b> {lead_name}\n<b>Приоритет:</b> {priority}")
+        await broadcast_event("task_assigned")
+        return {"status": "ok"}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+@app.post("/api/tasks/{task_id}/update-details")
+async def update_task_details(
+    task_id: int,
+    title: str = Form(...),
+    ai_summary: str = Form(...),
+    definition_of_done: str = Form(...),
+    project_group: str = Form(...),
+    priority: str = Form(...),
+    deadline: str = Form(...),
+    formatted_old_deadline: str = Form(""),
+    formatted_new_deadline: str = Form(""),
+    user_name: str = Form("Жамолиддин")
+):
+    try:
+        dt_deadline = None
+        if deadline:
+            try:
+                clean_dl = deadline.replace("Z", "+00:00")
+                dt_deadline = datetime.fromisoformat(clean_dl)
+            except Exception:
+                dt_deadline = datetime.now(timezone.utc) + timedelta(days=1)
+
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            old_task = await conn.fetchrow("""
+                SELECT title, ai_summary, definition_of_done, project_group, priority 
+                FROM tasks WHERE id = $1
+            """, task_id)
+
+            await conn.execute("""
+                UPDATE tasks 
+                SET title = $1, 
+                    ai_summary = $2, 
+                    definition_of_done = $3, 
+                    project_group = $4, 
+                    priority = $5, 
+                    deadline = $6 
+                WHERE id = $7
+            """, title, ai_summary, definition_of_done, project_group, priority, dt_deadline, task_id)
+
+            priority_map = {'URGENT': '🔴 Оперативно', 'NORMAL': '🟡 Умеренно', 'FUTURE': '🔵 На будущее'}
+            
+            changes = []
+            if old_task:
+                if old_task['title'] != title:
+                    changes.append(f"• Заголовок: «{old_task['title']}» ➔ «{title}»")
+                if old_task['project_group'] != project_group:
+                    changes.append(f"• Проект: «{old_task['project_group']}» ➔ «{project_group}»")
+                if old_task['priority'] != priority:
+                    changes.append(f"• Важность: {priority_map.get(old_task['priority'], old_task['priority'])} ➔ {priority_map.get(priority, priority)}")
+                if formatted_old_deadline and formatted_new_deadline and formatted_old_deadline != formatted_new_deadline:
+                    changes.append(f"• Дедлайн: {formatted_old_deadline} ➔ {formatted_new_deadline}")
+                if old_task['ai_summary'] != ai_summary or old_task['definition_of_done'] != definition_of_done:
+                    changes.append("• ТЗ и критерии сдачи (DoD) обновлены")
+
+            sys_msg = f"✏️ Директор {user_name} изменил параметры задачи:\n" + "\n".join(changes) if changes else f"✏️ Директор {user_name} сохранил параметры задачи без изменений."
+
+            await conn.execute("""
+                INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+                VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
+            """, task_id, user_name, sys_msg)
+
+        await broadcast_event("task_updated")
+        return {"status": "ok"}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+@app.post("/api/tasks/{task_id}/update-team")
+async def update_task_team(
+    task_id: int,
+    lead_id: int = Form(...),
+    assignee_ids: str = Form(...),
+    user_name: str = Form("Жамолиддин")
+):
+    try:
+        parsed_assignees = json.loads(assignee_ids)
+        if not parsed_assignees or len(parsed_assignees) == 0:
+            raise HTTPException(status_code=400, detail="В задаче должен оставаться минимум 1 исполнитель.")
+        
+        if lead_id not in parsed_assignees:
+            lead_id = parsed_assignees[0]
+
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            old_task = await conn.fetchrow("SELECT lead_user_id FROM tasks WHERE id = $1", task_id)
+            old_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", old_task['lead_user_id']) if old_task else 'Не назначен'
+            new_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
+            
+            new_team_rows = await conn.fetch("SELECT full_name FROM users WHERE id = ANY($1)", parsed_assignees)
+            new_team_str = ", ".join([r['full_name'] for r in new_team_rows])
+
+            await conn.execute("""
+                UPDATE tasks 
+                SET lead_user_id = $1, 
+                    assignee_ids = $2 
+                WHERE id = $3
+            """, lead_id, parsed_assignees, task_id)
+
+            lead_change_str = f"👑 Лид: {old_lead_name} ➔ {new_lead_name}" if old_lead_name != new_lead_name else f"👑 Лид: {new_lead_name}"
+            sys_msg = f"👥 Директор {user_name} обновил состав команды:\n{lead_change_str}\n👥 Исполнители: {new_team_str}"
+
+            await conn.execute("""
+                INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+                VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
+            """, task_id, user_name, sys_msg)
+
+        await broadcast_event("team_updated")
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+@app.post("/api/tasks/{task_id}/set-stage")
+async def set_stage(
+    task_id: int,
+    stage: str = Form(...),
+    user_name: str = Form("Жамолиддин")
+):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        if stage == 'ARCHIVE':
+            await conn.execute("""
+                UPDATE tasks 
+                SET status = 'ARCHIVED', progress = 100, completed_at = NOW(), pending_request = NULL 
+                WHERE id = $1
+            """, task_id)
+            sys_msg = f"🏁 Директор {user_name} утвердил и перевел задачу в архив."
+        else:
+            prog_val = int(stage)
+            await conn.execute("""
+                UPDATE tasks 
+                SET progress = $1, pending_request = NULL 
+                WHERE id = $2
+            """, prog_val, task_id)
+            sys_msg = f"⚡ Директор {user_name} установил прогресс задачи: {stage}%."
+
+        await conn.execute("""
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+            VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
+        """, task_id, user_name, sys_msg)
+
+    await broadcast_event("stage_updated")
+    return {"status": "ok"}
+
+@app.post("/api/tasks/{task_id}/request-stage")
+async def request_stage(
+    task_id: int,
+    stage: str = Form(...),
+    user_id: int = Form(...),
+    user_name: str = Form(...)
+):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        lead_id = await conn.fetchval("SELECT lead_user_id FROM tasks WHERE id = $1", task_id)
+        if lead_id != user_id:
+            raise HTTPException(status_code=403, detail="Только Лид команды имеет право отправлять запросы на утверждение этапов.")
+
+        await conn.execute("UPDATE tasks SET pending_request = $1 WHERE id = $2", stage, task_id)
+        target_str = "сдачу в архив" if stage == 'ARCHIVE' else f"этап {stage}%"
+        sys_msg = f"📌 Лид команды {user_name} запросил подтверждение на {target_str}."
+
+        await conn.execute("""
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+            VALUES ($1, $2, 'EMPLOYEE', $3, 'SYSTEM', $4, NOW())
+        """, task_id, user_id, user_name, sys_msg)
+
+    send_telegram_alert(f"📌 <b>Задача #{task_id}: запрос подтверждения</b>\n👑 <b>Лид:</b> {user_name}\n<b>Запрос:</b> {target_str}")
+    await broadcast_event("stage_requested")
+    return {"status": "ok"}
+
+@app.post("/api/tasks/{task_id}/confirm-stage-request")
+async def confirm_stage_request(
+    task_id: int,
+    approve: bool = Form(...),
+    user_name: str = Form("Жамолиддин")
+):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        task = await conn.fetchrow("""
+            SELECT t.pending_request, u.full_name as lead_name 
+            FROM tasks t 
+            LEFT JOIN users u ON u.id = t.lead_user_id 
+            WHERE t.id = $1
+        """, task_id)
+        
+        if not task or not task['pending_request']:
+            raise HTTPException(status_code=400, detail="Нет активного запроса")
+
+        req_stage = task['pending_request']
+        lead_name = task['lead_name'] or 'Лид'
+        target_str = "сдачу в архив" if req_stage == 'ARCHIVE' else f"этап {req_stage}%"
+
+        if approve:
+            if req_stage == 'ARCHIVE':
+                await conn.execute("UPDATE tasks SET status = 'ARCHIVED', progress = 100, completed_at = NOW(), pending_request = NULL WHERE id = $1", task_id)
+            else:
+                await conn.execute("UPDATE tasks SET progress = $1, pending_request = NULL WHERE id = $2", int(req_stage), task_id)
+            sys_msg = f"✅ Директор {user_name} подтвердил запрос (Лид {lead_name}: {target_str})."
+        else:
+            await conn.execute("UPDATE tasks SET pending_request = NULL WHERE id = $1", task_id)
+            sys_msg = f"❌ Директор {user_name} отклонил запрос (Лид {lead_name}: {target_str})."
+
+        await conn.execute("""
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+            VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
+        """, task_id, user_name, sys_msg)
+
+    await broadcast_event("stage_confirmed")
+    return {"status": "ok"}
+
+@app.get("/api/tasks/{task_id}/messages")
+async def get_messages(task_id: int, viewer_user_id: int = 1):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        max_id = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM task_messages WHERE task_id = $1", task_id)
+        if max_id > 0:
+            await conn.execute("""
+                INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (task_id, user_id) DO UPDATE 
+                SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+            """, task_id, viewer_user_id, max_id)
+
+        rows = await conn.fetch("""
+            SELECT msg.id, msg.task_id, msg.sender_id, msg.sender_role, msg.sender_name, msg.message_type, msg.content, msg.media_url,
+                   to_char(msg.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
+                   EXISTS(
+                       SELECT 1 FROM task_user_reads r 
+                       WHERE r.task_id = msg.task_id 
+                         AND r.user_id != msg.sender_id 
+                         AND r.last_read_msg_id >= msg.id
+                   ) as is_read
+            FROM task_messages msg 
+            WHERE msg.task_id = $1 
+            ORDER BY msg.id ASC
+        """, task_id)
+
+        return [dict(r) for r in rows]
+
+async def check_task_not_archived(conn, task_id: int):
+    status = await conn.fetchval("SELECT status FROM tasks WHERE id = $1", task_id)
+    if status == 'ARCHIVED':
+        raise HTTPException(status_code=400, detail="Задача находится в архиве. Чат заблокирован.")
+
+@app.post("/api/tasks/{task_id}/messages/text")
+async def send_text_msg(
+    task_id: int, 
+    sender_id: int = Form(1),
+    sender_role: str = Form(...), 
+    sender_name: str = Form(...), 
+    content: str = Form(...)
+):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        await check_task_not_archived(conn, task_id)
+        msg_id = await conn.fetchval("""
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+            VALUES ($1, $2, $3, $4, 'TEXT', $5, NOW())
+            RETURNING id
+        """, task_id, sender_id, sender_role, sender_name, content)
+        
+        await conn.execute("""
+            INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (task_id, user_id) DO UPDATE 
+            SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+        """, task_id, sender_id, msg_id)
+
+    await broadcast_event(f"chat_{task_id}")
+    return {"status": "ok", "id": msg_id}
+
+@app.post("/api/tasks/{task_id}/messages/voice")
+async def send_voice_msg(
+    task_id: int, 
+    sender_id: int = Form(1),
+    sender_role: str = Form(...), 
+    sender_name: str = Form(...), 
+    audio: UploadFile = File(...)
+):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        await check_task_not_archived(conn, task_id)
+        audio_bytes = await audio.read()
+        mime = audio.content_type or "audio/webm"
+        audio_b64 = f"data:{mime};base64," + base64.b64encode(audio_bytes).decode('utf-8')
+        msg_id = await conn.fetchval("""
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, media_url, content, created_at)
+            VALUES ($1, $2, $3, $4, 'VOICE', $5, 'Голосовое сообщение', NOW())
+            RETURNING id
+        """, task_id, sender_id, sender_role, sender_name, audio_b64)
+        
+        await conn.execute("""
+            INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (task_id, user_id) DO UPDATE 
+            SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+        """, task_id, sender_id, msg_id)
+
+    await broadcast_event(f"chat_{task_id}")
+    return {"status": "ok", "id": msg_id}
+
+@app.post("/api/tasks/{task_id}/messages/image")
+async def send_image_msg(
+    task_id: int, 
+    sender_id: int = Form(1),
+    sender_role: str = Form(...), 
+    sender_name: str = Form(...), 
+    file: UploadFile = File(...)
+):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        await check_task_not_archived(conn, task_id)
+        file_bytes = await file.read()
+        mime = file.content_type or "image/jpeg"
+        file_b64 = f"data:{mime};base64," + base64.b64encode(file_bytes).decode('utf-8')
+        msg_id = await conn.fetchval("""
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, media_url, content, created_at)
+            VALUES ($1, $2, $3, $4, 'IMAGE', $5, 'Прикрепленное фото', NOW())
+            RETURNING id
+        """, task_id, sender_id, sender_role, sender_name, file_b64)
+        
+        await conn.execute("""
+            INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (task_id, user_id) DO UPDATE 
+            SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+        """, task_id, sender_id, msg_id)
+
+    await broadcast_event(f"chat_{task_id}")
+    return {"status": "ok", "id": msg_id}
+
+@app.post("/api/tasks/{task_id}/red-flag")
+async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(1), sender_name: str = Form("Исполнитель")):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE tasks SET priority = 'URGENT', is_urgent = TRUE, risks_notes = $1 WHERE id = $2", f"🚨 RED FLAG: {reason}", task_id)
+        msg_id = await conn.fetchval("""
+            INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
+            VALUES ($1, $2, 'EMPLOYEE', $3, 'REDFLAG', $4, NOW())
+            RETURNING id
+        """, task_id, sender_id, sender_name, f"🚨 RED FLAG (БЛОКЕР): {reason}")
+
+        await conn.execute("""
+            INSERT INTO task_user_reads (task_id, user_id, last_read_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (task_id, user_id) DO UPDATE 
+            SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
+        """, task_id, sender_id, msg_id)
+
+    send_telegram_alert(f"🚨🚨🚨 <b>RED FLAG на задаче #{task_id}!</b>\n<b>Исполнитель:</b> {sender_name}\n<b>Проблема:</b> {reason}")
+    await broadcast_event("red_flag")
+    return {"status": "flagged"}
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Task OS Corporate</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <style>
+    [v-cloak] { display: none !important; }
+    .overscroll-contain { overscroll-behavior: contain; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased select-none">
+  <div id="app" v-cloak class="max-w-md mx-auto p-3.5 pb-24">
+    
+    <!-- 1. ЭКРАН РАЗБЛОКИРОВКИ ПО PIN-КОДУ -->
+    <div v-if="hasEncryptedVault && !isUnlocked" class="min-h-[85vh] flex flex-col justify-center px-4">
+      <div class="bg-slate-900/90 border border-slate-800 p-6 rounded-3xl space-y-5 shadow-2xl text-center backdrop-blur-xl">
+        <div class="w-14 h-14 bg-gradient-to-tr from-amber-600 to-amber-500 rounded-2xl flex items-center justify-center text-white text-2xl mx-auto shadow-lg shadow-amber-600/30">
+          <i class="fa-solid fa-lock"></i>
+        </div>
+        <div>
+          <h2 class="text-base font-black tracking-wide text-white">ЗАШИФРОВАННЫЙ СЕЙФ</h2>
+          <p class="text-xs text-slate-400 mt-1">Введите 4-значный PIN для быстрой расшифровки</p>
+        </div>
+
+        <div class="flex justify-center gap-3 py-1">
+          <div v-for="i in 4" :key="i" 
+               :class="pinInput.length >= i ? 'bg-amber-400 scale-110 shadow-lg shadow-amber-400/50' : 'bg-slate-800 border border-slate-700'"
+               class="w-3.5 h-3.5 rounded-full transition-all duration-150"></div>
+        </div>
+
+        <div v-if="pinError" class="text-xs text-red-400 font-semibold animate-pulse">
+          ❌ Неверный PIN-код
+        </div>
+
+        <div class="grid grid-cols-3 gap-2.5 max-w-[240px] mx-auto pt-1">
+          <button v-for="n in [1,2,3,4,5,6,7,8,9]" :key="n" @click="pressPinDigit(n)" class="h-12 rounded-2xl bg-slate-800/80 hover:bg-slate-700 active:scale-95 text-white text-base font-black border border-slate-700/50 shadow transition">
+            {{ n }}
+          </button>
+          <button @click="clearPin" class="h-12 rounded-2xl bg-red-950/40 text-red-400 font-bold border border-red-800/30 active:scale-95 text-xs transition">
+            Сброс
+          </button>
+          <button @click="pressPinDigit(0)" class="h-12 rounded-2xl bg-slate-800/80 hover:bg-slate-700 active:scale-95 text-white text-base font-black border border-slate-700/50 shadow transition">
+            0
+          </button>
+          <button @click="backspacePin" class="h-12 rounded-2xl bg-slate-800/80 text-slate-300 active:scale-95 text-sm flex items-center justify-center border border-slate-700/50 transition">
+            <i class="fa-solid fa-delete-left"></i>
+          </button>
+        </div>
+
+        <button @click="resetVaultAndRelogin" class="text-[11px] text-slate-400 hover:text-indigo-300 pt-2 block mx-auto underline">
+          Войти под другим логином / сбросить сейф
+        </button>
+      </div>
+    </div>
+
+    <!-- 2. ЭКРАН ПЕРВИЧНОГО ВХОДА -->
+    <div v-else-if="!currentUser" class="min-h-[85vh] flex flex-col justify-center px-2">
+      <div class="bg-slate-900/90 border border-slate-800 p-6 rounded-3xl space-y-4 shadow-2xl text-center backdrop-blur-xl">
+        <div class="w-14 h-14 bg-gradient-to-tr from-indigo-600 to-indigo-500 rounded-2xl flex items-center justify-center text-white text-2xl mx-auto shadow-lg shadow-indigo-600/30">
+          <i class="fa-solid fa-shield-halved"></i>
+        </div>
+        <div>
+          <h2 class="text-lg font-black tracking-wide text-white">TASK CONTROL OS</h2>
+          <p class="text-xs text-slate-400 mt-0.5">Вход с созданием локального шифрования</p>
+        </div>
+
+        <form @submit.prevent="handleLogin" class="text-left space-y-3 pt-2">
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1">Ваш логин:</label>
+            <input v-model="loginForm.username" type="text" autocapitalize="none" required placeholder="Введите логин" class="w-full bg-slate-950/80 border border-slate-700/80 text-xs p-3 rounded-xl text-white font-medium focus:border-indigo-500 outline-none">
+          </div>
+
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1">Пароль:</label>
+            <input v-model="loginForm.password" type="password" required placeholder="••••" class="w-full bg-slate-950/80 border border-slate-700/80 text-xs p-3 rounded-xl text-white font-medium focus:border-indigo-500 outline-none">
+          </div>
+
+          <div>
+            <label class="block text-[10px] font-bold text-amber-300 uppercase mb-1">Придумайте 4-значный PIN (для входа при F5):</label>
+            <input v-model="loginForm.pin" type="password" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" required placeholder="1234" class="w-full bg-slate-950/80 border border-amber-500/50 text-xs p-3 rounded-xl text-amber-300 font-bold focus:border-amber-400 outline-none tracking-widest text-center">
+          </div>
+
+          <button type="submit" :disabled="isLoggingIn" class="w-full bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-bold py-3 rounded-xl text-xs shadow-lg shadow-indigo-600/30 transition mt-2 flex items-center justify-center gap-2">
+            <i v-if="isLoggingIn" class="fa-solid fa-circle-notch fa-spin"></i>
+            <span>{{ isLoggingIn ? 'Создание сейфа...' : 'Войти и зашифровать сейф' }}</span>
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- 3. ОСНОВНОЙ РАБОЧИЙ ИНТЕРФЕЙС -->
+    <div v-else class="space-y-4">
+      
+      <!-- ХЕДЕР -->
+      <header class="bg-slate-900/90 border border-slate-800 p-3 rounded-2xl shadow-lg backdrop-blur-md flex justify-between items-center">
+        <div class="flex items-center gap-2.5">
+          <div class="w-2.5 h-2.5 rounded-full" :class="sseConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'"></div>
+          <div>
+            <h3 class="text-xs font-bold text-white leading-none">{{ currentUser.full_name }}</h3>
+            <span class="text-[9px] font-bold text-indigo-400 uppercase tracking-wider">{{ roleBadgeTitle }}</span>
+          </div>
+        </div>
+        <button @click="handleLogout" class="text-[10px] font-bold text-red-400 bg-red-950/40 hover:bg-red-900/60 px-2.5 py-1.5 rounded-xl border border-red-800/50 transition">
+          <i class="fa-solid fa-right-from-bracket mr-1"></i> Выйти
+        </button>
+      </header>
+
+      <!-- ПАНЕЛЬ ФИЛЬТРОВ -->
+      <div class="bg-slate-900/90 border border-slate-800 p-3 rounded-2xl space-y-2.5 shadow-md">
+        <div class="flex justify-between items-center">
+          <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+            <i class="fa-solid fa-filter text-indigo-400"></i> Фильтры задач
+          </span>
+          <button v-if="hasActiveFilters" @click="resetFilters" class="text-[9px] font-bold text-indigo-400 hover:text-indigo-300">
+            Сбросить все
+          </button>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2 text-xs">
+          <div>
+            <label class="block text-[9px] font-bold text-slate-400 mb-1">Проект:</label>
+            <select v-model="filterProject" class="w-full bg-slate-950 border border-slate-800 text-[11px] p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+              <option value="ALL">Все проекты</option>
+              <option value="Проект Кормовая Мука">Кормовая Мука</option>
+              <option value="Мука Евразия">Мука Евразия</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="block text-[9px] font-bold text-slate-400 mb-1">Важность:</label>
+            <select v-model="filterPriority" class="w-full bg-slate-950 border border-slate-800 text-[11px] p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+              <option value="ALL">Все приоритеты</option>
+              <option value="URGENT">🔴 Оперативно</option>
+              <option value="NORMAL">🟡 Умеренно</option>
+              <option value="FUTURE">🔵 На будущее</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2 items-center text-xs">
+          <div v-if="currentUser.role !== 'EMPLOYEE'">
+            <label class="block text-[9px] font-bold text-slate-400 mb-1">Исполнитель/Лид:</label>
+            <select v-model="filterExecutor" class="w-full bg-slate-950 border border-slate-800 text-[11px] p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+              <option value="ALL">Все сотрудники</option>
+              <option v-for="u in employeesOnly" :key="u.id" :value="u.id">{{ u.full_name }}</option>
+            </select>
+          </div>
+
+          <div :class="currentUser.role === 'EMPLOYEE' ? 'col-span-2' : ''" class="pt-2">
+            <button @click="filterUrgentOnly = !filterUrgentOnly" :class="filterUrgentOnly ? 'bg-red-950 border-red-800 text-red-300 font-bold' : 'bg-slate-950 border-slate-800 text-slate-400'" class="w-full py-2 px-3 rounded-xl border text-[11px] flex items-center justify-center gap-1.5 transition">
+              <i class="fa-solid fa-fire text-amber-500"></i>
+              <span>Только горящие (до 4ч)</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
+      <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
+        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ -->
+        <div class="bg-slate-900/90 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl backdrop-blur-md">
+          <h2 class="text-base font-bold text-white">Голосовое поручение</h2>
+          
+          <div class="flex justify-center py-1">
+            <button @click="toggleRecord" :class="isRecording ? 'bg-red-500 animate-pulse scale-105' : 'bg-indigo-600 active:scale-95'" class="w-20 h-20 rounded-full flex flex-col items-center justify-center text-white shadow-2xl transition duration-200">
+              <i :class="isRecording ? 'fa-solid fa-stop text-xl' : 'fa-solid fa-microphone text-2xl'"></i>
+              <span v-if="isRecording" class="text-[10px] font-mono font-bold mt-1">{{ formatTime(recordSeconds) }}</span>
+            </button>
+          </div>
+
+          <div v-if="isProcessing" class="text-xs text-indigo-400 font-semibold animate-pulse">
+            <i class="fa-solid fa-circle-notch fa-spin mr-1"></i> ИИ формирует ТЗ...
+          </div>
+          <p v-else class="text-[11px] font-semibold" :class="isRecording ? 'text-red-400' : 'text-slate-400'">
+            {{ isRecording ? 'Идет запись... Нажмите для завершения' : 'Нажмите микрофон и говорите' }}
+          </p>
+
+          <div class="pt-2.5 border-t border-slate-800 text-left space-y-1.5">
+            <div class="flex gap-1.5">
+              <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите поручение текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+              <button @click="sendTextTask" class="bg-indigo-600 hover:bg-indigo-500 px-3 rounded-xl text-white font-bold text-xs">
+                <i class="fa-solid fa-paper-plane"></i>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-3 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
+          <button @click="ownerTab = 'inbox'" :class="ownerTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
+          <button @click="ownerTab = 'active'" :class="ownerTab === 'active' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">В работе ({{ activeTasks.length }})</button>
+          <button @click="ownerTab = 'archive'" :class="ownerTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Архив ({{ archiveTasks.length }})</button>
+        </div>
+
+        <div class="space-y-3">
+          <div v-if="filteredOwnerTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
+            Задачи по выбранным фильтрам не найдены.
+          </div>
+
+          <div v-for="t in filteredOwnerTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
+            <div class="flex justify-between items-start gap-2">
+              <div class="flex flex-wrap items-center gap-1.5">
+                <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
+                <span class="text-[9px] font-bold px-2 py-0.5 rounded bg-indigo-950/80 border border-indigo-800/80 text-indigo-300">📁 {{ t.project_group }}</span>
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="priorityBadge(t.priority)">{{ priorityLabel(t.priority) }}</span>
+                <span v-if="t.status === 'IN_PROGRESS'" class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
+                  ⏰ {{ getDeadlineCountdown(t.deadline) }}
+                </span>
+              </div>
+            </div>
+
+            <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
+            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5">
+              <i class="fa-solid fa-user-tie"></i>
+              <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+            </div>
+
+            <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
+
+            <div v-if="t.status === 'IN_PROGRESS'" class="space-y-1">
+              <div class="flex justify-between text-[10px] font-bold">
+                <span class="text-slate-400">Прогресс выполнения:</span>
+                <span :class="t.progress >= 70 ? 'text-emerald-400' : (t.progress >= 30 ? 'text-amber-400' : 'text-indigo-400')">{{ t.progress }}%</span>
+              </div>
+              <div class="w-full bg-slate-950 rounded-full h-1.5 border border-slate-800 overflow-hidden">
+                <div :style="{ width: (t.progress || 0) + '%' }" :class="t.progress >= 70 ? 'bg-emerald-500' : (t.progress >= 30 ? 'bg-amber-500' : 'bg-indigo-500')" class="h-full transition-all duration-300"></div>
+              </div>
+            </div>
+
+            <!-- ПЛЕЕР ГОЛОСА АВТОРА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
+            <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
+              <div class="flex items-center gap-3">
+                <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
+                  <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+                </button>
+                <div class="flex-1 space-y-1">
+                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove.prevent="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                    <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
+                         :style="{ height: h + '%' }" 
+                         :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                         class="w-1 rounded-full transition-colors pointer-events-none"></div>
+                  </div>
+                  <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос автора' }}</span>
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioDuration) : '' }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2.5 rounded-xl border border-amber-900/40">
+              <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
+            </p>
+
+            <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-xs space-y-1.5">
+              <p class="text-slate-300"><strong>Суть задачи:</strong> {{ t.ai_summary }}</p>
+              <div class="text-slate-400 pt-1 border-t border-slate-800/80 whitespace-pre-line">
+                <strong class="text-indigo-300">Критерии сдачи (DoD):</strong><br>{{ t.definition_of_done }}
+              </div>
+            </div>
+
+            <div class="text-xs space-y-0.5 px-1 font-semibold">
+              <p v-if="t.lead_name" class="text-indigo-300">👑 Лид: {{ t.lead_name }}</p>
+              <p v-if="t.team_names" class="text-slate-400 text-[11px]">👥 Команда: {{ t.team_names }}</p>
+            </div>
+
+            <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
+              <div class="flex justify-between">
+                <span>📅 Создано:</span>
+                <span class="text-slate-200 font-mono">{{ formatLocalDT(t.created_at) }}</span>
+              </div>
+              <div v-if="t.deadline" class="flex justify-between">
+                <span>⏰ Дедлайн:</span>
+                <span class="text-amber-300 font-mono font-bold">{{ formatLocalDT(t.deadline) }}</span>
+              </div>
+              <div v-if="t.completed_at" class="flex justify-between">
+                <span>🏁 Завершено:</span>
+                <span class="text-emerald-400 font-mono">{{ formatLocalDT(t.completed_at) }}</span>
+              </div>
+            </div>
+
+            <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700 transition">
+              <i class="fa-solid fa-comments"></i>
+              <span>Чат по задаче</span>
+              <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. КАБИНЕТ ДИРЕКТОРА (ЖАМОЛИДДИН) -->
+      <div v-if="currentUser.role === 'DEPUTY'" class="space-y-4">
+        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ ДИРЕКТОРОМ -->
+        <div class="bg-slate-900/90 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl backdrop-blur-md">
+          <div class="flex items-center justify-center gap-2">
+            <i class="fa-solid fa-bolt text-amber-400"></i>
+            <h2 class="text-base font-bold text-white">Создать поручение (Директор)</h2>
+          </div>
+          
+          <div class="flex justify-center py-1">
+            <button @click="toggleRecord" :class="isRecording ? 'bg-red-500 animate-pulse scale-105' : 'bg-gradient-to-tr from-amber-600 to-amber-500 active:scale-95'" class="w-20 h-20 rounded-full flex flex-col items-center justify-center text-white shadow-2xl transition duration-200">
+              <i :class="isRecording ? 'fa-solid fa-stop text-xl' : 'fa-solid fa-microphone text-2xl'"></i>
+              <span v-if="isRecording" class="text-[10px] font-mono font-bold mt-1">{{ formatTime(recordSeconds) }}</span>
+            </button>
+          </div>
+
+          <div v-if="isProcessing" class="text-xs text-amber-400 font-semibold animate-pulse">
+            <i class="fa-solid fa-circle-notch fa-spin mr-1"></i> ИИ формирует ТЗ...
+          </div>
+          <p v-else class="text-[11px] font-semibold" :class="isRecording ? 'text-red-400' : 'text-slate-400'">
+            {{ isRecording ? 'Идет запись... Нажмите для завершения' : 'Нажмите микрофон и надиктуйте поручение' }}
+          </p>
+
+          <div class="pt-2.5 border-t border-slate-800 text-left space-y-1.5">
+            <div class="flex gap-1.5">
+              <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите задачу текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-amber-500">
+              <button @click="sendTextTask" class="bg-amber-600 hover:bg-amber-500 px-3 rounded-xl text-white font-bold text-xs">
+                <i class="fa-solid fa-paper-plane"></i>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-3 gap-1 p-1 bg-slate-900 rounded-xl border border-slate-800 text-[11px]">
+          <button @click="deputyTab = 'inbox'" :class="deputyTab === 'inbox' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Вход ({{ inboxTasks.length }})</button>
+          <button @click="deputyTab = 'active'" :class="deputyTab === 'active' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">В работе ({{ activeTasks.length }})</button>
+          <button @click="deputyTab = 'archive'" :class="deputyTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="py-1.5 rounded-lg text-center">Архив ({{ archiveTasks.length }})</button>
+        </div>
+
+        <div class="space-y-3">
+          <div v-if="filteredDeputyTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
+            Задачи по выбранным фильтрам не найдены.
+          </div>
+
+          <div v-for="t in filteredDeputyTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
+            <div class="flex justify-between items-start gap-2">
+              <div class="flex flex-wrap items-center gap-1.5">
+                <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
+                <span class="text-[9px] font-bold px-2 py-0.5 rounded bg-indigo-950/80 border border-indigo-800/80 text-indigo-300">📁 {{ t.project_group }}</span>
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="priorityBadge(t.priority)">{{ priorityLabel(t.priority) }}</span>
+                <span v-if="t.status === 'IN_PROGRESS'" class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
+                  ⏰ {{ getDeadlineCountdown(t.deadline) }}
+                </span>
+              </div>
+            </div>
+
+            <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
+            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5">
+              <i class="fa-solid fa-user-tie"></i>
+              <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+            </div>
+
+            <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
+
+            <!-- ПЛЕЕР ГОЛОСА АВТОРА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
+            <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
+              <div class="flex items-center gap-3">
+                <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
+                  <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+                </button>
+                <div class="flex-1 space-y-1">
+                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove.prevent="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                    <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
+                         :style="{ height: h + '%' }" 
+                         :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                         class="w-1 rounded-full transition-colors pointer-events-none"></div>
+                  </div>
+                  <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос автора' }}</span>
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioDuration) : '' }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2.5 rounded-xl border border-amber-900/40">
+              <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
+            </p>
+
+            <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-xs space-y-1.5">
+              <p class="text-slate-300"><strong>Суть задачи:</strong> {{ t.ai_summary }}</p>
+              <div class="text-slate-400 pt-1 border-t border-slate-800/80 whitespace-pre-line">
+                <strong class="text-indigo-300">Критерии сдачи (DoD):</strong><br>{{ t.definition_of_done }}
+              </div>
+            </div>
+
+            <div class="text-xs space-y-0.5 px-1 font-semibold">
+              <p v-if="t.lead_name" class="text-indigo-300">👑 Лид: {{ t.lead_name }}</p>
+              <p v-if="t.team_names" class="text-slate-400 text-[11px]">👥 Команда: {{ t.team_names }}</p>
+            </div>
+
+            <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
+              <div class="flex justify-between">
+                <span>📅 Создано:</span>
+                <span class="text-slate-200 font-mono">{{ formatLocalDT(t.created_at) }}</span>
+              </div>
+              <div v-if="t.deadline" class="flex justify-between">
+                <span>⏰ Дедлайн:</span>
+                <span class="text-amber-300 font-mono font-bold">{{ formatLocalDT(t.deadline) }}</span>
+              </div>
+              <div v-if="t.completed_at" class="flex justify-between">
+                <span>🏁 Завершено:</span>
+                <span class="text-emerald-400 font-mono">{{ formatLocalDT(t.completed_at) }}</span>
+              </div>
+            </div>
+
+            <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ -->
+            <div v-if="t.status === 'DRAFT'" class="space-y-2.5 pt-1 border-t border-slate-800">
+              <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
+              <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
+              <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" placeholder="Критерии сдачи (DoD)" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
+
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-[10px] font-bold text-slate-400 mb-1">Группа проекта:</label>
+                  <select v-model="editDrafts[t.id].project_group" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500 font-bold">
+                    <option value="Проект Кормовая Мука">Кормовая Мука</option>
+                    <option value="Мука Евразия">Мука Евразия</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label class="block text-[10px] font-bold text-slate-400 mb-1">Важность:</label>
+                  <select v-model="editDrafts[t.id].priority" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+                    <option value="URGENT">🔴 Оперативно</option>
+                    <option value="NORMAL">🟡 Умеренно</option>
+                    <option value="FUTURE">🔵 На будущее</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label class="block text-[10px] font-bold text-amber-300 mb-1">👑 Лид команды:</label>
+                <select v-model="editDrafts[t.id].lead_id" @change="ensureLeadInAssignees(t.id)" class="w-full bg-slate-950 border border-amber-500/50 text-xs p-2 rounded-xl text-amber-300 font-bold outline-none focus:border-amber-400">
+                  <option v-for="u in employeesOnly" :key="u.id" :value="u.id">{{ u.full_name }} (Лид)</option>
+                </select>
+              </div>
+
+              <div class="bg-slate-950 p-2.5 rounded-xl border border-slate-800 space-y-1.5">
+                <label class="block text-[10px] font-bold text-slate-400">👥 Состав исполнителей команды:</label>
+                <div class="grid grid-cols-3 gap-1 text-[11px]">
+                  <label v-for="u in employeesOnly" :key="u.id" class="flex items-center gap-1.5 cursor-pointer p-1 rounded hover:bg-slate-900">
+                    <input type="checkbox" :value="u.id" v-model="editDrafts[t.id].assignee_ids" class="rounded bg-slate-800 text-indigo-600 focus:ring-0">
+                    <span :class="editDrafts[t.id].lead_id === u.id ? 'text-amber-300 font-bold' : 'text-slate-300'">{{ u.full_name }}</span>
+                  </label>
+                </div>
+              </div>
+
+              <div>
+                <label class="block text-[10px] font-bold text-slate-400 mb-1">Дедлайн (ваше местное время):</label>
+                <input v-model="editDrafts[t.id].deadline" type="datetime-local" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+              </div>
+
+              <button @click="assignTask(t.id)" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 rounded-xl text-xs shadow transition mt-1">
+                🚀 Утвердить и отправить команде
+              </button>
+            </div>
+
+            <!-- УПРАВЛЕНИЕ И РЕДАКТИРОВАНИЕ В ПРОЦЕССЕ РАБОТЫ -->
+            <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-2 border-t border-slate-800">
+              <div v-if="t.pending_request" class="p-2.5 bg-amber-950/40 border border-amber-800/60 rounded-xl space-y-2 animate-pulse">
+                <div class="flex justify-between items-center text-xs font-bold text-amber-300">
+                  <span>📌 Запрос от Лида ({{ t.lead_name }}):</span>
+                  <span class="bg-amber-500 text-slate-950 px-2 py-0.5 rounded text-[10px] font-black">
+                    {{ t.pending_request === 'ARCHIVE' ? 'Сдача в архив' : t.pending_request + '%' }}
+                  </span>
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                  <button @click="confirmStageRequest(t.id, true)" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-1.5 rounded-lg text-xs shadow">
+                    ✅ Подтвердить
+                  </button>
+                  <button @click="confirmStageRequest(t.id, false)" class="bg-red-950 hover:bg-red-900 text-red-300 border border-red-800 font-bold py-1.5 rounded-lg text-xs">
+                    ❌ Отклонить
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <span class="text-[10px] font-bold text-slate-400 block mb-1">Установить этап напрямую:</span>
+                <div class="grid grid-cols-3 gap-1.5">
+                  <button @click="setDirectStage(t.id, '30')" :class="t.progress === 30 ? 'bg-amber-600 text-white font-bold shadow-lg' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'" class="py-1.5 rounded-xl text-xs font-semibold transition">
+                    30%
+                  </button>
+                  <button @click="setDirectStage(t.id, '70')" :class="t.progress === 70 ? 'bg-amber-600 text-white font-bold shadow-lg' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'" class="py-1.5 rounded-xl text-xs font-semibold transition">
+                    70%
+                  </button>
+                  <button @click="setDirectStage(t.id, 'ARCHIVE')" class="py-1.5 rounded-xl bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-bold transition">
+                    В архив
+                  </button>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-2 pt-1 border-t border-slate-800/80">
+                <button @click="openEditDetailsModal(t)" class="py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-indigo-300 text-xs font-bold border border-slate-700 flex items-center justify-center gap-1.5 transition">
+                  <i class="fa-solid fa-pen-to-square"></i> Изменить ТЗ/Срок
+                </button>
+                <button @click="openManageTeamModal(t)" class="py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-bold border border-slate-700 flex items-center justify-center gap-1.5 transition">
+                  <i class="fa-solid fa-users-gear"></i> Состав команды
+                </button>
+              </div>
+            </div>
+
+            <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700 transition">
+              <i class="fa-solid fa-comments"></i>
+              <span>Чат по задаче</span>
+              <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[10px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3. ЛИЧНЫЙ КАБИНЕТ ИСПОЛНИТЕЛЯ -->
+      <div v-if="currentUser.role === 'EMPLOYEE'" class="space-y-4">
+        <div class="bg-gradient-to-r from-slate-900 to-indigo-950 border border-indigo-800/50 p-4 rounded-3xl space-y-3 shadow-xl">
+          <div class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-2xl bg-indigo-600 text-white flex items-center justify-center font-black text-base shadow">
+              {{ currentUser.full_name.charAt(0) }}
+            </div>
+            <div>
+              <h3 class="text-sm font-bold text-white">{{ currentUser.full_name }}</h3>
+              <p class="text-[11px] text-indigo-300 font-semibold">Исполнитель команды</p>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2 pt-2 border-t border-slate-800/80 text-center">
+            <div class="bg-slate-950/60 p-2 rounded-xl border border-slate-800">
+              <span class="text-[10px] text-slate-400 block font-semibold">В работе</span>
+              <span class="text-sm font-black text-indigo-400">{{ myActiveTasks.length }}</span>
+            </div>
+            <div class="bg-slate-950/60 p-2 rounded-xl border border-slate-800">
+              <span class="text-[10px] text-slate-400 block font-semibold">В архиве</span>
+              <span class="text-sm font-black text-emerald-400">{{ myArchiveTasks.length }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex gap-1.5 p-1 bg-slate-900 rounded-xl border border-slate-800 text-xs">
+          <button @click="empTab = 'active'" :class="empTab === 'active' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="flex-1 py-1.5 rounded-lg">В работе ({{ myActiveTasks.length }})</button>
+          <button @click="empTab = 'archive'" :class="empTab === 'archive' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400'" class="flex-1 py-1.5 rounded-lg">История</button>
+        </div>
+
+        <div class="space-y-3">
+          <div v-if="filteredEmpTasks.length === 0" class="p-8 text-center text-slate-500 text-xs bg-slate-900/50 rounded-2xl border border-slate-800">
+            Задачи по выбранным фильтрам не найдены.
+          </div>
+
+          <div v-for="t in filteredEmpTasks" :key="t.id" class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 shadow">
+            <div class="flex justify-between items-start gap-2">
+              <div class="flex items-center gap-1.5">
+                <span class="text-[10px] font-mono font-bold bg-slate-800 text-indigo-300 px-1.5 py-0.5 rounded">#{{ t.id }}</span>
+                <span class="text-[9px] font-bold px-2 py-0.5 rounded bg-indigo-950/80 border border-indigo-800/80 text-indigo-300">📁 {{ t.project_group }}</span>
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded" :class="priorityBadge(t.priority)">{{ priorityLabel(t.priority) }}</span>
+              </div>
+              <span class="text-[10px] font-mono px-2 py-0.5 rounded border" :class="getDeadlineBadge(t.deadline)">
+                ⏰ {{ getDeadlineCountdown(t.deadline) }}
+              </span>
+            </div>
+
+            <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
+            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5">
+              <i class="fa-solid fa-user-tie"></i>
+              <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+            </div>
+
+            <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
+
+            <div v-if="t.status === 'IN_PROGRESS'" class="space-y-1">
+              <div class="flex justify-between text-[10px] font-bold">
+                <span class="text-slate-400">Прогресс:</span>
+                <span :class="t.progress >= 70 ? 'text-emerald-400' : (t.progress >= 30 ? 'text-amber-400' : 'text-indigo-400')">{{ t.progress }}%</span>
+              </div>
+              <div class="w-full bg-slate-950 rounded-full h-1.5 border border-slate-800 overflow-hidden">
+                <div :style="{ width: (t.progress || 0) + '%' }" :class="t.progress >= 70 ? 'bg-emerald-500' : (t.progress >= 30 ? 'bg-amber-500' : 'bg-indigo-500')" class="h-full transition-all duration-300"></div>
+              </div>
+            </div>
+
+            <!-- ПЛЕЕР ГОЛОСА АВТОРА -->
+            <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
+              <div class="flex items-center gap-3">
+                <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
+                  <i :class="activeAudioId === 'task_' + t.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+                </button>
+                <div class="flex-1 space-y-1">
+                  <div @click="seekAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" @touchmove.prevent="handleTouchSeek('task_' + t.id, '/api/tasks/' + t.id + '/voice', $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                    <div v-for="(h, idx) in getWaveformBars(t.id)" :key="idx" 
+                         :style="{ height: h + '%' }" 
+                         :class="(activeAudioId === 'task_' + t.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                         class="w-1 rounded-full transition-colors pointer-events-none"></div>
+                  </div>
+                  <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioCurrentTime) : 'Голос автора' }}</span>
+                    <span>{{ activeAudioId === 'task_' + t.id ? formatAudioTime(audioDuration) : '' }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <p class="text-[11px] text-amber-300/90 bg-amber-950/20 p-2.5 rounded-xl border border-amber-900/40">
+              <strong>🗣 Исходное поручение:</strong> {{ t.raw_input_text }}
+            </p>
+            
+            <div class="p-2.5 bg-slate-950 rounded-xl border border-slate-800 text-xs space-y-1.5">
+              <p class="text-slate-300"><strong>Суть задачи:</strong> {{ t.ai_summary }}</p>
+              <div class="text-slate-400 pt-1 border-t border-slate-800/80 whitespace-pre-line">
+                <strong class="text-indigo-300">Критерии сдачи (DoD):</strong><br>{{ t.definition_of_done }}
+              </div>
+            </div>
+
+            <div class="text-xs space-y-0.5 px-1 font-semibold">
+              <p class="text-indigo-300">👑 Лид: {{ t.lead_name }} <span v-if="t.lead_user_id === currentUser.id" class="text-amber-300 font-black">(Вы)</span></p>
+              <p v-if="t.team_names" class="text-slate-400 text-[11px]">👥 Команда: {{ t.team_names }}</p>
+            </div>
+
+            <div class="text-[10px] text-slate-400 space-y-0.5 pt-1 border-t border-slate-800/80">
+              <div class="flex justify-between">
+                <span>📅 Создано:</span>
+                <span class="text-slate-200 font-mono">{{ formatLocalDT(t.created_at) }}</span>
+              </div>
+              <div v-if="t.deadline" class="flex justify-between">
+                <span>⏰ Сдать до:</span>
+                <span class="text-amber-300 font-mono font-bold">{{ formatLocalDT(t.deadline) }}</span>
+              </div>
+              <div v-if="t.completed_at" class="flex justify-between">
+                <span>🏁 Завершено:</span>
+                <span class="text-emerald-400 font-mono">{{ formatLocalDT(t.completed_at) }}</span>
+              </div>
+            </div>
+
+            <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1 border-t border-slate-800">
+              <div v-if="t.lead_user_id === currentUser.id">
+                <div v-if="t.pending_request" class="bg-amber-950/30 border border-amber-800/50 p-2 rounded-xl text-center text-xs text-amber-300 font-bold">
+                  ⏳ Ваш запрос ({{ t.pending_request === 'ARCHIVE' ? 'Архив' : t.pending_request + '%' }}) ожидает решения Жамолиддина
+                </div>
+
+                <div v-else class="space-y-1">
+                  <span class="text-[10px] font-bold text-amber-300 block">👑 Вы Лид: отправить запрос Жамолиддину:</span>
+                  <div class="grid grid-cols-3 gap-1.5">
+                    <button @click="requestStage(t.id, '30')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold py-2 rounded-xl text-xs transition">
+                      📌 30%
+                    </button>
+                    <button @click="requestStage(t.id, '70')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold py-2 rounded-xl text-xs transition">
+                      📌 70%
+                    </button>
+                    <button @click="requestStage(t.id, 'ARCHIVE')" class="bg-emerald-900/80 hover:bg-emerald-800 text-emerald-200 font-bold py-2 rounded-xl text-xs transition">
+                      🏁 В архив
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div v-else class="bg-slate-950 p-2 rounded-xl border border-slate-800 text-[11px] text-slate-400">
+                👥 Вы состоите в команде. Запросы на утверждение этапов отправляет Лид (<strong class="text-indigo-300">{{ t.lead_name }}</strong>).
+              </div>
+
+              <div class="grid grid-cols-2 gap-2 pt-1">
+                <button @click="openChat(t)" class="bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 border border-slate-700 transition">
+                  <i class="fa-solid fa-comments"></i> Чат
+                  <span v-if="t.unread_count > 0" class="bg-indigo-600 text-white text-[9px] px-1.5 py-0.2 rounded-full font-black">{{ t.unread_count }}</span>
+                </button>
+                <button @click="sendRedFlag(t.id)" class="bg-red-950 text-red-300 border border-red-800 hover:bg-red-900 text-xs font-bold py-2 rounded-xl flex items-center justify-center gap-1 transition">
+                  🚩 Red Flag
+                </button>
+              </div>
+            </div>
+
+            <div v-if="t.status === 'ARCHIVED'" class="pt-1">
+              <button @click="openChat(t)" class="w-full bg-slate-800 hover:bg-slate-700 text-indigo-300 font-bold py-2 rounded-xl text-xs flex items-center justify-center gap-2 border border-slate-700 transition">
+                <i class="fa-solid fa-comments"></i> История чата
+              </button>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- МОДАЛЬНОЕ ОКНО: РЕДАКТИРОВАНИЕ ДЕТАЛЕЙ ЗАДАЧИ -->
+    <div v-if="editingDetailsTask" class="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-center justify-center p-3.5">
+      <div class="bg-slate-900 border border-slate-800 rounded-3xl p-5 max-w-sm w-full space-y-3.5 shadow-2xl">
+        <div class="flex justify-between items-center">
+          <h3 class="text-sm font-bold text-white flex items-center gap-1.5">
+            <i class="fa-solid fa-pen-to-square text-indigo-400"></i> Редактирование ТЗ #{{ editingDetailsTask.id }}
+          </h3>
+          <button @click="editingDetailsTask = null" class="w-7 h-7 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs hover:text-white">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+
+        <div class="space-y-2 text-xs">
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 mb-1">Заголовок:</label>
+            <input v-model="editDetailsForm.title" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
+          </div>
+
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 mb-1">Суть ТЗ:</label>
+            <textarea v-model="editDetailsForm.ai_summary" rows="2" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
+          </div>
+
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 mb-1">Критерии сдачи (DoD):</label>
+            <textarea v-model="editDetailsForm.definition_of_done" rows="2" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="block text-[10px] font-bold text-slate-400 mb-1">Группа проекта:</label>
+              <select v-model="editDetailsForm.project_group" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-white outline-none focus:border-indigo-500 font-bold">
+                <option value="Проект Кормовая Мука">Кормовая Мука</option>
+                <option value="Мука Евразия">Мука Евразия</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="block text-[10px] font-bold text-slate-400 mb-1">Важность:</label>
+              <select v-model="editDetailsForm.priority" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+                <option value="URGENT">🔴 Оперативно</option>
+                <option value="NORMAL">🟡 Умеренно</option>
+                <option value="FUTURE">🔵 На будущее</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-[10px] font-bold text-slate-400 mb-1">Дедлайн (местное время):</label>
+            <input v-model="editDetailsForm.deadline" type="datetime-local" class="w-full bg-slate-950 border border-slate-700 p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+          </div>
+        </div>
+
+        <button @click="saveTaskDetails" class="w-full bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-bold py-2.5 rounded-xl text-xs shadow-lg transition">
+          💾 Сохранить изменения и уведомить в чате
+        </button>
+      </div>
+    </div>
+
+    <!-- МОДАЛЬНОЕ ОКНО: УПРАВЛЕНИЕ КОМАНДОЙ И ЛИДОМ -->
+    <div v-if="managingTeamTask" class="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-center justify-center p-3.5">
+      <div class="bg-slate-900 border border-slate-800 rounded-3xl p-5 max-w-sm w-full space-y-3.5 shadow-2xl">
+        <div class="flex justify-between items-center">
+          <h3 class="text-sm font-bold text-white flex items-center gap-1.5">
+            <i class="fa-solid fa-users-gear text-amber-400"></i> Состав команды #{{ managingTeamTask.id }}
+          </h3>
+          <button @click="managingTeamTask = null" class="w-7 h-7 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs hover:text-white">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+
+        <div class="space-y-3 text-xs">
+          <div class="bg-slate-950 p-3 rounded-2xl border border-slate-800 space-y-2">
+            <label class="block text-[10px] font-bold text-slate-400 uppercase">Выберите участников (минимум 1):</label>
+            <div class="space-y-1.5">
+              <label v-for="u in employeesOnly" :key="u.id" class="flex items-center justify-between p-2 rounded-xl hover:bg-slate-900 cursor-pointer border border-transparent hover:border-slate-800">
+                <div class="flex items-center gap-2">
+                  <input type="checkbox" :value="u.id" v-model="teamManageForm.assignee_ids" @change="onAssigneeCheckboxChange(u.id)" class="rounded bg-slate-800 text-indigo-600 focus:ring-0">
+                  <span class="text-white font-semibold">{{ u.full_name }}</span>
+                </div>
+                <span v-if="teamManageForm.lead_id === u.id" class="text-[10px] bg-amber-500/20 text-amber-300 font-black px-2 py-0.5 rounded border border-amber-500/30">👑 Лид</span>
+              </label>
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-[10px] font-bold text-amber-300 mb-1">👑 Назначить Лида команды:</label>
+            <select v-model="teamManageForm.lead_id" class="w-full bg-slate-950 border border-amber-500/60 p-2.5 rounded-xl text-amber-300 font-bold outline-none focus:border-amber-400">
+              <option v-for="u in selectedAssigneesObjects" :key="u.id" :value="u.id">{{ u.full_name }} (Лид)</option>
+            </select>
+          </div>
+        </div>
+
+        <button @click="saveTaskTeam" :disabled="teamManageForm.assignee_ids.length === 0" class="w-full bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 disabled:opacity-50 text-slate-950 font-black py-2.5 rounded-xl text-xs shadow-lg transition">
+          👥 Сохранить команду и уведомить в чате
+        </button>
+      </div>
+    </div>
+
+    <!-- МОДАЛЬНОЕ ОКНО ЧАТА ПО ЗАДАЧЕ (ENTERPRISE VIEW) -->
+    <div v-if="activeChatTask" class="fixed inset-0 bg-slate-950 z-50 flex flex-col h-[100dvh] w-full max-w-md mx-auto overscroll-contain">
+      
+      <div class="p-3.5 border-b border-slate-800/80 flex justify-between items-center bg-slate-900/90 backdrop-blur-xl shrink-0 shadow-lg">
+        <div class="flex items-center gap-2.5">
+          <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-indigo-500 text-white flex items-center justify-center font-bold text-xs shadow-md shadow-indigo-600/30">
+            #{{ activeChatTask.id }}
+          </div>
+          <div>
+            <h3 class="text-xs font-bold text-white truncate max-w-[230px] leading-tight">{{ activeChatTask.title }}</h3>
+            <div class="flex items-center gap-1.5 mt-0.5">
+              <span class="text-[9px] font-semibold text-indigo-300/80">{{ activeChatTask.project_group }} • {{ activeChatTask.progress || 0 }}%</span>
+              <span v-if="!isOnline" class="text-[8px] bg-amber-500/20 text-amber-300 px-1 py-0.2 rounded border border-amber-500/40">Офлайн</span>
+            </div>
+          </div>
+        </div>
+        <button @click="closeChat" class="w-8 h-8 rounded-full bg-slate-800/80 text-slate-300 flex items-center justify-center text-sm hover:text-white transition">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <div ref="chatContainer" @scroll="onChatScroll" class="flex-1 overflow-y-auto overscroll-contain p-3.5 space-y-3 bg-slate-950 relative">
+        <div v-if="isChatLoading" class="flex flex-col items-center justify-center h-full text-slate-400 py-16 space-y-2.5">
+          <i class="fa-solid fa-circle-notch fa-spin text-2xl text-indigo-500"></i>
+          <span class="text-xs font-semibold tracking-wide">Загрузка диалога...</span>
+        </div>
+
+        <div v-else-if="chatMessages.length === 0" class="text-center text-slate-500 text-xs py-16">
+          <i class="fa-regular fa-comments text-3xl mb-2 block opacity-40"></i>
+          Сообщений пока нет. Напишите или надиктуйте ответ!
+        </div>
+
+        <div v-else v-for="m in chatMessages" :key="m.id" :class="isMyMessage(m) ? 'justify-end' : 'justify-start'" class="flex">
+          <div :class="isMyMessage(m) ? 'bg-gradient-to-br from-indigo-600 to-indigo-700 text-white rounded-tr-none shadow-indigo-600/20' : (m.message_type === 'REDFLAG' ? 'bg-red-950/80 border border-red-800/80 text-red-200' : (m.message_type === 'SYSTEM' ? 'bg-indigo-950/40 border border-indigo-800/50 text-indigo-200 rounded-xl max-w-full' : 'bg-slate-900 border border-slate-800/90 text-slate-200 rounded-tl-none'))" class="max-w-[84%] rounded-2xl p-3 shadow-md text-xs space-y-1.5 transition-all">
+            
+            <div class="flex justify-between items-center gap-3 text-[9px] opacity-75 font-semibold">
+              <span>{{ m.sender_name }} ({{ formatRoleName(m.sender_role) }})</span>
+              <div class="flex items-center gap-1">
+                <span>{{ formatLocalTimeOnly(m.created_at) }}</span>
+                <i v-if="isPendingMessage(m)" class="fa-regular fa-clock text-[9px] text-amber-300 opacity-90 animate-pulse ml-0.5"></i>
+              </div>
+            </div>
+
+            <p v-if="m.message_type === 'TEXT' || m.message_type === 'REDFLAG' || m.message_type === 'SYSTEM'" class="leading-relaxed whitespace-pre-wrap">{{ m.content }}</p>
+
+            <div v-if="m.message_type === 'VOICE'" class="pt-1">
+              <div class="flex items-center gap-2.5 bg-black/20 p-2 rounded-xl border border-white/5">
+                <button @click="togglePlayAudio('msg_' + m.id, m.media_url)" :class="isMyMessage(m) ? 'bg-white text-indigo-600' : 'bg-indigo-600 text-white'" class="w-8 h-8 rounded-full flex items-center justify-center text-xs shrink-0 shadow transition">
+                  <i :class="activeAudioId === 'msg_' + m.id && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+                </button>
+                <div class="flex-1 space-y-1">
+                  <div @click="seekAudio('msg_' + m.id, m.media_url, $event)" @touchmove.prevent="handleTouchSeek('msg_' + m.id, m.media_url, $event)" class="h-5 flex items-center gap-0.5 cursor-pointer py-1">
+                    <div v-for="(h, idx) in getWaveformBars(m.id)" :key="idx" 
+                         :style="{ height: h + '%' }" 
+                         :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                         class="w-1 rounded-full transition-colors pointer-events-none"></div>
+                  </div>
+                  <div class="flex justify-between text-[9px] font-mono opacity-80">
+                    <span>{{ activeAudioId === 'msg_' + m.id ? formatAudioTime(audioCurrentTime) : 'Голосовое' }}</span>
+                    <span>{{ activeAudioId === 'msg_' + m.id ? formatAudioTime(audioDuration) : '' }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="m.message_type === 'IMAGE'" class="pt-1">
+              <div @click="openImageLightbox(m.media_url)" class="relative group cursor-pointer overflow-hidden rounded-xl border border-white/10">
+                <img :src="m.media_url" class="rounded-xl max-h-52 w-full object-cover group-hover:scale-105 transition duration-200">
+                <div class="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 flex items-center justify-center text-white text-base transition">
+                  <i class="fa-solid fa-magnifying-glass-plus"></i>
+                </div>
+              </div>
+            </div>
+
+            <div v-if="m.message_type !== 'SYSTEM'" class="text-right text-[10px] leading-none pt-0.5">
+              <span v-if="isMyMessage(m)">
+                <span v-if="isPendingMessage(m)" class="text-[9px] text-amber-300 font-semibold opacity-90">В очереди...</span>
+                <span v-else :class="m.is_read ? 'text-sky-300 font-bold' : 'opacity-60'">
+                  {{ m.is_read ? '✓✓' : '✓' }}
+                </span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <button v-if="userScrolledUp" @click="scrollToBottomSmooth" class="fixed bottom-20 right-4 w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-2xl flex items-center justify-center text-sm transition duration-200 z-50 border border-indigo-400/40 animate-bounce">
+        <i class="fa-solid fa-arrow-down"></i>
+        <span v-if="newMessagesBelowCount > 0" class="absolute -top-1.5 -right-1.5 bg-red-500 text-white text-[10px] font-black min-w-[20px] h-5 px-1 rounded-full flex items-center justify-center border-2 border-slate-950 shadow-md animate-pulse">
+          {{ newMessagesBelowCount }}
+        </span>
+      </button>
+
+      <div v-if="recordedVoiceUrl" class="p-3 bg-slate-900 border-t border-slate-800 space-y-2.5 shrink-0">
+        <div class="flex justify-between items-center text-[11px] font-bold text-slate-300">
+          <span class="flex items-center gap-1.5 text-indigo-400">
+            <i class="fa-solid fa-microphone-lines"></i> Прослушать перед отправкой:
+          </span>
+          <span class="font-mono text-xs text-slate-400">{{ formatTime(recordVoiceSeconds) }}</span>
+        </div>
+
+        <div class="flex items-center gap-3 bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
+          <button @click="togglePlayAudio('preview_voice', recordedVoiceUrl)" class="w-9 h-9 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-xs shrink-0 shadow transition">
+            <i :class="activeAudioId === 'preview_voice' && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+          </button>
+          <div class="flex-1 space-y-1">
+            <div @click="seekAudio('preview_voice', recordedVoiceUrl, $event)" @touchmove.prevent="handleTouchSeek('preview_voice', recordedVoiceUrl, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+              <div v-for="(h, idx) in getWaveformBars(999)" :key="idx" 
+                   :style="{ height: h + '%' }" 
+                   :class="(activeAudioId === 'preview_voice' && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                   class="w-1 rounded-full transition-colors pointer-events-none"></div>
+            </div>
+            <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+              <span>{{ activeAudioId === 'preview_voice' ? formatAudioTime(audioCurrentTime) : '0:00' }}</span>
+              <span>{{ activeAudioId === 'preview_voice' ? formatAudioTime(audioDuration) : formatTime(recordVoiceSeconds) }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2 pt-0.5">
+          <button @click="cancelVoiceRecording" class="py-2.5 rounded-xl bg-red-950/60 hover:bg-red-900/80 border border-red-800/60 text-red-300 text-xs font-bold flex items-center justify-center gap-1.5 transition">
+            <i class="fa-solid fa-trash-can"></i> Удалить
+          </button>
+          <button @click="confirmSendVoice" class="py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow transition">
+            <i class="fa-solid fa-paper-plane"></i> Отправить
+          </button>
+        </div>
+      </div>
+
+      <div v-else-if="isRecordingVoice" class="p-3 bg-slate-900 border-t border-slate-800 flex items-center justify-between shrink-0 animate-pulse">
+        <div class="flex items-center gap-2 text-xs font-bold text-red-400">
+          <div class="w-3 h-3 rounded-full bg-red-500 animate-ping"></div>
+          <span>Идет запись: {{ formatTime(recordVoiceSeconds) }}</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button @click="cancelVoiceRecording" class="w-8 h-8 rounded-xl bg-slate-800 text-slate-400 flex items-center justify-center text-xs hover:text-red-300">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+          <button @click="stopVoiceRecording" class="px-3.5 py-2 rounded-xl bg-red-600 text-white text-xs font-bold flex items-center gap-1.5 shadow">
+            <i class="fa-solid fa-stop"></i> Завершить
+          </button>
+        </div>
+      </div>
+
+      <div v-else-if="activeChatTask.status === 'ARCHIVED'" class="p-3 bg-slate-900 border-t border-slate-800 text-center text-xs text-slate-400 font-semibold flex items-center justify-center gap-2 shrink-0">
+        <i class="fa-solid fa-lock text-slate-500"></i>
+        <span>Задача закрыта в архив. Чат доступен только для чтения.</span>
+      </div>
+
+      <div v-else class="p-2.5 border-t border-slate-800/80 bg-slate-900/90 backdrop-blur-md space-y-2 shrink-0">
+        <div class="flex items-center gap-1.5">
+          <label class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 flex items-center justify-center cursor-pointer hover:bg-slate-700 text-sm transition">
+            <i class="fa-solid fa-paperclip"></i>
+            <input type="file" accept="image/*" @change="uploadChatImage" class="hidden">
+          </label>
+
+          <button @click="startVoiceRecording" class="w-9 h-9 rounded-xl bg-slate-800 text-slate-300 hover:bg-slate-700 flex items-center justify-center text-sm transition">
+            <i class="fa-solid fa-microphone"></i>
+          </button>
+
+          <input v-model="chatInput" @keyup.enter="sendChatMessage" placeholder="Сообщение..." class="flex-1 bg-slate-950 border border-slate-700/80 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
+
+          <button @click="sendChatMessage" class="w-9 h-9 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 text-white flex items-center justify-center text-sm hover:from-indigo-500 hover:to-indigo-400 shadow transition">
+            <i class="fa-solid fa-paper-plane"></i>
+          </button>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- LIGHTBOX ДЛЯ ПРЕДОСМОТРА ФОТО -->
+    <div v-if="previewImageUrl" class="fixed inset-0 bg-black/95 backdrop-blur-2xl z-[60] flex flex-col justify-between p-4" @click.self="previewImageUrl = null">
+      <div class="flex justify-between items-center text-white shrink-0">
+        <span class="text-xs font-bold opacity-75">Просмотр фото</span>
+        <div class="flex items-center gap-3">
+          <a :href="previewImageUrl" download="task_photo.jpg" target="_blank" class="w-9 h-9 rounded-xl bg-white/10 flex items-center justify-center text-white text-sm hover:bg-white/20 transition">
+            <i class="fa-solid fa-download"></i>
+          </a>
+          <button @click="previewImageUrl = null" class="w-9 h-9 rounded-xl bg-white/10 flex items-center justify-center text-white text-sm hover:bg-white/20 transition">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="flex-1 flex items-center justify-center overflow-hidden my-4">
+        <img :src="previewImageUrl" class="max-h-full max-w-full object-contain rounded-2xl shadow-2xl">
+      </div>
+
+      <div class="text-center text-[11px] text-slate-400 shrink-0">
+        Нажмите крестик или фон, чтобы закрыть
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const { createApp, ref, computed, onMounted, nextTick } = Vue;
+
+    const CryptoEngine = {
+      async deriveKey(pin, saltBase64) {
+        const enc = new TextEncoder();
+        const pinKey = await crypto.subtle.importKey(
+          'raw',
+          enc.encode(pin),
+          { name: 'PBKDF2' },
+          false,
+          ['deriveKey']
+        );
+        const salt = saltBase64 ? Uint8Array.from(atob(saltBase64), c => c.charCodeAt(0)) : crypto.getRandomValues(new Uint8Array(16));
+        const key = await crypto.subtle.deriveKey(
+          {
+            name: 'PBKDF2',
+            salt: salt,
+            iterations: 100000,
+            hash: 'SHA-256'
+          },
+          pinKey,
+          { name: 'AES-GCM', length: 256 },
+          false,
+          ['encrypt', 'decrypt']
+        );
+        return { key, saltBase64: btoa(String.fromCharCode(...salt)) };
+      },
+
+      async encrypt(dataObj, key) {
+        const enc = new TextEncoder();
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const encodedData = enc.encode(JSON.stringify(dataObj));
+        const ciphertext = await crypto.subtle.encrypt(
+          { name: 'AES-GCM', iv: iv },
+          key,
+          encodedData
+        );
+        return {
+          iv: btoa(String.fromCharCode(...iv)),
+          cipher: btoa(String.fromCharCode(...new Uint8Array(ciphertext)))
+        };
+      },
+
+      async decrypt(encryptedObj, key) {
+        const dec = new TextDecoder();
+        const iv = Uint8Array.from(atob(encryptedObj.iv), c => c.charCodeAt(0));
+        const cipher = Uint8Array.from(atob(encryptedObj.cipher), c => c.charCodeAt(0));
+        const decrypted = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: iv },
+          key,
+          cipher
+        );
+        return JSON.parse(dec.decode(decrypted));
+      }
+    };
+
+    createApp({
+      setup() {
+        const currentUser = ref(null);
+        const loginForm = ref({ username: '', password: '', pin: '1234' });
+        const isLoggingIn = ref(false);
+        const isOnline = ref(navigator.onLine);
+
+        // PIN & СЕЙФ
+        const hasEncryptedVault = ref(false);
+        const isUnlocked = ref(false);
+        const pinInput = ref('');
+        const pinError = ref(false);
+        let currentVaultKey = null;
+
+        const ownerTab = ref('inbox');
+        const deputyTab = ref('inbox');
+        const empTab = ref('active');
+        const isRecording = ref(false);
+        const isProcessing = ref(false);
+        const recordSeconds = ref(0);
+        const textInput = ref('');
+        const editDrafts = ref({});
+        const sseConnected = ref(false);
+        let timerInterval = null;
+
+        // ФИЛЬТРЫ
+        const filterProject = ref('ALL');
+        const filterPriority = ref('ALL');
+        const filterExecutor = ref('ALL');
+        const filterUrgentOnly = ref(false);
+
+        // МОДАЛЬНЫЕ ОКНА
+        const editingDetailsTask = ref(null);
+        const editDetailsForm = ref({
+          title: '', ai_summary: '', definition_of_done: '', project_group: '', priority: '', deadline: '', old_deadline_str: ''
+        });
+
+        const managingTeamTask = ref(null);
+        const teamManageForm = ref({
+          lead_id: null, assignee_ids: []
+        });
+
+        const tasks = ref([]);
+        const users = ref([]);
+        let mediaRecorder = null;
+        let audioChunks = [];
+
+        // ЧАТ
+        const activeChatTask = ref(null);
+        const chatMessages = ref([]);
+        const chatInput = ref('');
+        const isChatLoading = ref(false);
+        const chatContainer = ref(null);
+        const previewImageUrl = ref(null);
+        const userScrolledUp = ref(false);
+        const newMessagesBelowCount = ref(0);
+
+        // ОФЛАЙН ОЧЕРЕДЬ
+        const pendingQueue = ref([]);
+        let isFlushingQueue = false;
+
+        // ГОЛОС
+        const isRecordingVoice = ref(false);
+        const recordVoiceSeconds = ref(0);
+        const recordedVoiceBlob = ref(null);
+        const recordedVoiceUrl = ref(null);
+        let chatVoiceRecorder = null;
+        let chatVoiceChunks = [];
+        let chatVoiceTimer = null;
+        let chatVoiceStream = null;
+
+        // ПЛЕЕР
+        const activeAudioId = ref(null);
+        const isAudioPlaying = ref(false);
+        const audioCurrentTime = ref(0);
+        const audioDuration = ref(0);
+        const audioProgress = ref(0);
+        let globalAudio = null;
+        const voiceBlobCache = {};
+
+        const roleBadgeTitle = computed(() => {
+          if (!currentUser.value) return '';
+          if (currentUser.value.role === 'OWNER') return 'Шеф (Владелец)';
+          if (currentUser.value.role === 'DEPUTY') return 'Директор (Управление)';
+          return 'Исполнитель команды';
+        });
+
+        const employeesOnly = computed(() => users.value.filter(u => u.role === 'EMPLOYEE'));
+
+        const selectedAssigneesObjects = computed(() => {
+          return employeesOnly.value.filter(u => teamManageForm.value.assignee_ids.includes(u.id));
+        });
+
+        const hasActiveFilters = computed(() => {
+          return filterProject.value !== 'ALL' || filterPriority.value !== 'ALL' || filterExecutor.value !== 'ALL' || filterUrgentOnly.value;
+        });
+
+        const resetFilters = () => {
+          filterProject.value = 'ALL';
+          filterPriority.value = 'ALL';
+          filterExecutor.value = 'ALL';
+          filterUrgentOnly.value = false;
+        };
+
+        const applyTaskFilters = (taskList) => {
+          return taskList.filter(t => {
+            if (filterProject.value !== 'ALL' && t.project_group !== filterProject.value) return false;
+            if (filterPriority.value !== 'ALL' && t.priority !== filterPriority.value) return false;
+            if (filterExecutor.value !== 'ALL') {
+              const execId = parseInt(filterExecutor.value);
+              const isMatch = t.lead_user_id === execId || (t.assignee_ids && t.assignee_ids.includes(execId));
+              if (!isMatch) return false;
+            }
+            if (filterUrgentOnly.value) {
+              if (!t.deadline) return false;
+              const diff = new Date(t.deadline).getTime() - Date.now();
+              if (diff > 4 * 3600 * 1000) return false;
+            }
+            return true;
+          });
+        };
+
+        const inboxTasks = computed(() => tasks.value.filter(t => t.status === 'DRAFT'));
+        const activeTasks = computed(() => tasks.value.filter(t => t.status === 'IN_PROGRESS'));
+        const archiveTasks = computed(() => tasks.value.filter(t => t.status === 'ARCHIVED'));
+
+        const displayedOwnerTasks = computed(() => {
+          if (ownerTab.value === 'inbox') return inboxTasks.value;
+          if (ownerTab.value === 'active') return activeTasks.value;
+          return archiveTasks.value;
+        });
+        const filteredOwnerTasks = computed(() => applyTaskFilters(displayedOwnerTasks.value));
+
+        const displayedDeputyTasks = computed(() => {
+          if (deputyTab.value === 'inbox') return inboxTasks.value;
+          if (deputyTab.value === 'active') return activeTasks.value;
+          return archiveTasks.value;
+        });
+        const filteredDeputyTasks = computed(() => applyTaskFilters(displayedDeputyTasks.value));
+
+        const myTasks = computed(() => tasks.value.filter(t => {
+          if (!currentUser.value) return false;
+          return t.lead_user_id === currentUser.value.id || (t.assignee_ids && t.assignee_ids.includes(currentUser.value.id));
+        }));
+        const myActiveTasks = computed(() => myTasks.value.filter(t => t.status === 'IN_PROGRESS'));
+        const myArchiveTasks = computed(() => myTasks.value.filter(t => t.status === 'ARCHIVED'));
+
+        const displayedEmpTasks = computed(() => {
+          if (empTab.value === 'active') return myActiveTasks.value;
+          return myArchiveTasks.value;
+        });
+        const filteredEmpTasks = computed(() => applyTaskFilters(displayedEmpTasks.value));
+
+        const isMyMessage = (m) => {
+          if (!currentUser.value) return false;
+          return m.sender_id === currentUser.value.id;
+        };
+
+        const isPendingMessage = (m) => {
+          return m.status === 'pending' || String(m.id).startsWith('temp_');
+        };
+
+        const ensureLeadInAssignees = (taskId) => {
+          const draft = editDrafts.value[taskId];
+          if (draft && draft.lead_id && !draft.assignee_ids.includes(draft.lead_id)) {
+            draft.assignee_ids.push(draft.lead_id);
+          }
+        };
+
+        const formatLocalDT = (isoStr) => {
+          if (!isoStr) return '';
+          const d = new Date(isoStr);
+          if (isNaN(d.getTime())) return '';
+          return d.toLocaleString('ru-RU', {
+            day: 'numeric',
+            month: 'short',
+            hour: '2-digit',
+            minute: '2-digit'
+          });
+        };
+
+        const formatLocalTimeOnly = (isoStr) => {
+          if (!isoStr) return '';
+          const d = new Date(isoStr);
+          if (isNaN(d.getTime())) return '';
+          return d.toLocaleTimeString('ru-RU', {
+            hour: '2-digit',
+            minute: '2-digit'
+          });
+        };
+
+        const formatAudioTime = (seconds) => {
+          if (!seconds || isNaN(seconds)) return '0:00';
+          const s = Math.floor(seconds);
+          const mins = Math.floor(s / 60);
+          const secs = s % 60;
+          return `${mins}:${secs.toString().padStart(2, '0')}`;
+        };
+
+        const getDefaultLocalDateTimeInput = () => {
+          const now = new Date();
+          const offset = now.getTimezoneOffset() * 60000;
+          return new Date(now.getTime() - offset).toISOString().slice(0, 16);
+        };
+
+        const getWaveformBars = (id) => {
+          const count = 28;
+          const bars = [];
+          let seed = ((typeof id === 'number' ? id : 42) * 9301 + 49297) % 233280;
+          for (let i = 0; i < count; i++) {
+            seed = (seed * 9301 + 49297) % 233280;
+            const rnd = seed / 233280;
+            const h = Math.floor(25 + Math.sin(i * 0.45) * 20 + rnd * 55);
+            bars.push(Math.min(100, Math.max(15, h)));
+          }
+          return bars;
+        };
+
+        const resolveAudioUrl = async (url) => {
+          if (!url) return '';
+          if (url.startsWith('data:') || url.startsWith('blob:')) return url;
+          if (voiceBlobCache[url]) return voiceBlobCache[url];
+          try {
+            const res = await fetch(url);
+            const blob = await res.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            voiceBlobCache[url] = blobUrl;
+            return blobUrl;
+          } catch (e) {
+            return url;
+          }
+        };
+
+        const playAudioAt = async (id, rawUrl, targetRatio = null) => {
+          const url = await resolveAudioUrl(rawUrl);
+
+          if (activeAudioId.value === id && globalAudio) {
+            if (targetRatio !== null && globalAudio.duration && !isNaN(globalAudio.duration)) {
+              globalAudio.currentTime = targetRatio * globalAudio.duration;
+              audioCurrentTime.value = globalAudio.currentTime;
+              audioProgress.value = targetRatio;
+            }
+            if (!isAudioPlaying.value) {
+              globalAudio.play().catch(() => {});
+              isAudioPlaying.value = true;
+            }
+            return;
+          }
+
+          if (globalAudio) {
+            globalAudio.pause();
+            globalAudio.src = '';
+            globalAudio = null;
+          }
+
+          activeAudioId.value = id;
+          isAudioPlaying.value = true;
+          audioCurrentTime.value = 0;
+          audioProgress.value = targetRatio || 0;
+
+          globalAudio = new Audio(url);
+
+          const applyTargetTime = () => {
+            if (globalAudio && globalAudio.duration && !isNaN(globalAudio.duration)) {
+              audioDuration.value = globalAudio.duration;
+              if (targetRatio !== null) {
+                globalAudio.currentTime = targetRatio * globalAudio.duration;
+                audioCurrentTime.value = globalAudio.currentTime;
+              }
+            }
+          };
+
+          globalAudio.onloadedmetadata = applyTargetTime;
+          globalAudio.oncanplay = applyTargetTime;
+
+          globalAudio.ontimeupdate = () => {
+            if (globalAudio && globalAudio.duration && !isNaN(globalAudio.duration)) {
+              audioCurrentTime.value = globalAudio.currentTime;
+              audioDuration.value = globalAudio.duration;
+              audioProgress.value = globalAudio.currentTime / globalAudio.duration;
+            }
+          };
+
+          globalAudio.onended = () => {
+            isAudioPlaying.value = false;
+            audioProgress.value = 0;
+            audioCurrentTime.value = 0;
+          };
+
+          globalAudio.play().catch(e => {
+            console.error("Audio playback error:", e);
+            isAudioPlaying.value = false;
+          });
+        };
+
+        const togglePlayAudio = (id, url) => {
+          if (activeAudioId.value === id && globalAudio) {
+            if (isAudioPlaying.value) {
+              globalAudio.pause();
+              isAudioPlaying.value = false;
+            } else {
+              globalAudio.play().catch(() => {});
+              isAudioPlaying.value = true;
+            }
+            return;
+          }
+          playAudioAt(id, url, null);
+        };
+
+        const seekAudio = (id, url, event) => {
+          event.stopPropagation();
+          const rect = event.currentTarget.getBoundingClientRect();
+          const clickX = event.clientX - rect.left;
+          const ratio = Math.max(0, Math.min(1, clickX / rect.width));
+          playAudioAt(id, url, ratio);
+        };
+
+        const handleTouchSeek = (id, url, event) => {
+          event.stopPropagation();
+          if (event.touches && event.touches[0]) {
+            const touch = event.touches[0];
+            const rect = event.currentTarget.getBoundingClientRect();
+            const touchX = touch.clientX - rect.left;
+            const ratio = Math.max(0, Math.min(1, touchX / rect.width));
+            playAudioAt(id, url, ratio);
+          }
+        };
+
+        const saveEncryptedVault = async (dataPayload) => {
+          if (!currentVaultKey) return;
+          try {
+            const encrypted = await CryptoEngine.encrypt(dataPayload, currentVaultKey);
+            localStorage.setItem('task_encrypted_vault', JSON.stringify(encrypted));
+          } catch (e) {
+            console.error("Vault encrypt error:", e);
+          }
+        };
+
+        const handleLogin = async () => {
+          if (!loginForm.value.pin || loginForm.value.pin.length !== 4) {
+            alert('⚠️ Введите 4-значный PIN для создания сейфа');
+            return;
+          }
+          isLoggingIn.value = true;
+          try {
+            const fd = new FormData();
+            fd.append('username', loginForm.value.username);
+            fd.append('password', loginForm.value.password);
+            const res = await fetch('/api/login', { method: 'POST', body: fd });
+            if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.detail || 'Ошибка входа');
+            }
+            const data = await res.json();
+            currentUser.value = data.user;
+
+            const { key, saltBase64 } = await CryptoEngine.deriveKey(loginForm.value.pin, null);
+            currentVaultKey = key;
+            localStorage.setItem('task_vault_salt', saltBase64);
+
+            const verificationCipher = await CryptoEngine.encrypt({ check: 'VAULT_OK' }, key);
+            localStorage.setItem('task_vault_verifier', JSON.stringify(verificationCipher));
+
+            hasEncryptedVault.value = true;
+            isUnlocked.value = true;
+
+            await loadData();
+            await saveEncryptedVault({ user: data.user, tasks: tasks.value });
+          } catch (e) {
+            alert('❌ ' + e.message);
+          } finally {
+            isLoggingIn.value = false;
+          }
+        };
+
+        const pressPinDigit = async (d) => {
+          if (pinInput.value.length >= 4) return;
+          pinInput.value += d;
+          pinError.value = false;
+
+          if (pinInput.value.length === 4) {
+            await tryUnlockWithPin(pinInput.value);
+          }
+        };
+
+        const backspacePin = () => {
+          pinInput.value = pinInput.value.slice(0, -1);
+          pinError.value = false;
+        };
+
+        const clearPin = () => {
+          pinInput.value = '';
+          pinError.value = false;
+        };
+
+        const tryUnlockWithPin = async (pin) => {
+          try {
+            const salt = localStorage.getItem('task_vault_salt');
+            const verifierRaw = localStorage.getItem('task_vault_verifier');
+            const vaultRaw = localStorage.getItem('task_encrypted_vault');
+
+            if (!salt || !verifierRaw || !vaultRaw) {
+              resetVaultAndRelogin();
+              return;
+            }
+
+            const { key } = await CryptoEngine.deriveKey(pin, salt);
+            const verifier = JSON.parse(verifierRaw);
+            const verified = await CryptoEngine.decrypt(verifier, key);
+
+            if (verified && verified.check === 'VAULT_OK') {
+              currentVaultKey = key;
+              const decryptedVault = await CryptoEngine.decrypt(JSON.parse(vaultRaw), key);
+
+              currentUser.value = decryptedVault.user;
+              tasks.value = decryptedVault.tasks || [];
+              isUnlocked.value = true;
+
+              loadData();
+            } else {
+              throw new Error("Invalid PIN");
+            }
+          } catch (e) {
+            pinError.value = true;
+            pinInput.value = '';
+          }
+        };
+
+        const resetVaultAndRelogin = () => {
+          localStorage.removeItem('task_vault_salt');
+          localStorage.removeItem('task_vault_verifier');
+          localStorage.removeItem('task_encrypted_vault');
+          hasEncryptedVault.value = false;
+          isUnlocked.value = false;
+          currentUser.value = null;
+          pinInput.value = '';
+          currentVaultKey = null;
+        };
+
+        const handleLogout = () => {
+          if (globalAudio) {
+            globalAudio.pause();
+            globalAudio.src = '';
+            globalAudio = null;
+          }
+          resetVaultAndRelogin();
+        };
+
+        const loadData = async () => {
+          if (!currentUser.value) return;
+          try {
+            const [rTasks, rUsers] = await Promise.all([
+              fetch(`/api/tasks?viewer_user_id=${currentUser.value.id}`).then(r => r.json()),
+              fetch('/api/users').then(r => r.json())
+            ]);
+            tasks.value = rTasks;
+            users.value = rUsers;
+            
+            const empList = rUsers.filter(u => u.role === 'EMPLOYEE');
+            const defaultDL = getDefaultLocalDateTimeInput();
+            const defaultLeadId = empList[0]?.id || 3;
+
+            rTasks.forEach(t => {
+              if (!editDrafts.value[t.id]) {
+                let initialDL = defaultDL;
+                if (t.deadline) {
+                  const d = new Date(t.deadline);
+                  const offset = d.getTimezoneOffset() * 60000;
+                  initialDL = new Date(d.getTime() - offset).toISOString().slice(0, 16);
+                }
+                const curLead = t.lead_user_id || defaultLeadId;
+                const curAssignees = (t.assignee_ids && t.assignee_ids.length > 0) ? [...t.assignee_ids] : [curLead];
+
+                editDrafts.value[t.id] = {
+                  title: t.title,
+                  ai_summary: t.ai_summary,
+                  definition_of_done: t.definition_of_done,
+                  priority: t.priority || 'URGENT',
+                  project_group: t.project_group || 'Проект Кормовая Мука',
+                  lead_id: curLead,
+                  assignee_ids: curAssignees,
+                  deadline: initialDL
+                };
+              }
+            });
+
+            if (currentVaultKey) {
+              await saveEncryptedVault({ user: currentUser.value, tasks: tasks.value });
+            }
+          } catch (e) {
+            console.error("Sync error:", e);
+          }
+        };
+
+        const setupSSE = () => {
+          const evtSource = new EventSource('/api/events');
+          evtSource.onopen = () => { sseConnected.value = true; };
+          evtSource.onmessage = () => {
+            loadData();
+            if (activeChatTask.value) {
+              loadMessages(false);
+            }
+          };
+          evtSource.onerror = () => {
+            sseConnected.value = false;
+            evtSource.close();
+            setTimeout(setupSSE, 5000);
+          };
+        };
+
+        // СОЗДАНИЕ ЗАДАЧИ АВТОРОМ (ШЕФОМ ИЛИ ДИРЕКТОРОМ)
+        const toggleRecord = async () => {
+          if (!isRecording.value) {
+            try {
+              const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+              mediaRecorder = new MediaRecorder(stream);
+              audioChunks = [];
+              recordSeconds.value = 0;
+              timerInterval = setInterval(() => recordSeconds.value++, 1000);
+
+              mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+              mediaRecorder.onstop = async () => {
+                clearInterval(timerInterval);
+                isProcessing.value = true;
+                const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                const fd = new FormData();
+                fd.append('audio', blob, 'recording.webm');
+                fd.append('user_id', currentUser.value.id);
+
+                try {
+                  const res = await fetch('/api/tasks/create-voice', { method: 'POST', body: fd });
+                  if (!res.ok) throw new Error('Ошибка создания');
+                  await loadData();
+                  alert('✅ Поручение создано и добавлено во Входящие!');
+                } catch (err) {
+                  alert('❌ ' + err.message);
+                } finally {
+                  isProcessing.value = false;
+                }
+              };
+
+              mediaRecorder.start();
+              isRecording.value = true;
+            } catch (err) {
+              alert('Разрешите доступ к микрофону в браузере!');
+            }
+          } else {
+            mediaRecorder.stop();
+            isRecording.value = false;
+          }
+        };
+
+        const sendTextTask = async () => {
+          if (!textInput.value.trim()) return;
+          isProcessing.value = true;
+          const fd = new FormData();
+          fd.append('text', textInput.value);
+          fd.append('user_id', currentUser.value.id);
+          try {
+            const res = await fetch('/api/tasks/create-text', { method: 'POST', body: fd });
+            if (!res.ok) throw new Error('Ошибка создания');
+            textInput.value = '';
+            await loadData();
+            alert('✅ Поручение создано и добавлено во Входящие!');
+          } catch (e) {
+            alert('❌ ' + e.message);
+          } finally {
+            isProcessing.value = false;
+          }
+        };
+
+        const assignTask = async (id) => {
+          const draft = editDrafts.value[id] || {};
+          const fd = new FormData();
+          const leadId = draft.lead_id || employeesOnly.value[0]?.id || 3;
+          let assignees = Array.isArray(draft.assignee_ids) ? [...draft.assignee_ids] : [leadId];
+          if (!assignees.includes(leadId)) assignees.push(leadId);
+
+          fd.append('lead_id', leadId);
+          fd.append('assignee_ids', JSON.stringify(assignees));
+          fd.append('project_group', draft.project_group || 'Проект Кормовая Мука');
+          fd.append('priority', draft.priority || 'URGENT');
+          
+          const d = new Date(draft.deadline);
+          const deadlineIso = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+          fd.append('deadline', deadlineIso);
+          
+          fd.append('title', draft.title || '');
+          fd.append('ai_summary', draft.ai_summary || '');
+          fd.append('definition_of_done', draft.definition_of_done || '');
+
+          try {
+            const res = await fetch(`/api/tasks/${id}/assign`, { method: 'POST', body: fd });
+            if (!res.ok) throw new Error('Ошибка назначения');
+            await loadData();
+            deputyTab.value = 'active';
+            alert('🚀 Задача утверждена и передана команде!');
+          } catch (e) {
+            alert('❌ ' + e.message);
+          }
+        };
+
+        const openEditDetailsModal = (task) => {
+          editingDetailsTask.value = task;
+          let initialDL = getDefaultLocalDateTimeInput();
+          if (task.deadline) {
+            const d = new Date(task.deadline);
+            const offset = d.getTimezoneOffset() * 60000;
+            initialDL = new Date(d.getTime() - offset).toISOString().slice(0, 16);
+          }
+          editDetailsForm.value = {
+            title: task.title,
+            ai_summary: task.ai_summary,
+            definition_of_done: task.definition_of_done,
+            project_group: task.project_group || 'Проект Кормовая Мука',
+            priority: task.priority || 'URGENT',
+            deadline: initialDL,
+            old_deadline_str: task.deadline ? formatLocalDT(task.deadline) : 'Не установлен'
+          };
+        };
+
+        const saveTaskDetails = async () => {
+          if (!editingDetailsTask.value) return;
+          const fd = new FormData();
+          fd.append('title', editDetailsForm.value.title);
+          fd.append('ai_summary', editDetailsForm.value.ai_summary);
+          fd.append('definition_of_done', editDetailsForm.value.definition_of_done);
+          fd.append('project_group', editDetailsForm.value.project_group);
+          fd.append('priority', editDetailsForm.value.priority);
+          
+          const d = new Date(editDetailsForm.value.deadline);
+          const deadlineIso = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+          fd.append('deadline', deadlineIso);
+          
+          fd.append('formatted_old_deadline', editDetailsForm.value.old_deadline_str);
+          fd.append('formatted_new_deadline', formatLocalDT(deadlineIso));
+          fd.append('user_name', currentUser.value.full_name);
+
+          try {
+            const res = await fetch(`/api/tasks/${editingDetailsTask.value.id}/update-details`, { method: 'POST', body: fd });
+            if (!res.ok) throw new Error('Ошибка обновления параметров');
+            editingDetailsTask.value = null;
+            await loadData();
+            alert('✅ Детали задачи обновлены, история изменений отправлена в чат!');
+          } catch (e) {
+            alert('❌ ' + e.message);
+          }
+        };
+
+        const openManageTeamModal = (task) => {
+          managingTeamTask.value = task;
+          const currentAssignees = (task.assignee_ids && task.assignee_ids.length > 0) ? [...task.assignee_ids] : [task.lead_user_id];
+          teamManageForm.value = {
+            lead_id: task.lead_user_id,
+            assignee_ids: currentAssignees
+          };
+        };
+
+        const onAssigneeCheckboxChange = (uncheckId) => {
+          if (teamManageForm.value.assignee_ids.length === 0) {
+            teamManageForm.value.assignee_ids.push(uncheckId);
+            alert('⚠️ В задаче должен оставаться минимум 1 исполнитель!');
+            return;
+          }
+          if (!teamManageForm.value.assignee_ids.includes(teamManageForm.value.lead_id)) {
+            teamManageForm.value.lead_id = teamManageForm.value.assignee_ids[0];
+          }
+        };
+
+        const saveTaskTeam = async () => {
+          if (!managingTeamTask.value) return;
+          if (teamManageForm.value.assignee_ids.length === 0) {
+            alert('⚠️ Выберите хотя бы одного исполнителя!');
+            return;
+          }
+          if (!teamManageForm.value.assignee_ids.includes(teamManageForm.value.lead_id)) {
+            teamManageForm.value.lead_id = teamManageForm.value.assignee_ids[0];
+          }
+
+          const fd = new FormData();
+          fd.append('lead_id', teamManageForm.value.lead_id);
+          fd.append('assignee_ids', JSON.stringify(teamManageForm.value.assignee_ids));
+          fd.append('user_name', currentUser.value.full_name);
+
+          try {
+            const res = await fetch(`/api/tasks/${managingTeamTask.value.id}/update-team`, { method: 'POST', body: fd });
+            if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.detail || 'Ошибка обновления команды');
+            }
+            managingTeamTask.value = null;
+            await loadData();
+            alert('👥 Состав команды обновлен, отчет отправлен в чат задачи!');
+          } catch (e) {
+            alert('❌ ' + e.message);
+          }
+        };
+
+        const setDirectStage = async (taskId, stage) => {
+          const label = stage === 'ARCHIVE' ? 'в архив' : `на ${stage}%`;
+          if (!confirm(`Перевести задачу ${label}?`)) return;
+          const fd = new FormData();
+          fd.append('stage', stage);
+          fd.append('user_name', currentUser.value.full_name);
+          await fetch(`/api/tasks/${taskId}/set-stage`, { method: 'POST', body: fd });
+          await loadData();
+        };
+
+        const requestStage = async (taskId, stage) => {
+          const label = stage === 'ARCHIVE' ? 'сдачу в архив' : `этап ${stage}%`;
+          if (!confirm(`Отправить запрос Жамолиддину на ${label}?`)) return;
+          const fd = new FormData();
+          fd.append('stage', stage);
+          fd.append('user_id', currentUser.value.id);
+          fd.append('user_name', currentUser.value.full_name);
+          const res = await fetch(`/api/tasks/${taskId}/request-stage`, { method: 'POST', body: fd });
+          if (!res.ok) {
+            const err = await res.json();
+            alert('❌ ' + (err.detail || 'Ошибка отправки запроса'));
+            return;
+          }
+          await loadData();
+          alert('📌 Запрос успешно отправлен Директору!');
+        };
+
+        const confirmStageRequest = async (taskId, approve) => {
+          const fd = new FormData();
+          fd.append('approve', approve);
+          fd.append('user_name', currentUser.value.full_name);
+          await fetch(`/api/tasks/${taskId}/confirm-stage-request`, { method: 'POST', body: fd });
+          await loadData();
+        };
+
+        const onChatScroll = () => {
+          if (!chatContainer.value) return;
+          const { scrollTop, scrollHeight, clientHeight } = chatContainer.value;
+          userScrolledUp.value = (scrollHeight - scrollTop - clientHeight) > 60;
+          if (!userScrolledUp.value) {
+            newMessagesBelowCount.value = 0;
+          }
+        };
+
+        const scrollToBottomSmooth = () => {
+          if (chatContainer.value) {
+            chatContainer.value.scrollTo({
+              top: chatContainer.value.scrollHeight,
+              behavior: 'smooth'
+            });
+            userScrolledUp.value = false;
+            newMessagesBelowCount.value = 0;
+          }
+        };
+
+        const openChat = async (task) => {
+          activeChatTask.value = task;
+          chatMessages.value = [];
+          isChatLoading.value = true;
+          userScrolledUp.value = false;
+          newMessagesBelowCount.value = 0;
+          cancelVoiceRecording();
+          document.body.classList.add('overflow-hidden');
+          task.unread_count = 0;
+          
+          await loadMessages(true);
+          isChatLoading.value = false;
+        };
+
+        const closeChat = () => {
+          if (globalAudio) {
+            globalAudio.pause();
+            globalAudio.src = '';
+            globalAudio = null;
+          }
+          activeAudioId.value = null;
+          isAudioPlaying.value = false;
+          activeChatTask.value = null;
+          cancelVoiceRecording();
+          document.body.classList.remove('overflow-hidden');
+          loadData();
+        };
+
+        const loadMessages = async (forceScrollBottom = false) => {
+          if (!activeChatTask.value || !currentUser.value) return;
+
+          try {
+            const res = await fetch(`/api/tasks/${activeChatTask.value.id}/messages?viewer_user_id=${currentUser.value.id}`);
+            const serverMsgs = await res.json();
+            
+            const currentPending = pendingQueue.value
+              .filter(q => q.taskId === activeChatTask.value.id)
+              .map(q => q.localMsg);
+
+            const combined = [...serverMsgs, ...currentPending];
+
+            const prevLen = chatMessages.value.length;
+            const newLen = combined.length;
+
+            chatMessages.value = combined;
+            await nextTick();
+
+            if (forceScrollBottom || !userScrolledUp.value) {
+              if (chatContainer.value) {
+                chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+              }
+            } else if (newLen > prevLen) {
+              newMessagesBelowCount.value += (newLen - prevLen);
+            }
+          } catch (e) {
+            console.error(e);
+          }
+        };
+
+        const flushPendingQueue = async () => {
+          if (isFlushingQueue || pendingQueue.value.length === 0) return;
+          isFlushingQueue = true;
+
+          try {
+            while (pendingQueue.value.length > 0) {
+              const item = pendingQueue.value[0];
+              try {
+                const res = await fetch(item.endpoint, { method: 'POST', body: item.formData });
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                
+                pendingQueue.value.shift();
+                if (activeChatTask.value && activeChatTask.value.id === item.taskId) {
+                  await loadMessages(false);
+                }
+              } catch (netErr) {
+                console.warn("Офлайн-режим. Сообщение сохранено в оперативной памяти:", netErr);
+                break;
+              }
+            }
+          } finally {
+            isFlushingQueue = false;
+          }
+        };
+
+        const sendChatMessage = async () => {
+          const text = chatInput.value.trim();
+          if (!text || !activeChatTask.value || !currentUser.value) return;
+
+          const tempId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+          const taskId = activeChatTask.value.id;
+
+          const localMsg = {
+            id: tempId,
+            task_id: taskId,
+            sender_id: currentUser.value.id,
+            sender_role: currentUser.value.role,
+            sender_name: currentUser.value.full_name,
+            message_type: 'TEXT',
+            content: text,
+            media_url: null,
+            created_at: new Date().toISOString(),
+            is_read: false,
+            status: 'pending'
+          };
+
+          chatMessages.value.push(localMsg);
+          chatInput.value = '';
+          userScrolledUp.value = false;
+          await nextTick();
+          if (chatContainer.value) chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+
+          const fd = new FormData();
+          fd.append('sender_id', currentUser.value.id);
+          fd.append('sender_role', currentUser.value.role);
+          fd.append('sender_name', currentUser.value.full_name);
+          fd.append('content', text);
+
+          pendingQueue.value.push({
+            tempId,
+            taskId,
+            endpoint: `/api/tasks/${taskId}/messages/text`,
+            formData: fd,
+            localMsg
+          });
+
+          flushPendingQueue();
+        };
+
+        const startVoiceRecording = async () => {
+          cancelVoiceRecording();
+          try {
+            chatVoiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            chatVoiceRecorder = new MediaRecorder(chatVoiceStream);
+            chatVoiceChunks = [];
+            recordVoiceSeconds.value = 0;
+            isRecordingVoice.value = true;
+
+            chatVoiceTimer = setInterval(() => recordVoiceSeconds.value++, 1000);
+
+            chatVoiceRecorder.ondataavailable = e => {
+              if (e.data.size > 0) chatVoiceChunks.push(e.data);
+            };
+
+            chatVoiceRecorder.onstop = () => {
+              if (chatVoiceTimer) clearInterval(chatVoiceTimer);
+              const blob = new Blob(chatVoiceChunks, { type: chatVoiceRecorder.mimeType || 'audio/webm' });
+              recordedVoiceBlob.value = blob;
+              recordedVoiceUrl.value = URL.createObjectURL(blob);
+              isRecordingVoice.value = false;
+
+              if (chatVoiceStream) {
+                chatVoiceStream.getTracks().forEach(t => t.stop());
+                chatVoiceStream = null;
+              }
+            };
+
+            chatVoiceRecorder.start();
+          } catch (err) {
+            alert('Разрешите доступ к микрофону для записи!');
+          }
+        };
+
+        const stopVoiceRecording = () => {
+          if (chatVoiceRecorder && isRecordingVoice.value && chatVoiceRecorder.state !== 'inactive') {
+            chatVoiceRecorder.stop();
+          }
+        };
+
+        const cancelVoiceRecording = () => {
+          if (chatVoiceTimer) {
+            clearInterval(chatVoiceTimer);
+            chatVoiceTimer = null;
+          }
+          if (chatVoiceRecorder && isRecordingVoice.value && chatVoiceRecorder.state !== 'inactive') {
+            chatVoiceRecorder.stop();
+          }
+          if (chatVoiceStream) {
+            chatVoiceStream.getTracks().forEach(t => t.stop());
+            chatVoiceStream = null;
+          }
+
+          if (globalAudio) {
+            globalAudio.pause();
+            globalAudio.src = '';
+            globalAudio = null;
+          }
+          if (activeAudioId.value === 'preview_voice') {
+            activeAudioId.value = null;
+            isAudioPlaying.value = false;
+            audioCurrentTime.value = 0;
+            audioProgress.value = 0;
+          }
+
+          isRecordingVoice.value = false;
+          recordVoiceSeconds.value = 0;
+          recordedVoiceBlob.value = null;
+          if (recordedVoiceUrl.value) {
+            URL.revokeObjectURL(recordedVoiceUrl.value);
+            recordedVoiceUrl.value = null;
+          }
+        };
+
+        const confirmSendVoice = async () => {
+          if (!recordedVoiceBlob.value || !activeChatTask.value || !currentUser.value) return;
+
+          const tempId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+          const taskId = activeChatTask.value.id;
+          const blob = recordedVoiceBlob.value;
+          const localUrl = recordedVoiceUrl.value;
+
+          const localMsg = {
+            id: tempId,
+            task_id: taskId,
+            sender_id: currentUser.value.id,
+            sender_role: currentUser.value.role,
+            sender_name: currentUser.value.full_name,
+            message_type: 'VOICE',
+            content: 'Голосовое сообщение',
+            media_url: localUrl,
+            created_at: new Date().toISOString(),
+            is_read: false,
+            status: 'pending'
+          };
+
+          chatMessages.value.push(localMsg);
+          
+          if (chatVoiceTimer) clearInterval(chatVoiceTimer);
+          isRecordingVoice.value = false;
+          recordVoiceSeconds.value = 0;
+          recordedVoiceBlob.value = null;
+          recordedVoiceUrl.value = null;
+
+          userScrolledUp.value = false;
+          await nextTick();
+          if (chatContainer.value) chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+
+          const fd = new FormData();
+          fd.append('sender_id', currentUser.value.id);
+          fd.append('sender_role', currentUser.value.role);
+          fd.append('sender_name', currentUser.value.full_name);
+          fd.append('audio', blob, 'voice.webm');
+
+          pendingQueue.value.push({
+            tempId,
+            taskId,
+            endpoint: `/api/tasks/${taskId}/messages/voice`,
+            formData: fd,
+            localMsg
+          });
+
+          flushPendingQueue();
+        };
+
+        const uploadChatImage = async (e) => {
+          const file = e.target.files[0];
+          if (!file || !activeChatTask.value || !currentUser.value) return;
+
+          const tempId = 'temp_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+          const taskId = activeChatTask.value.id;
+          const localUrl = URL.createObjectURL(file);
+
+          const localMsg = {
+            id: tempId,
+            task_id: taskId,
+            sender_id: currentUser.value.id,
+            sender_role: currentUser.value.role,
+            sender_name: currentUser.value.full_name,
+            message_type: 'IMAGE',
+            content: 'Прикрепленное фото',
+            media_url: localUrl,
+            created_at: new Date().toISOString(),
+            is_read: false,
+            status: 'pending'
+          };
+
+          chatMessages.value.push(localMsg);
+          userScrolledUp.value = false;
+          await nextTick();
+          if (chatContainer.value) chatContainer.value.scrollTop = chatContainer.value.scrollHeight;
+
+          const fd = new FormData();
+          fd.append('sender_id', currentUser.value.id);
+          fd.append('sender_role', currentUser.value.role);
+          fd.append('sender_name', currentUser.value.full_name);
+          fd.append('file', file);
+
+          pendingQueue.value.push({
+            tempId,
+            taskId,
+            endpoint: `/api/tasks/${taskId}/messages/image`,
+            formData: fd,
+            localMsg
+          });
+
+          flushPendingQueue();
+        };
+
+        const openImageLightbox = (url) => {
+          previewImageUrl.value = url;
+        };
+
+        const sendRedFlag = async (id) => {
+          const r = prompt('В чем причина блокера?');
+          if (!r) return;
+          const fd = new FormData();
+          fd.append('reason', r);
+          fd.append('sender_id', currentUser.value.id);
+          fd.append('sender_name', currentUser.value.full_name);
+          await fetch(`/api/tasks/${id}/red-flag`, { method: 'POST', body: fd });
+          await loadData();
+          alert('🚨 Red Flag отправлен Жамолиддину!');
+        };
+
+        const getDeadlineCountdown = (dlStr) => {
+          if (!dlStr) return 'Без срока';
+          const diff = new Date(dlStr).getTime() - Date.now();
+          if (diff <= 0) return 'Просрочено!';
+          const hours = Math.floor(diff / (1000 * 60 * 60));
+          const mins = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+          if (hours > 24) {
+            const days = Math.floor(hours / 24);
+            return `${days}д ${hours % 24}ч`;
+          }
+          return `${hours}ч ${mins}м`;
+        };
+
+        const getDeadlineBadge = (dlStr) => {
+          if (!dlStr) return 'bg-slate-800 text-slate-400 border-slate-700';
+          const diff = new Date(dlStr).getTime() - Date.now();
+          if (diff <= 0) return 'bg-red-950 text-red-300 border-red-800 font-black animate-pulse';
+          if (diff < 1000 * 60 * 60 * 4) return 'bg-amber-950 text-amber-300 border-amber-800 font-bold';
+          return 'bg-emerald-950 text-emerald-300 border-emerald-800';
+        };
+
+        const priorityBadge = (p) => {
+          if (p === 'URGENT') return 'bg-red-950 text-red-300 border border-red-800/60';
+          if (p === 'NORMAL') return 'bg-amber-950 text-amber-300 border border-amber-800/60';
+          return 'bg-blue-950 text-blue-300 border border-blue-800/60';
+        };
+
+        const priorityLabel = (p) => {
+          if (p === 'URGENT') return '🔴 Оперативно';
+          if (p === 'NORMAL') return '🟡 Умеренно';
+          return '🔵 На будущее';
+        };
+
+        const formatRoleName = (r) => r === 'OWNER' ? 'Шеф' : (r === 'DEPUTY' ? 'Директор' : 'Исполнитель');
+        const formatTime = (s) => `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
+
+        onMounted(() => {
+          const salt = localStorage.getItem('task_vault_salt');
+          const vault = localStorage.getItem('task_encrypted_vault');
+          if (salt && vault) {
+            hasEncryptedVault.value = true;
+          }
+
+          setupSSE();
+
+          window.addEventListener('online', () => {
+            isOnline.value = true;
+            flushPendingQueue();
+            loadData();
+          });
+          window.addEventListener('offline', () => {
+            isOnline.value = false;
+          });
+          document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') {
+              flushPendingQueue();
+              loadData();
+            }
+          });
+          setInterval(flushPendingQueue, 4000);
+        });
+
+        return {
+          currentUser, loginForm, isLoggingIn, isOnline, hasEncryptedVault, isUnlocked, pinInput, pinError,
+          pressPinDigit, backspacePin, clearPin, resetVaultAndRelogin,
+          ownerTab, deputyTab, empTab, isRecording, isProcessing,
+          recordSeconds, textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
+          filterProject, filterPriority, filterExecutor, filterUrgentOnly, hasActiveFilters, resetFilters,
+          editingDetailsTask, editDetailsForm, openEditDetailsModal, saveTaskDetails,
+          managingTeamTask, teamManageForm, selectedAssigneesObjects, openManageTeamModal, onAssigneeCheckboxChange, saveTaskTeam,
+          inboxTasks, activeTasks, archiveTasks,
+          filteredOwnerTasks, filteredDeputyTasks, filteredEmpTasks,
+          myActiveTasks, myArchiveTasks, isMyMessage, isPendingMessage,
+          activeChatTask, chatMessages, chatInput, isChatLoading, chatContainer, previewImageUrl,
+          isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl, userScrolledUp, newMessagesBelowCount,
+          activeAudioId, isAudioPlaying, audioCurrentTime, audioDuration, audioProgress,
+          togglePlayAudio, seekAudio, handleTouchSeek, getWaveformBars, formatAudioTime,
+          handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, setDirectStage, requestStage, confirmStageRequest,
+          ensureLeadInAssignees,
+          openChat, closeChat, sendChatMessage, uploadChatImage, openImageLightbox,
+          startVoiceRecording, stopVoiceRecording, cancelVoiceRecording, confirmSendVoice, sendRedFlag,
+          onChatScroll, scrollToBottomSmooth,
+          formatLocalDT, formatLocalTimeOnly,
+          getDeadlineCountdown, getDeadlineBadge, priorityBadge, priorityLabel,
+          formatRoleName, formatTime
+        };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>"""
