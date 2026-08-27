@@ -226,7 +226,6 @@ def query_gemini_direct(parts_list: list) -> dict:
             "project_group": "Проект Кормовая Мука"
         }
 
-    # Актуальные модели Gemini
     models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
     
     for model_name in models:
@@ -403,6 +402,24 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+
+# УДАЛЕНИЕ ВХОДЯЩЕЙ ЗАДАЧИ АВТОРОМ С ПРОВЕРКОЙ ПРАВ
+@app.post("/api/tasks/{task_id}/delete")
+async def delete_task(task_id: int, user_id: int = Form(...)):
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        task = await conn.fetchrow("SELECT id, title, created_by, status FROM tasks WHERE id = $1", task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Задача не найдена")
+        if task['created_by'] != user_id:
+            raise HTTPException(status_code=403, detail="Вы можете удалять только лично созданные входящие поручения.")
+        if task['status'] != 'DRAFT':
+            raise HTTPException(status_code=400, detail="Удалять можно только поручения из раздела 'Входящие'.")
+        
+        await conn.execute("DELETE FROM tasks WHERE id = $1", task_id)
+
+    await broadcast_event("task_deleted")
+    return {"status": "ok"}
 
 @app.post("/api/tasks/{task_id}/assign")
 async def assign_task(
@@ -990,28 +1007,78 @@ async def index():
 
       <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
-        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ -->
-        <div class="bg-slate-900/90 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl backdrop-blur-md">
-          <h2 class="text-base font-bold text-white">Голосовое поручение</h2>
-          
-          <div class="flex justify-center py-1">
-            <button @click="toggleRecord" :class="isRecording ? 'bg-red-500 animate-pulse scale-105' : 'bg-indigo-600 active:scale-95'" class="w-20 h-20 rounded-full flex flex-col items-center justify-center text-white shadow-2xl transition duration-200">
-              <i :class="isRecording ? 'fa-solid fa-stop text-xl' : 'fa-solid fa-microphone text-2xl'"></i>
-              <span v-if="isRecording" class="text-[10px] font-mono font-bold mt-1">{{ formatTime(recordSeconds) }}</span>
+        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ ШЕФОМ (С ТЕЛЕГРАМ-ПОДОБНЫМ УПРАВЛЕНИЕМ) -->
+        <div class="bg-slate-900/90 border border-slate-800 p-4 rounded-3xl space-y-3.5 shadow-xl backdrop-blur-md">
+          <div class="flex items-center justify-between">
+            <h2 class="text-sm font-bold text-white flex items-center gap-1.5">
+              <i class="fa-solid fa-microphone text-indigo-400"></i> Голосовое поручение Шефа
+            </h2>
+            <span v-if="isRecordingTaskVoice" class="text-[11px] text-red-400 font-mono font-bold animate-pulse">
+              ● {{ formatTime(recordTaskVoiceSeconds) }}
+            </span>
+          </div>
+
+          <!-- 1.1 Панель предпрослушивания с волновой дорожкой -->
+          <div v-if="recordedTaskVoiceUrl" class="space-y-2.5 bg-slate-950 p-3 rounded-2xl border border-slate-800">
+            <div class="flex items-center gap-3">
+              <button @click="togglePlayAudio('preview_task_voice', recordedTaskVoiceUrl)" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
+                <i :class="activeAudioId === 'preview_task_voice' && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+              </button>
+              <div class="flex-1 space-y-1">
+                <div @click="seekAudio('preview_task_voice', recordedTaskVoiceUrl, $event)" @touchmove.prevent="handleTouchSeek('preview_task_voice', recordedTaskVoiceUrl, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div v-for="(h, idx) in getWaveformBars(888)" :key="idx" 
+                       :style="{ height: h + '%' }" 
+                       :class="(activeAudioId === 'preview_task_voice' && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                       class="w-1 rounded-full transition-colors pointer-events-none"></div>
+                </div>
+                <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                  <span>{{ activeAudioId === 'preview_task_voice' ? formatAudioTime(audioCurrentTime) : '0:00' }}</span>
+                  <span>{{ activeAudioId === 'preview_task_voice' ? formatAudioTime(audioDuration) : formatTime(recordTaskVoiceSeconds) }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2 pt-1">
+              <button @click="cancelTaskVoiceRecording" class="py-2.5 rounded-xl bg-red-950/60 hover:bg-red-900/80 border border-red-800/60 text-red-300 text-xs font-bold flex items-center justify-center gap-1.5 transition">
+                <i class="fa-solid fa-trash-can"></i> Удалить
+              </button>
+              <button @click="confirmSendTaskVoice" :disabled="isProcessing" class="py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white text-xs font-bold flex items-center justify-center gap-1.5 shadow transition">
+                <i v-if="isProcessing" class="fa-solid fa-circle-notch fa-spin"></i>
+                <i v-else class="fa-solid fa-bolt"></i>
+                <span>{{ isProcessing ? 'ИИ формирует ТЗ...' : 'Создать поручение (ИИ)' }}</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- 1.2 Панель активной записи -->
+          <div v-else-if="isRecordingTaskVoice" class="p-3 bg-slate-950 rounded-2xl border border-red-800/50 flex items-center justify-between animate-pulse">
+            <div class="flex items-center gap-2 text-xs font-bold text-red-400">
+              <div class="w-3 h-3 rounded-full bg-red-500 animate-ping"></div>
+              <span>Идет запись: {{ formatTime(recordTaskVoiceSeconds) }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button @click="cancelTaskVoiceRecording" class="w-8 h-8 rounded-xl bg-slate-800 text-slate-400 flex items-center justify-center text-xs hover:text-red-300">
+                <i class="fa-solid fa-xmark"></i>
+              </button>
+              <button @click="stopTaskVoiceRecording" class="px-3.5 py-2 rounded-xl bg-red-600 text-white text-xs font-bold flex items-center gap-1.5 shadow">
+                <i class="fa-solid fa-stop"></i> Завершить
+              </button>
+            </div>
+          </div>
+
+          <!-- 1.3 Кнопка старта записи -->
+          <div v-else class="flex flex-col items-center justify-center py-2 space-y-2">
+            <button @click="startTaskVoiceRecording" class="w-16 h-16 rounded-full bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white text-2xl shadow-xl shadow-indigo-600/30 flex items-center justify-center transition">
+              <i class="fa-solid fa-microphone"></i>
             </button>
+            <span class="text-[11px] text-slate-400">Нажмите микрофон для записи</span>
           </div>
 
-          <div v-if="isProcessing" class="text-xs text-indigo-400 font-semibold animate-pulse">
-            <i class="fa-solid fa-circle-notch fa-spin mr-1"></i> ИИ формирует ТЗ...
-          </div>
-          <p v-else class="text-[11px] font-semibold" :class="isRecording ? 'text-red-400' : 'text-slate-400'">
-            {{ isRecording ? 'Идет запись... Нажмите для завершения' : 'Нажмите микрофон и говорите' }}
-          </p>
-
-          <div class="pt-2.5 border-t border-slate-800 text-left space-y-1.5">
+          <!-- Текстовое поручение -->
+          <div class="pt-2 border-t border-slate-800 text-left space-y-1.5">
             <div class="flex gap-1.5">
               <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите поручение текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
-              <button @click="sendTextTask" class="bg-indigo-600 hover:bg-indigo-500 px-3 rounded-xl text-white font-bold text-xs">
+              <button @click="sendTextTask" :disabled="isProcessing" class="bg-indigo-600 hover:bg-indigo-500 px-3 rounded-xl text-white font-bold text-xs">
                 <i class="fa-solid fa-paper-plane"></i>
               </button>
             </div>
@@ -1042,9 +1109,15 @@ async def index():
             </div>
 
             <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
-            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5">
-              <i class="fa-solid fa-user-tie"></i>
-              <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center justify-between">
+              <div class="flex items-center gap-1.5">
+                <i class="fa-solid fa-user-tie"></i>
+                <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+              </div>
+              <!-- КНОПКА УДАЛЕНИЯ ТОЛЬКО СВОЕГО ВХОДЯЩЕГО ЗАДАНИЯ -->
+              <button v-if="t.status === 'DRAFT' && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
+                <i class="fa-solid fa-trash-can mr-1"></i> Удалить
+              </button>
             </div>
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
@@ -1122,31 +1195,78 @@ async def index():
 
       <!-- 2. КАБИНЕТ ДИРЕКТОРА (ЖАМОЛИДДИН) -->
       <div v-if="currentUser.role === 'DEPUTY'" class="space-y-4">
-        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ ДИРЕКТОРОМ -->
-        <div class="bg-slate-900/90 border border-slate-800 p-5 rounded-3xl text-center space-y-3.5 shadow-xl backdrop-blur-md">
-          <div class="flex items-center justify-center gap-2">
-            <i class="fa-solid fa-bolt text-amber-400"></i>
-            <h2 class="text-base font-bold text-white">Создать поручение (Директор)</h2>
+        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ ДИРЕКТОРОМ (С ТЕЛЕГРАМ-ПОДОБНЫМ УПРАВЛЕНИЕМ) -->
+        <div class="bg-slate-900/90 border border-slate-800 p-4 rounded-3xl space-y-3.5 shadow-xl backdrop-blur-md">
+          <div class="flex items-center justify-between">
+            <h2 class="text-sm font-bold text-white flex items-center gap-1.5">
+              <i class="fa-solid fa-bolt text-amber-400"></i> Создать поручение (Директор)
+            </h2>
+            <span v-if="isRecordingTaskVoice" class="text-[11px] text-amber-400 font-mono font-bold animate-pulse">
+              ● {{ formatTime(recordTaskVoiceSeconds) }}
+            </span>
           </div>
-          
-          <div class="flex justify-center py-1">
-            <button @click="toggleRecord" :class="isRecording ? 'bg-red-500 animate-pulse scale-105' : 'bg-gradient-to-tr from-amber-600 to-amber-500 active:scale-95'" class="w-20 h-20 rounded-full flex flex-col items-center justify-center text-white shadow-2xl transition duration-200">
-              <i :class="isRecording ? 'fa-solid fa-stop text-xl' : 'fa-solid fa-microphone text-2xl'"></i>
-              <span v-if="isRecording" class="text-[10px] font-mono font-bold mt-1">{{ formatTime(recordSeconds) }}</span>
+
+          <!-- 2.1 Панель предпрослушивания -->
+          <div v-if="recordedTaskVoiceUrl" class="space-y-2.5 bg-slate-950 p-3 rounded-2xl border border-slate-800">
+            <div class="flex items-center gap-3">
+              <button @click="togglePlayAudio('preview_task_voice', recordedTaskVoiceUrl)" class="w-10 h-10 rounded-full bg-amber-600 hover:bg-amber-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
+                <i :class="activeAudioId === 'preview_task_voice' && isAudioPlaying ? 'fa-solid fa-pause' : 'fa-solid fa-play ml-0.5'"></i>
+              </button>
+              <div class="flex-1 space-y-1">
+                <div @click="seekAudio('preview_task_voice', recordedTaskVoiceUrl, $event)" @touchmove.prevent="handleTouchSeek('preview_task_voice', recordedTaskVoiceUrl, $event)" class="h-6 flex items-center gap-0.5 cursor-pointer py-1">
+                  <div v-for="(h, idx) in getWaveformBars(888)" :key="idx" 
+                       :style="{ height: h + '%' }" 
+                       :class="(activeAudioId === 'preview_task_voice' && (idx / 28) <= audioProgress) ? 'bg-amber-400' : 'bg-slate-700'"
+                       class="w-1 rounded-full transition-colors pointer-events-none"></div>
+                </div>
+                <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                  <span>{{ activeAudioId === 'preview_task_voice' ? formatAudioTime(audioCurrentTime) : '0:00' }}</span>
+                  <span>{{ activeAudioId === 'preview_task_voice' ? formatAudioTime(audioDuration) : formatTime(recordTaskVoiceSeconds) }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2 pt-1">
+              <button @click="cancelTaskVoiceRecording" class="py-2.5 rounded-xl bg-red-950/60 hover:bg-red-900/80 border border-red-800/60 text-red-300 text-xs font-bold flex items-center justify-center gap-1.5 transition">
+                <i class="fa-solid fa-trash-can"></i> Удалить
+              </button>
+              <button @click="confirmSendTaskVoice" :disabled="isProcessing" class="py-2.5 rounded-xl bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-slate-950 font-black text-xs flex items-center justify-center gap-1.5 shadow transition">
+                <i v-if="isProcessing" class="fa-solid fa-circle-notch fa-spin"></i>
+                <i v-else class="fa-solid fa-bolt"></i>
+                <span>{{ isProcessing ? 'ИИ формирует ТЗ...' : 'Создать поручение (ИИ)' }}</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- 2.2 Панель активной записи -->
+          <div v-else-if="isRecordingTaskVoice" class="p-3 bg-slate-950 rounded-2xl border border-amber-500/50 flex items-center justify-between animate-pulse">
+            <div class="flex items-center gap-2 text-xs font-bold text-amber-400">
+              <div class="w-3 h-3 rounded-full bg-amber-500 animate-ping"></div>
+              <span>Идет запись: {{ formatTime(recordTaskVoiceSeconds) }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button @click="cancelTaskVoiceRecording" class="w-8 h-8 rounded-xl bg-slate-800 text-slate-400 flex items-center justify-center text-xs hover:text-red-300">
+                <i class="fa-solid fa-xmark"></i>
+              </button>
+              <button @click="stopTaskVoiceRecording" class="px-3.5 py-2 rounded-xl bg-amber-600 text-slate-950 font-black text-xs flex items-center gap-1.5 shadow">
+                <i class="fa-solid fa-stop"></i> Завершить
+              </button>
+            </div>
+          </div>
+
+          <!-- 2.3 Кнопка старта записи -->
+          <div v-else class="flex flex-col items-center justify-center py-2 space-y-2">
+            <button @click="startTaskVoiceRecording" class="w-16 h-16 rounded-full bg-gradient-to-tr from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 active:scale-95 text-white text-2xl shadow-xl shadow-amber-600/30 flex items-center justify-center transition">
+              <i class="fa-solid fa-microphone"></i>
             </button>
+            <span class="text-[11px] text-slate-400">Нажмите микрофон для записи</span>
           </div>
 
-          <div v-if="isProcessing" class="text-xs text-amber-400 font-semibold animate-pulse">
-            <i class="fa-solid fa-circle-notch fa-spin mr-1"></i> ИИ формирует ТЗ...
-          </div>
-          <p v-else class="text-[11px] font-semibold" :class="isRecording ? 'text-red-400' : 'text-slate-400'">
-            {{ isRecording ? 'Идет запись... Нажмите для завершения' : 'Нажмите микрофон и надиктуйте поручение' }}
-          </p>
-
-          <div class="pt-2.5 border-t border-slate-800 text-left space-y-1.5">
+          <!-- Текстовое поручение -->
+          <div class="pt-2 border-t border-slate-800 text-left space-y-1.5">
             <div class="flex gap-1.5">
-              <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите задачу текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-amber-500">
-              <button @click="sendTextTask" class="bg-amber-600 hover:bg-amber-500 px-3 rounded-xl text-white font-bold text-xs">
+              <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите поручение текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-amber-500">
+              <button @click="sendTextTask" :disabled="isProcessing" class="bg-amber-600 hover:bg-amber-500 px-3 rounded-xl text-slate-950 font-black text-xs">
                 <i class="fa-solid fa-paper-plane"></i>
               </button>
             </div>
@@ -1177,14 +1297,20 @@ async def index():
             </div>
 
             <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
-            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5">
-              <i class="fa-solid fa-user-tie"></i>
-              <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+            <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center justify-between">
+              <div class="flex items-center gap-1.5">
+                <i class="fa-solid fa-user-tie"></i>
+                <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
+              </div>
+              <!-- КНОПКА УДАЛЕНИЯ ТОЛЬКО СВОЕГО ВХОДЯЩЕГО ЗАДАНИЯ -->
+              <button v-if="t.status === 'DRAFT' && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
+                <i class="fa-solid fa-trash-can mr-1"></i> Удалить
+              </button>
             </div>
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПЛЕЕР ГОЛОСА АВТОРА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
+            <!-- ПЛЕЕР ГОЛОСА АВТОРА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1660,7 +1786,7 @@ async def index():
                   <div @click="seekAudio('msg_' + m.id, m.media_url, $event)" @touchmove.prevent="handleTouchSeek('msg_' + m.id, m.media_url, $event)" class="h-5 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(m.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
-                         :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
+                         :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? (isMyMessage(m) ? 'bg-white' : 'bg-indigo-400') : (isMyMessage(m) ? 'bg-indigo-400/50' : 'bg-slate-700')"
                          class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[9px] font-mono opacity-80">
@@ -1875,13 +2001,20 @@ async def index():
         const ownerTab = ref('inbox');
         const deputyTab = ref('inbox');
         const empTab = ref('active');
-        const isRecording = ref(false);
         const isProcessing = ref(false);
-        const recordSeconds = ref(0);
         const textInput = ref('');
         const editDrafts = ref({});
         const sseConnected = ref(false);
-        let timerInterval = null;
+
+        // ГОЛОСОВОЙ КОНТРОЛЬ ДЛЯ СОЗДАНИЯ ЗАДАЧИ
+        const isRecordingTaskVoice = ref(false);
+        const recordTaskVoiceSeconds = ref(0);
+        const recordedTaskVoiceBlob = ref(null);
+        const recordedTaskVoiceUrl = ref(null);
+        let taskVoiceRecorder = null;
+        let taskVoiceChunks = [];
+        let taskVoiceTimer = null;
+        let taskVoiceStream = null;
 
         // ФИЛЬТРЫ
         const filterProject = ref('ALL');
@@ -1902,8 +2035,6 @@ async def index():
 
         const tasks = ref([]);
         const users = ref([]);
-        let mediaRecorder = null;
-        let audioChunks = [];
 
         // ЧАТ
         const activeChatTask = ref(null);
@@ -1919,7 +2050,7 @@ async def index():
         const pendingQueue = ref([]);
         let isFlushingQueue = false;
 
-        // ГОЛОС
+        // ГОЛОС В ЧАТЕ
         const isRecordingVoice = ref(false);
         const recordVoiceSeconds = ref(0);
         const recordedVoiceBlob = ref(null);
@@ -1929,7 +2060,7 @@ async def index():
         let chatVoiceTimer = null;
         let chatVoiceStream = null;
 
-        // ПЛЕЕР
+        // ЕДИНЫЙ ПЛЕЕР
         const activeAudioId = ref(null);
         const isAudioPlaying = ref(false);
         const audioCurrentTime = ref(0);
@@ -2368,45 +2499,98 @@ async def index():
           };
         };
 
-        // СОЗДАНИЕ ЗАДАЧИ АВТОРОМ (ШЕФОМ ИЛИ ДИРЕКТОРОМ)
-        const toggleRecord = async () => {
-          if (!isRecording.value) {
-            try {
-              const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-              mediaRecorder = new MediaRecorder(stream);
-              audioChunks = [];
-              recordSeconds.value = 0;
-              timerInterval = setInterval(() => recordSeconds.value++, 1000);
+        // 1. ЗАПИСЬ ГОЛОСОВОГО ПОРУЧЕНИЯ ДЛЯ ЗАДАЧИ С ПРЕДПРОСЛУШКОЙ
+        const startTaskVoiceRecording = async () => {
+          cancelTaskVoiceRecording();
+          try {
+            taskVoiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            taskVoiceRecorder = new MediaRecorder(taskVoiceStream);
+            taskVoiceChunks = [];
+            recordTaskVoiceSeconds.value = 0;
+            isRecordingTaskVoice.value = true;
 
-              mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
-              mediaRecorder.onstop = async () => {
-                clearInterval(timerInterval);
-                isProcessing.value = true;
-                const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-                const fd = new FormData();
-                fd.append('audio', blob, 'recording.webm');
-                fd.append('user_id', currentUser.value.id);
+            taskVoiceTimer = setInterval(() => recordTaskVoiceSeconds.value++, 1000);
 
-                try {
-                  const res = await fetch('/api/tasks/create-voice', { method: 'POST', body: fd });
-                  if (!res.ok) throw new Error('Ошибка создания');
-                  await loadData();
-                  alert('✅ Поручение создано и добавлено во Входящие!');
-                } catch (err) {
-                  alert('❌ ' + err.message);
-                } finally {
-                  isProcessing.value = false;
-                }
-              };
+            taskVoiceRecorder.ondataavailable = e => {
+              if (e.data.size > 0) taskVoiceChunks.push(e.data);
+            };
 
-              mediaRecorder.start();
-              isRecording.value = true;
-            } catch (err) {
-              alert('Разрешите доступ к микрофону в браузере!');
-            }
-          } else {
-            mediaRecorder.stop();
-            isRecording.value = false;
+            taskVoiceRecorder.onstop = () => {
+              if (taskVoiceTimer) clearInterval(taskVoiceTimer);
+              const blob = new Blob(taskVoiceChunks, { type: taskVoiceRecorder.mimeType || 'audio/webm' });
+              recordedTaskVoiceBlob.value = blob;
+              recordedTaskVoiceUrl.value = URL.createObjectURL(blob);
+              isRecordingTaskVoice.value = false;
+
+              if (taskVoiceStream) {
+                taskVoiceStream.getTracks().forEach(t => t.stop());
+                taskVoiceStream = null;
+              }
+            };
+
+            taskVoiceRecorder.start();
+          } catch (err) {
+            alert('Разрешите доступ к микрофону в браузере!');
+          }
+        };
+
+        const stopTaskVoiceRecording = () => {
+          if (taskVoiceRecorder && isRecordingTaskVoice.value && taskVoiceRecorder.state !== 'inactive') {
+            taskVoiceRecorder.stop();
+          }
+        };
+
+        const cancelTaskVoiceRecording = () => {
+          if (taskVoiceTimer) {
+            clearInterval(taskVoiceTimer);
+            taskVoiceTimer = null;
+          }
+          if (taskVoiceRecorder && isRecordingTaskVoice.value && taskVoiceRecorder.state !== 'inactive') {
+            taskVoiceRecorder.stop();
+          }
+          if (taskVoiceStream) {
+            taskVoiceStream.getTracks().forEach(t => t.stop());
+            taskVoiceStream = null;
+          }
+
+          if (globalAudio) {
+            globalAudio.pause();
+            globalAudio.src = '';
+            globalAudio = null;
+          }
+          if (activeAudioId.value === 'preview_task_voice') {
+            activeAudioId.value = null;
+            isAudioPlaying.value = false;
+            audioCurrentTime.value = 0;
+            audioProgress.value = 0;
+          }
+
+          isRecordingTaskVoice.value = false;
+          recordTaskVoiceSeconds.value = 0;
+          recordedTaskVoiceBlob.value = null;
+          if (recordedTaskVoiceUrl.value) {
+            URL.revokeObjectURL(recordedTaskVoiceUrl.value);
+            recordedTaskVoiceUrl.value = null;
+          }
+        };
+
+        const confirmSendTaskVoice = async () => {
+          if (!recordedTaskVoiceBlob.value || !currentUser.value) return;
+          isProcessing.value = true;
+          const fd = new FormData();
+          fd.append('audio', recordedTaskVoiceBlob.value, 'recording.webm');
+          fd.append('user_id', currentUser.value.id);
+
+          try {
+            const res = await fetch('/api/tasks/create-voice', { method: 'POST', body: fd });
+            if (!res.ok) throw new Error('Ошибка создания');
+            cancelTaskVoiceRecording();
+            await loadData();
+            alert('✅ Поручение создано и добавлено во Входящие!');
+          } catch (err) {
+            alert('❌ ' + err.message);
+          } finally {
+            isProcessing.value = false;
           }
         };
 
@@ -2426,6 +2610,24 @@ async def index():
             alert('❌ ' + e.message);
           } finally {
             isProcessing.value = false;
+          }
+        };
+
+        // 2. УДАЛЕНИЕ СВОЕГО ВХОДЯЩЕГО ПОРУЧЕНИЯ
+        const deleteTask = async (taskId) => {
+          if (!confirm('Вы действительно хотите удалить это поручение?')) return;
+          const fd = new FormData();
+          fd.append('user_id', currentUser.value.id);
+          try {
+            const res = await fetch(`/api/tasks/${taskId}/delete`, { method: 'POST', body: fd });
+            if (!res.ok) {
+              const err = await res.json();
+              throw new Error(err.detail || 'Ошибка удаления');
+            }
+            await loadData();
+            alert('🗑 Поручение успешно удалено');
+          } catch (e) {
+            alert('❌ ' + e.message);
           }
         };
 
@@ -2989,8 +3191,10 @@ async def index():
         return {
           currentUser, loginForm, isLoggingIn, isOnline, hasEncryptedVault, isUnlocked, pinInput, pinError,
           pressPinDigit, backspacePin, clearPin, resetVaultAndRelogin,
-          ownerTab, deputyTab, empTab, isRecording, isProcessing,
-          recordSeconds, textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
+          ownerTab, deputyTab, empTab, isProcessing,
+          isRecordingTaskVoice, recordTaskVoiceSeconds, recordedTaskVoiceUrl,
+          startTaskVoiceRecording, stopTaskVoiceRecording, cancelTaskVoiceRecording, confirmSendTaskVoice,
+          textInput, sseConnected, tasks, users, employeesOnly, editDrafts, roleBadgeTitle,
           filterProject, filterPriority, filterExecutor, filterUrgentOnly, hasActiveFilters, resetFilters,
           editingDetailsTask, editDetailsForm, openEditDetailsModal, saveTaskDetails,
           managingTeamTask, teamManageForm, selectedAssigneesObjects, openManageTeamModal, onAssigneeCheckboxChange, saveTaskTeam,
@@ -3001,7 +3205,7 @@ async def index():
           isRecordingVoice, recordVoiceSeconds, recordedVoiceUrl, userScrolledUp, newMessagesBelowCount,
           activeAudioId, isAudioPlaying, audioCurrentTime, audioDuration, audioProgress,
           togglePlayAudio, seekAudio, handleTouchSeek, getWaveformBars, formatAudioTime,
-          handleLogin, handleLogout, toggleRecord, sendTextTask, assignTask, setDirectStage, requestStage, confirmStageRequest,
+          handleLogin, handleLogout, sendTextTask, deleteTask, assignTask, setDirectStage, requestStage, confirmStageRequest,
           ensureLeadInAssignees,
           openChat, closeChat, sendChatMessage, uploadChatImage, openImageLightbox,
           startVoiceRecording, stopVoiceRecording, cancelVoiceRecording, confirmSendVoice, sendRedFlag,
