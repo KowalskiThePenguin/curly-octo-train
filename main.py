@@ -35,11 +35,15 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 db_pool = None
 sse_subscribers = set()
 FAILED_LOGIN_ATTEMPTS = {}
+DEADLINE_ALERTS_SENT = set()
 
-async def broadcast_event(event_type: str = "update"):
+async def broadcast_event(event_type: str = "update", payload: dict = None):
+    msg_data = {"event": event_type}
+    if payload:
+        msg_data.update(payload)
     for queue in list(sse_subscribers):
         try:
-            await queue.put(f"data: {json.dumps({'event': event_type})}\n\n")
+            await queue.put(f"data: {json.dumps(msg_data)}\n\n")
         except Exception:
             sse_subscribers.discard(queue)
 
@@ -81,6 +85,52 @@ async def keep_alive_worker():
                 urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             print(f"Keep-alive error: {e}")
+
+# ФОНОВЫЙ СЕРВИС: ЕЖЕЧАСНЫЙ КОНТРОЛЬ ДЕДЛАЙНОВ ЗА 4 ЧАСА ДО СРОКА
+async def deadline_checker_worker():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            pool = await get_db()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT t.id, t.title, t.deadline, t.lead_user_id, t.assignee_ids, t.project_group,
+                           u.full_name as lead_name
+                    FROM tasks t
+                    LEFT JOIN users u ON u.id = t.lead_user_id
+                    WHERE t.status = 'IN_PROGRESS' AND t.deadline IS NOT NULL
+                """)
+                now = datetime.now(timezone.utc)
+                for r in rows:
+                    dl = r['deadline']
+                    diff = dl - now
+                    diff_hours = diff.total_seconds() / 3600.0
+                    
+                    if 0 < diff_hours <= 4.05:
+                        bracket = int(diff_hours) + 1 if diff_hours > int(diff_hours) else int(diff_hours)
+                        if bracket in [1, 2, 3, 4]:
+                            alert_key = (r['id'], bracket)
+                            if alert_key not in DEADLINE_ALERTS_SENT:
+                                DEADLINE_ALERTS_SENT.add(alert_key)
+                                
+                                targets = set(r['assignee_ids'] or [])
+                                if r['lead_user_id']:
+                                    targets.add(r['lead_user_id'])
+                                
+                                hours_word = "часа" if bracket in [2, 3, 4] else "час"
+                                title = f"⏰ До дедлайна осталось {bracket} {hours_word}!"
+                                body = f"Задача #{r['id']} «{r['title']}» ({r['project_group']}). Лид: {r['lead_name'] or 'Не назначен'}."
+                                
+                                await broadcast_event("notify", {
+                                    "title": title,
+                                    "body": body,
+                                    "roles": ["OWNER", "DEPUTY"],
+                                    "user_ids": list(targets),
+                                    "task_id": r['id']
+                                })
+                                send_telegram_alert(f"⏰ <b>Внимание! До дедлайна {bracket} {hours_word}!</b>\n<b>Задача #{r['id']}:</b> {r['title']}\n<b>Проект:</b> {r['project_group']}\n<b>Лид:</b> {r['lead_name']}")
+        except Exception as e:
+            print(f"Deadline checker error: {e}")
 
 @app.on_event("startup")
 async def startup():
@@ -145,6 +195,7 @@ async def startup():
             """, uid, phone_login, name, role, dept, uname, pwd)
 
     asyncio.create_task(keep_alive_worker())
+    asyncio.create_task(deadline_checker_worker())
 
 @app.get("/api/health")
 async def health():
@@ -216,7 +267,6 @@ def query_gemini_direct(parts_list: list) -> dict:
     clean_key = raw_key.strip().strip("[]'\"")
 
     if not clean_key:
-        print("[Gemini Error] GEMINI_API_KEY пустой или не задан в Render!")
         return {
             "title": "Новое поручение",
             "ai_summary": "Поручение принято и зарегистрировано в системе",
@@ -246,15 +296,8 @@ def query_gemini_direct(parts_list: list) -> dict:
                 clean_text = raw_text.replace("```json", "").replace("```", "").strip()
                 match = re.search(r'\{.*\}', clean_text, re.DOTALL)
                 if match:
-                    parsed = json.loads(match.group(0))
-                    print(f"[Gemini Success] ТЗ успешно сформировано моделью {model_name}")
-                    return parsed
-        except urllib.error.HTTPError as he:
-            err_body = he.read().decode("utf-8", errors="ignore")
-            print(f"[Gemini HTTP {he.code}] Модель {model_name}: {err_body}")
-            continue
-        except Exception as e:
-            print(f"[Gemini Error] Модель {model_name}: {e}")
+                    return json.loads(match.group(0))
+        except Exception:
             continue
 
     return {
@@ -373,7 +416,16 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
             """, task_id, user_id, audio_b64, parsed.get("ai_summary", ""))
 
         send_telegram_alert(f"🎙 <b>Новое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
-        await broadcast_event("new_task")
+        
+        # PUSH: уведомление для Директора / Шефа
+        target_roles = ["DEPUTY"] if creator.get('role') == 'OWNER' else ["OWNER"]
+        await broadcast_event("notify", {
+            "title": f"📋 Новое поручение #{task_id}",
+            "body": f"{creator_name}: {parsed.get('title')}",
+            "roles": target_roles,
+            "user_ids": [],
+            "task_id": task_id
+        })
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
         traceback.print_exc()
@@ -397,13 +449,20 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
             """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
 
         send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
-        await broadcast_event("new_task")
+        
+        target_roles = ["DEPUTY"] if creator.get('role') == 'OWNER' else ["OWNER"]
+        await broadcast_event("notify", {
+            "title": f"📝 Новое поручение #{task_id}",
+            "body": f"{creator_name}: {parsed.get('title')}",
+            "roles": target_roles,
+            "user_ids": [],
+            "task_id": task_id
+        })
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# УДАЛЕНИЕ ВХОДЯЩЕЙ ЗАДАЧИ АВТОРОМ С ПРОВЕРКОЙ ПРАВ
 @app.post("/api/tasks/{task_id}/delete")
 async def delete_task(task_id: int, user_id: int = Form(...)):
     pool = await get_db()
@@ -480,7 +539,15 @@ async def assign_task(
             """, task_id, f"🚀 Задача утверждена и передана в работу.\n📁 Группа: {project_group}\n👑 Лид: {lead_name}\n👥 Команда: {team_str}")
 
         send_telegram_alert(f"🚀 <b>Задача #{task_id} передана в работу</b>\n📁 <b>Группа:</b> {project_group}\n👑 <b>Лид:</b> {lead_name}\n<b>Приоритет:</b> {priority}")
-        await broadcast_event("task_assigned")
+        
+        # PUSH: уведомление для Шефа, Лида и команды
+        await broadcast_event("notify", {
+            "title": f"🚀 Назначена задача #{task_id}",
+            "body": f"Лид: {lead_name} | {title or 'В работе'}",
+            "roles": ["OWNER"],
+            "user_ids": parsed_assignees,
+            "task_id": task_id
+        })
         return {"status": "ok"}
     except Exception as e:
         traceback.print_exc()
@@ -511,7 +578,7 @@ async def update_task_details(
         pool = await get_db()
         async with pool.acquire() as conn:
             old_task = await conn.fetchrow("""
-                SELECT title, ai_summary, definition_of_done, project_group, priority 
+                SELECT title, ai_summary, definition_of_done, project_group, priority, lead_user_id, assignee_ids 
                 FROM tasks WHERE id = $1
             """, task_id)
 
@@ -548,7 +615,18 @@ async def update_task_details(
                 VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
             """, task_id, user_name, sys_msg)
 
-        await broadcast_event("task_updated")
+            assignees = set(old_task['assignee_ids'] or []) if old_task else set()
+            if old_task and old_task['lead_user_id']:
+                assignees.add(old_task['lead_user_id'])
+
+        # PUSH: уведомление об изменении ТЗ/срока
+        await broadcast_event("notify", {
+            "title": f"✏️ Изменение параметров #{task_id}",
+            "body": f"Директор обновил параметры задачи «{title}»",
+            "roles": ["OWNER"],
+            "user_ids": list(assignees),
+            "task_id": task_id
+        })
         return {"status": "ok"}
     except Exception as e:
         traceback.print_exc()
@@ -593,7 +671,14 @@ async def update_task_team(
                 VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
             """, task_id, user_name, sys_msg)
 
-        await broadcast_event("team_updated")
+        # PUSH: уведомление о смене команды
+        await broadcast_event("notify", {
+            "title": f"👥 Смена состава команды #{task_id}",
+            "body": f"Лид: {new_lead_name} | Исполнители: {new_team_str}",
+            "roles": ["OWNER"],
+            "user_ids": parsed_assignees,
+            "task_id": task_id
+        })
         return {"status": "ok"}
     except HTTPException:
         raise
@@ -609,6 +694,7 @@ async def set_stage(
 ):
     pool = await get_db()
     async with pool.acquire() as conn:
+        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids, title FROM tasks WHERE id = $1", task_id)
         if stage == 'ARCHIVE':
             await conn.execute("""
                 UPDATE tasks 
@@ -630,7 +716,19 @@ async def set_stage(
             VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
         """, task_id, user_name, sys_msg)
 
-    await broadcast_event("stage_updated")
+        targets = set(task['assignee_ids'] or []) if task else set()
+        if task and task['lead_user_id']:
+            targets.add(task['lead_user_id'])
+
+    # PUSH: обновление этапа
+    label = "в архив" if stage == 'ARCHIVE' else f"{stage}%"
+    await broadcast_event("notify", {
+        "title": f"⚡ Этап задачи #{task_id}: {label}",
+        "body": sys_msg,
+        "roles": ["OWNER"],
+        "user_ids": list(targets),
+        "task_id": task_id
+    })
     return {"status": "ok"}
 
 @app.post("/api/tasks/{task_id}/request-stage")
@@ -656,7 +754,15 @@ async def request_stage(
         """, task_id, user_id, user_name, sys_msg)
 
     send_telegram_alert(f"📌 <b>Задача #{task_id}: запрос подтверждения</b>\n👑 <b>Лид:</b> {user_name}\n<b>Запрос:</b> {target_str}")
-    await broadcast_event("stage_requested")
+    
+    # PUSH: уведомить Директора и Шефа
+    await broadcast_event("notify", {
+        "title": f"📌 Запрос подтверждения #{task_id}",
+        "body": f"Лид {user_name} запросил {target_str}",
+        "roles": ["DEPUTY", "OWNER"],
+        "user_ids": [],
+        "task_id": task_id
+    })
     return {"status": "ok"}
 
 @app.post("/api/tasks/{task_id}/confirm-stage-request")
@@ -668,7 +774,7 @@ async def confirm_stage_request(
     pool = await get_db()
     async with pool.acquire() as conn:
         task = await conn.fetchrow("""
-            SELECT t.pending_request, u.full_name as lead_name 
+            SELECT t.pending_request, t.lead_user_id, t.assignee_ids, u.full_name as lead_name 
             FROM tasks t 
             LEFT JOIN users u ON u.id = t.lead_user_id 
             WHERE t.id = $1
@@ -687,16 +793,29 @@ async def confirm_stage_request(
             else:
                 await conn.execute("UPDATE tasks SET progress = $1, pending_request = NULL WHERE id = $2", int(req_stage), task_id)
             sys_msg = f"✅ Директор {user_name} подтвердил запрос (Лид {lead_name}: {target_str})."
+            push_title = f"✅ Запрос утвержден (#{task_id})"
         else:
             await conn.execute("UPDATE tasks SET pending_request = NULL WHERE id = $1", task_id)
             sys_msg = f"❌ Директор {user_name} отклонил запрос (Лид {lead_name}: {target_str})."
+            push_title = f"❌ Запрос отклонен (#{task_id})"
 
         await conn.execute("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
             VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
         """, task_id, user_name, sys_msg)
 
-    await broadcast_event("stage_confirmed")
+        targets = set(task['assignee_ids'] or []) if task else set()
+        if task and task['lead_user_id']:
+            targets.add(task['lead_user_id'])
+
+    # PUSH: результат рассмотрения этапа
+    await broadcast_event("notify", {
+        "title": push_title,
+        "body": sys_msg,
+        "roles": ["OWNER"],
+        "user_ids": list(targets),
+        "task_id": task_id
+    })
     return {"status": "ok"}
 
 @app.get("/api/tasks/{task_id}/messages")
@@ -757,7 +876,22 @@ async def send_text_msg(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-    await broadcast_event(f"chat_{task_id}")
+        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+        recipients = set(task['assignee_ids'] or []) if task else set()
+        if task and task['lead_user_id']:
+            recipients.add(task['lead_user_id'])
+        recipients.add(1) # Шеф
+        recipients.add(2) # Директор
+        recipients.discard(sender_id)
+
+    # PUSH: новое сообщение в чате
+    await broadcast_event("notify", {
+        "title": f"💬 Сообщение в задаче #{task_id}",
+        "body": f"{sender_name}: {content[:60]}",
+        "roles": [],
+        "user_ids": list(recipients),
+        "task_id": task_id
+    })
     return {"status": "ok", "id": msg_id}
 
 @app.post("/api/tasks/{task_id}/messages/voice")
@@ -787,7 +921,21 @@ async def send_voice_msg(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-    await broadcast_event(f"chat_{task_id}")
+        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+        recipients = set(task['assignee_ids'] or []) if task else set()
+        if task and task['lead_user_id']:
+            recipients.add(task['lead_user_id'])
+        recipients.add(1)
+        recipients.add(2)
+        recipients.discard(sender_id)
+
+    await broadcast_event("notify", {
+        "title": f"🎙 Голосовое в задаче #{task_id}",
+        "body": f"{sender_name} отправил голосовое сообщение",
+        "roles": [],
+        "user_ids": list(recipients),
+        "task_id": task_id
+    })
     return {"status": "ok", "id": msg_id}
 
 @app.post("/api/tasks/{task_id}/messages/image")
@@ -817,7 +965,21 @@ async def send_image_msg(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-    await broadcast_event(f"chat_{task_id}")
+        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+        recipients = set(task['assignee_ids'] or []) if task else set()
+        if task and task['lead_user_id']:
+            recipients.add(task['lead_user_id'])
+        recipients.add(1)
+        recipients.add(2)
+        recipients.discard(sender_id)
+
+    await broadcast_event("notify", {
+        "title": f"📷 Фото в задаче #{task_id}",
+        "body": f"{sender_name} прикрепил изображение",
+        "roles": [],
+        "user_ids": list(recipients),
+        "task_id": task_id
+    })
     return {"status": "ok", "id": msg_id}
 
 @app.post("/api/tasks/{task_id}/red-flag")
@@ -839,7 +1001,15 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(
         """, task_id, sender_id, msg_id)
 
     send_telegram_alert(f"🚨🚨🚨 <b>RED FLAG на задаче #{task_id}!</b>\n<b>Исполнитель:</b> {sender_name}\n<b>Проблема:</b> {reason}")
-    await broadcast_event("red_flag")
+    
+    # PUSH: экстренное уведомление для руководства
+    await broadcast_event("notify", {
+        "title": f"🚨 RED FLAG на задаче #{task_id}!",
+        "body": f"{sender_name}: {reason}",
+        "roles": ["OWNER", "DEPUTY"],
+        "user_ids": [],
+        "task_id": task_id
+    })
     return {"status": "flagged"}
 
 @app.get("/", response_class=HTMLResponse)
@@ -859,8 +1029,24 @@ async def index():
   </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased select-none">
-  <div id="app" v-cloak class="max-w-md mx-auto p-3.5 pb-24">
+  <div id="app" v-cloak class="max-w-md mx-auto p-3.5 pb-24 relative">
     
+    <!-- ВСплывающий баннер УВЕДОМЛЕНИЯ (TOAST) -->
+    <transition enter-active-class="transition duration-300 ease-out" enter-from-class="transform -translate-y-6 opacity-0" enter-to-class="transform translate-y-0 opacity-100" leave-active-class="transition duration-200 ease-in" leave-from-class="opacity-100" leave-to-class="opacity-0">
+      <div v-if="activeToast" class="fixed top-3 left-3 right-3 max-w-md mx-auto z-[100] bg-indigo-950/95 border border-indigo-500/80 rounded-2xl p-3 shadow-2xl backdrop-blur-xl flex items-start gap-3">
+        <div class="w-8 h-8 rounded-xl bg-indigo-600 flex items-center justify-center text-white text-sm shrink-0 shadow">
+          <i class="fa-solid fa-bell"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <h4 class="text-xs font-black text-white leading-tight truncate">{{ activeToast.title }}</h4>
+          <p class="text-[11px] text-indigo-200/90 leading-snug line-clamp-2 mt-0.5">{{ activeToast.body }}</p>
+        </div>
+        <button @click="activeToast = null" class="text-slate-400 hover:text-white text-xs p-1">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+    </transition>
+
     <!-- 1. ЭКРАН РАЗБЛОКИРОВКИ ПО PIN-КОДУ -->
     <div v-if="hasEncryptedVault && !isUnlocked" class="min-h-[85vh] flex flex-col justify-center px-4">
       <div class="bg-slate-900/90 border border-slate-800 p-6 rounded-3xl space-y-5 shadow-2xl text-center backdrop-blur-xl">
@@ -950,9 +1136,14 @@ async def index():
             <span class="text-[9px] font-bold text-indigo-400 uppercase tracking-wider">{{ roleBadgeTitle }}</span>
           </div>
         </div>
-        <button @click="handleLogout" class="text-[10px] font-bold text-red-400 bg-red-950/40 hover:bg-red-900/60 px-2.5 py-1.5 rounded-xl border border-red-800/50 transition">
-          <i class="fa-solid fa-right-from-bracket mr-1"></i> Выйти
-        </button>
+        <div class="flex items-center gap-2">
+          <button v-if="notificationPermission !== 'granted'" @click="requestNotificationAccess" class="text-[10px] font-bold text-amber-300 bg-amber-950/60 border border-amber-800/60 px-2.5 py-1.5 rounded-xl transition animate-pulse">
+            🔔 Включить пуш
+          </button>
+          <button @click="handleLogout" class="text-[10px] font-bold text-red-400 bg-red-950/40 hover:bg-red-900/60 px-2.5 py-1.5 rounded-xl border border-red-800/50 transition">
+            <i class="fa-solid fa-right-from-bracket mr-1"></i> Выйти
+          </button>
+        </div>
       </header>
 
       <!-- ПАНЕЛЬ ФИЛЬТРОВ -->
@@ -1007,7 +1198,6 @@ async def index():
 
       <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
-        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ ШЕФОМ (С ТЕЛЕГРАМ-ПОДОБНЫМ УПРАВЛЕНИЕМ) -->
         <div class="bg-slate-900/90 border border-slate-800 p-4 rounded-3xl space-y-3.5 shadow-xl backdrop-blur-md">
           <div class="flex items-center justify-between">
             <h2 class="text-sm font-bold text-white flex items-center gap-1.5">
@@ -1018,7 +1208,6 @@ async def index():
             </span>
           </div>
 
-          <!-- 1.1 Панель предпрослушивания с волновой дорожкой -->
           <div v-if="recordedTaskVoiceUrl" class="space-y-2.5 bg-slate-950 p-3 rounded-2xl border border-slate-800">
             <div class="flex items-center gap-3">
               <button @click="togglePlayAudio('preview_task_voice', recordedTaskVoiceUrl)" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1050,7 +1239,6 @@ async def index():
             </div>
           </div>
 
-          <!-- 1.2 Панель активной записи -->
           <div v-else-if="isRecordingTaskVoice" class="p-3 bg-slate-950 rounded-2xl border border-red-800/50 flex items-center justify-between animate-pulse">
             <div class="flex items-center gap-2 text-xs font-bold text-red-400">
               <div class="w-3 h-3 rounded-full bg-red-500 animate-ping"></div>
@@ -1066,7 +1254,6 @@ async def index():
             </div>
           </div>
 
-          <!-- 1.3 Кнопка старта записи -->
           <div v-else class="flex flex-col items-center justify-center py-2 space-y-2">
             <button @click="startTaskVoiceRecording" class="w-16 h-16 rounded-full bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white text-2xl shadow-xl shadow-indigo-600/30 flex items-center justify-center transition">
               <i class="fa-solid fa-microphone"></i>
@@ -1074,7 +1261,6 @@ async def index():
             <span class="text-[11px] text-slate-400">Нажмите микрофон для записи</span>
           </div>
 
-          <!-- Текстовое поручение -->
           <div class="pt-2 border-t border-slate-800 text-left space-y-1.5">
             <div class="flex gap-1.5">
               <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите поручение текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-indigo-500">
@@ -1108,13 +1294,11 @@ async def index():
               </div>
             </div>
 
-            <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
             <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center justify-between">
               <div class="flex items-center gap-1.5">
                 <i class="fa-solid fa-user-tie"></i>
                 <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
               </div>
-              <!-- КНОПКА УДАЛЕНИЯ ТОЛЬКО СВОЕГО ВХОДЯЩЕГО ЗАДАНИЯ -->
               <button v-if="t.status === 'DRAFT' && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
                 <i class="fa-solid fa-trash-can mr-1"></i> Удалить
               </button>
@@ -1132,7 +1316,6 @@ async def index():
               </div>
             </div>
 
-            <!-- ПЛЕЕР ГОЛОСА АВТОРА С БЕСШОВНОЙ ПЕРЕМОТКОЙ -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1195,7 +1378,6 @@ async def index():
 
       <!-- 2. КАБИНЕТ ДИРЕКТОРА (ЖАМОЛИДДИН) -->
       <div v-if="currentUser.role === 'DEPUTY'" class="space-y-4">
-        <!-- БЛОК СОЗДАНИЯ ЗАДАЧИ ДИРЕКТОРОМ (С ТЕЛЕГРАМ-ПОДОБНЫМ УПРАВЛЕНИЕМ) -->
         <div class="bg-slate-900/90 border border-slate-800 p-4 rounded-3xl space-y-3.5 shadow-xl backdrop-blur-md">
           <div class="flex items-center justify-between">
             <h2 class="text-sm font-bold text-white flex items-center gap-1.5">
@@ -1206,7 +1388,6 @@ async def index():
             </span>
           </div>
 
-          <!-- 2.1 Панель предпрослушивания -->
           <div v-if="recordedTaskVoiceUrl" class="space-y-2.5 bg-slate-950 p-3 rounded-2xl border border-slate-800">
             <div class="flex items-center gap-3">
               <button @click="togglePlayAudio('preview_task_voice', recordedTaskVoiceUrl)" class="w-10 h-10 rounded-full bg-amber-600 hover:bg-amber-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1238,7 +1419,6 @@ async def index():
             </div>
           </div>
 
-          <!-- 2.2 Панель активной записи -->
           <div v-else-if="isRecordingTaskVoice" class="p-3 bg-slate-950 rounded-2xl border border-amber-500/50 flex items-center justify-between animate-pulse">
             <div class="flex items-center gap-2 text-xs font-bold text-amber-400">
               <div class="w-3 h-3 rounded-full bg-amber-500 animate-ping"></div>
@@ -1254,7 +1434,6 @@ async def index():
             </div>
           </div>
 
-          <!-- 2.3 Кнопка старта записи -->
           <div v-else class="flex flex-col items-center justify-center py-2 space-y-2">
             <button @click="startTaskVoiceRecording" class="w-16 h-16 rounded-full bg-gradient-to-tr from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 active:scale-95 text-white text-2xl shadow-xl shadow-amber-600/30 flex items-center justify-center transition">
               <i class="fa-solid fa-microphone"></i>
@@ -1262,7 +1441,6 @@ async def index():
             <span class="text-[11px] text-slate-400">Нажмите микрофон для записи</span>
           </div>
 
-          <!-- Текстовое поручение -->
           <div class="pt-2 border-t border-slate-800 text-left space-y-1.5">
             <div class="flex gap-1.5">
               <input v-model="textInput" @keyup.enter="sendTextTask" placeholder="Или напишите поручение текстом..." class="flex-1 bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white outline-none focus:border-amber-500">
@@ -1296,13 +1474,11 @@ async def index():
               </div>
             </div>
 
-            <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
             <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center justify-between">
               <div class="flex items-center gap-1.5">
                 <i class="fa-solid fa-user-tie"></i>
                 <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
               </div>
-              <!-- КНОПКА УДАЛЕНИЯ ТОЛЬКО СВОЕГО ВХОДЯЩЕГО ЗАДАНИЯ -->
               <button v-if="t.status === 'DRAFT' && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
                 <i class="fa-solid fa-trash-can mr-1"></i> Удалить
               </button>
@@ -1310,7 +1486,6 @@ async def index():
 
             <h4 class="text-sm font-bold text-white leading-snug">{{ t.title }}</h4>
 
-            <!-- ПЛЕЕР ГОЛОСА АВТОРА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1514,7 +1689,6 @@ async def index():
               </span>
             </div>
 
-            <!-- ОТМЕТКА АВТОРА ЗАДАЧИ -->
             <div class="text-[11px] bg-indigo-950/40 border border-indigo-800/40 text-indigo-300 px-2.5 py-1 rounded-xl font-bold flex items-center gap-1.5">
               <i class="fa-solid fa-user-tie"></i>
               <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
@@ -1532,7 +1706,6 @@ async def index():
               </div>
             </div>
 
-            <!-- ПЛЕЕР ГОЛОСА АВТОРА -->
             <div v-if="t.has_voice" class="bg-slate-950 p-2.5 rounded-2xl border border-slate-800">
               <div class="flex items-center gap-3">
                 <button @click="togglePlayAudio('task_' + t.id, '/api/tasks/' + t.id + '/voice')" class="w-10 h-10 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center text-sm shrink-0 shadow transition">
@@ -1786,7 +1959,7 @@ async def index():
                   <div @click="seekAudio('msg_' + m.id, m.media_url, $event)" @touchmove.prevent="handleTouchSeek('msg_' + m.id, m.media_url, $event)" class="h-5 flex items-center gap-0.5 cursor-pointer py-1">
                     <div v-for="(h, idx) in getWaveformBars(m.id)" :key="idx" 
                          :style="{ height: h + '%' }" 
-                         :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? (isMyMessage(m) ? 'bg-white' : 'bg-indigo-400') : (isMyMessage(m) ? 'bg-indigo-400/50' : 'bg-slate-700')"
+                         :class="(activeAudioId === 'msg_' + m.id && (idx / 28) <= audioProgress) ? 'bg-indigo-400' : 'bg-slate-700'"
                          class="w-1 rounded-full transition-colors pointer-events-none"></div>
                   </div>
                   <div class="flex justify-between text-[9px] font-mono opacity-80">
@@ -1933,21 +2106,10 @@ async def index():
     const CryptoEngine = {
       async deriveKey(pin, saltBase64) {
         const enc = new TextEncoder();
-        const pinKey = await crypto.subtle.importKey(
-          'raw',
-          enc.encode(pin),
-          { name: 'PBKDF2' },
-          false,
-          ['deriveKey']
-        );
+        const pinKey = await crypto.subtle.importKey('raw', enc.encode(pin), { name: 'PBKDF2' }, false, ['deriveKey']);
         const salt = saltBase64 ? Uint8Array.from(atob(saltBase64), c => c.charCodeAt(0)) : crypto.getRandomValues(new Uint8Array(16));
         const key = await crypto.subtle.deriveKey(
-          {
-            name: 'PBKDF2',
-            salt: salt,
-            iterations: 100000,
-            hash: 'SHA-256'
-          },
+          { name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' },
           pinKey,
           { name: 'AES-GCM', length: 256 },
           false,
@@ -1960,11 +2122,7 @@ async def index():
         const enc = new TextEncoder();
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const encodedData = enc.encode(JSON.stringify(dataObj));
-        const ciphertext = await crypto.subtle.encrypt(
-          { name: 'AES-GCM', iv: iv },
-          key,
-          encodedData
-        );
+        const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, encodedData);
         return {
           iv: btoa(String.fromCharCode(...iv)),
           cipher: btoa(String.fromCharCode(...new Uint8Array(ciphertext)))
@@ -1975,11 +2133,7 @@ async def index():
         const dec = new TextDecoder();
         const iv = Uint8Array.from(atob(encryptedObj.iv), c => c.charCodeAt(0));
         const cipher = Uint8Array.from(atob(encryptedObj.cipher), c => c.charCodeAt(0));
-        const decrypted = await crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv: iv },
-          key,
-          cipher
-        );
+        const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, key, cipher);
         return JSON.parse(dec.decode(decrypted));
       }
     };
@@ -1997,6 +2151,11 @@ async def index():
         const pinInput = ref('');
         const pinError = ref(false);
         let currentVaultKey = null;
+
+        // ПУШ УВЕДОМЛЕНИЯ
+        const notificationPermission = ref(typeof Notification !== 'undefined' ? Notification.permission : 'denied');
+        const activeToast = ref(null);
+        let toastTimer = null;
 
         const ownerTab = ref('inbox');
         const deputyTab = ref('inbox');
@@ -2091,6 +2250,56 @@ async def index():
           filterPriority.value = 'ALL';
           filterExecutor.value = 'ALL';
           filterUrgentOnly.value = false;
+        };
+
+        const playNotificationChime = () => {
+          try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const now = ctx.currentTime;
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(587.33, now);
+            osc.frequency.exponentialRampToValueAtTime(880, now + 0.12);
+            
+            gain.gain.setValueAtTime(0.18, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+            
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            
+            osc.start(now);
+            osc.stop(now + 0.3);
+          } catch(e) {}
+        };
+
+        const requestNotificationAccess = async () => {
+          if ('Notification' in window) {
+            const p = await Notification.requestPermission();
+            notificationPermission.value = p;
+          }
+        };
+
+        const triggerNotification = (notifData) => {
+          playNotificationChime();
+
+          activeToast.value = {
+            title: notifData.title,
+            body: notifData.body
+          };
+          if (toastTimer) clearTimeout(toastTimer);
+          toastTimer = setTimeout(() => { activeToast.value = null; }, 5000);
+
+          if ('Notification' in window && Notification.permission === 'granted') {
+            try {
+              new Notification(notifData.title, {
+                body: notifData.body,
+                tag: 'task_alert_' + (notifData.task_id || Date.now()),
+                silent: true
+              });
+            } catch(e) {}
+          }
         };
 
         const applyTaskFilters = (taskList) => {
@@ -2322,9 +2531,7 @@ async def index():
           try {
             const encrypted = await CryptoEngine.encrypt(dataPayload, currentVaultKey);
             localStorage.setItem('task_encrypted_vault', JSON.stringify(encrypted));
-          } catch (e) {
-            console.error("Vault encrypt error:", e);
-          }
+          } catch (e) {}
         };
 
         const handleLogin = async () => {
@@ -2355,6 +2562,7 @@ async def index():
             hasEncryptedVault.value = true;
             isUnlocked.value = true;
 
+            requestNotificationAccess();
             await loadData();
             await saveEncryptedVault({ user: data.user, tasks: tasks.value });
           } catch (e) {
@@ -2407,6 +2615,7 @@ async def index():
               tasks.value = decryptedVault.tasks || [];
               isUnlocked.value = true;
 
+              requestNotificationAccess();
               loadData();
             } else {
               throw new Error("Invalid PIN");
@@ -2486,7 +2695,19 @@ async def index():
         const setupSSE = () => {
           const evtSource = new EventSource('/api/events');
           evtSource.onopen = () => { sseConnected.value = true; };
-          evtSource.onmessage = () => {
+          evtSource.onmessage = (event) => {
+            try {
+              const data = JSON.parse(event.data);
+              if (data.event === "notify" && currentUser.value) {
+                const targetRoles = data.roles || [];
+                const targetUsers = data.user_ids || [];
+                const isTarget = targetRoles.includes(currentUser.value.role) || targetUsers.includes(currentUser.value.id);
+                if (isTarget) {
+                  triggerNotification(data);
+                }
+              }
+            } catch(e) {}
+
             loadData();
             if (activeChatTask.value) {
               loadMessages(false);
@@ -2499,7 +2720,6 @@ async def index():
           };
         };
 
-        // 1. ЗАПИСЬ ГОЛОСОВОГО ПОРУЧЕНИЯ ДЛЯ ЗАДАЧИ С ПРЕДПРОСЛУШКОЙ
         const startTaskVoiceRecording = async () => {
           cancelTaskVoiceRecording();
           try {
@@ -2613,7 +2833,6 @@ async def index():
           }
         };
 
-        // 2. УДАЛЕНИЕ СВОЕГО ВХОДЯЩЕГО ПОРУЧЕНИЯ
         const deleteTask = async (taskId) => {
           if (!confirm('Вы действительно хотите удалить это поручение?')) return;
           const fd = new FormData();
@@ -2888,7 +3107,6 @@ async def index():
                   await loadMessages(false);
                 }
               } catch (netErr) {
-                console.warn("Офлайн-режим. Сообщение сохранено в оперативной памяти:", netErr);
                 break;
               }
             }
@@ -3190,6 +3408,7 @@ async def index():
 
         return {
           currentUser, loginForm, isLoggingIn, isOnline, hasEncryptedVault, isUnlocked, pinInput, pinError,
+          notificationPermission, requestNotificationAccess, activeToast,
           pressPinDigit, backspacePin, clearPin, resetVaultAndRelogin,
           ownerTab, deputyTab, empTab, isProcessing,
           isRecordingTaskVoice, recordTaskVoiceSeconds, recordedTaskVoiceUrl,
