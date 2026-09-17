@@ -37,7 +37,6 @@ sse_subscribers = set()
 FAILED_LOGIN_ATTEMPTS = {}
 DEADLINE_ALERTS_SENT = set()
 
-# PWA MANIFEST ДЛЯ УСТАНОВКИ НА РАБОЧИЙ СТОЛ
 @app.get("/manifest.json")
 async def manifest():
     m = {
@@ -59,7 +58,6 @@ async def manifest():
     }
     return Response(content=json.dumps(m), media_type="application/manifest+json")
 
-# СЕРВИСНЫЙ ВОРКЕР
 @app.get("/sw.js")
 async def service_worker():
     js = """
@@ -171,7 +169,6 @@ async def deadline_checker_worker():
                             alert_key = (r['id'], bracket)
                             if alert_key not in DEADLINE_ALERTS_SENT:
                                 DEADLINE_ALERTS_SENT.add(alert_key)
-                                
                                 targets = set(r['assignee_ids'] or [])
                                 if r['lead_user_id']:
                                     targets.add(r['lead_user_id'])
@@ -443,7 +440,6 @@ async def get_task_voice(task_id: int):
             mime = header.split(";")[0].replace("data:", "")
         return Response(content=base64.b64decode(encoded), media_type=mime)
 
-# СОЗДАНИЕ ГОЛОСОВОГО ПОРУЧЕНИЯ
 @app.post("/api/tasks/create-voice")
 async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1)):
     try:
@@ -493,7 +489,6 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# СОЗДАНИЕ ТЕКСТОВОГО ПОРУЧЕНИЯ
 @app.post("/api/tasks/create-text")
 async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
     try:
@@ -529,7 +524,6 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# УДАЛЕНИЕ ВХОДЯЩЕЙ ЗАДАЧИ
 @app.post("/api/tasks/{task_id}/delete")
 async def delete_task(task_id: int, user_id: int = Form(...)):
     pool = await get_db()
@@ -560,7 +554,6 @@ async def delete_task(task_id: int, user_id: int = Form(...)):
     })
     return {"status": "ok"}
 
-# НАЗНАЧЕНИЕ В РАБОТУ
 @app.post("/api/tasks/{task_id}/assign")
 async def assign_task(
     task_id: int, 
@@ -635,7 +628,6 @@ async def assign_task(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# ИЗМЕНЕНИЕ ПАРАМЕТРОВ ТЗ И ДЕДЛАЙНА
 @app.post("/api/tasks/{task_id}/update-details")
 async def update_task_details(
     task_id: int,
@@ -716,7 +708,6 @@ async def update_task_details(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ
 @app.post("/api/tasks/{task_id}/update-team")
 async def update_task_team(
     task_id: int,
@@ -785,7 +776,6 @@ async def update_task_team(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# СМЕНА ЭТАПА ДИРЕКТОРОМ
 @app.post("/api/tasks/{task_id}/set-stage")
 async def set_stage(
     task_id: int,
@@ -832,7 +822,6 @@ async def set_stage(
     })
     return {"status": "ok"}
 
-# ЗАПРОС ЭТАПА ЛИДОМ
 @app.post("/api/tasks/{task_id}/request-stage")
 async def request_stage(
     task_id: int,
@@ -867,7 +856,6 @@ async def request_stage(
     })
     return {"status": "ok"}
 
-# РЕШЕНИЕ ДИРЕКТОРА ПО ЗАПРОСУ ЭТАПА
 @app.post("/api/tasks/{task_id}/confirm-stage-request")
 async def confirm_stage_request(
     task_id: int,
@@ -1132,15 +1120,20 @@ async def index():
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <script src="https://cdn.tailwindcss.com"></script>
-  <!-- Быстрый и надежный CDN jsdelivr -->
-  <script src="https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.js"></script>
+  <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
+  <script>
+    if (!window.Vue) {
+      document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/vue/3.4.21/vue.global.prod.min.js"><\\/script>');
+    }
+  </script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <style>
+    [v-cloak] { display: none !important; }
     .overscroll-contain { overscroll-behavior: contain; }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased select-none">
-  <div id="app" class="max-w-md mx-auto p-3.5 pb-24 relative">
+  <div id="app" v-cloak class="max-w-md mx-auto p-3.5 pb-24 relative">
     
     <!-- ВСплывающий баннер УВЕДОМЛЕНИЯ (TOAST) -->
     <transition enter-active-class="transition duration-300 ease-out" enter-from-class="transform -translate-y-6 opacity-0" enter-to-class="transform translate-y-0 opacity-100" leave-active-class="transition duration-200 ease-in" leave-from-class="opacity-100" leave-to-class="opacity-0">
@@ -1248,7 +1241,6 @@ async def index():
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <!-- КНОПКА ВКЛЮЧЕНИЯ ПУШ-УВЕДОМЛЕНИЙ -->
           <button v-if="notificationPermission !== 'granted'" @click="requestNotificationAccess" class="text-[10px] font-bold text-amber-300 bg-amber-950/60 border border-amber-800/80 px-2.5 py-1.5 rounded-xl transition animate-pulse">
             🔔 Включить пуш
           </button>
@@ -1411,7 +1403,7 @@ async def index():
                 <i class="fa-solid fa-user-tie"></i>
                 <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
               </div>
-              <button v-if="t.status === 'DRAFT' && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
+              <button v-if="t.status === 'DRAFT' && currentUser && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
                 <i class="fa-solid fa-trash-can mr-1"></i> Удалить
               </button>
             </div>
@@ -1591,7 +1583,7 @@ async def index():
                 <i class="fa-solid fa-user-tie"></i>
                 <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
               </div>
-              <button v-if="t.status === 'DRAFT' && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
+              <button v-if="t.status === 'DRAFT' && currentUser && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
                 <i class="fa-solid fa-trash-can mr-1"></i> Удалить
               </button>
             </div>
@@ -1850,7 +1842,7 @@ async def index():
             </div>
 
             <div class="text-xs space-y-0.5 px-1 font-semibold">
-              <p class="text-indigo-300">👑 Лид: {{ t.lead_name }} <span v-if="t.lead_user_id === currentUser.id" class="text-amber-300 font-black">(Вы)</span></p>
+              <p class="text-indigo-300">👑 Лид: {{ t.lead_name }} <span v-if="currentUser && t.lead_user_id === currentUser.id" class="text-amber-300 font-black">(Вы)</span></p>
               <p v-if="t.team_names" class="text-slate-400 text-[11px]">👥 Команда: {{ t.team_names }}</p>
             </div>
 
@@ -1870,7 +1862,7 @@ async def index():
             </div>
 
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1 border-t border-slate-800">
-              <div v-if="t.lead_user_id === currentUser.id">
+              <div v-if="currentUser && t.lead_user_id === currentUser.id">
                 <div v-if="t.pending_request" class="bg-amber-950/30 border border-amber-800/50 p-2 rounded-xl text-center text-xs text-amber-300 font-bold">
                   ⏳ Ваш запрос ({{ t.pending_request === 'ARCHIVE' ? 'Архив' : t.pending_request + '%' }}) ожидает решения Жамолиддина
                 </div>
@@ -2255,7 +2247,7 @@ async def index():
         const currentUser = ref(null);
         const loginForm = ref({ username: '', password: '', pin: '1234' });
         const isLoggingIn = ref(false);
-        const isOnline = ref(navigator.onLine);
+        const isOnline = ref(typeof navigator !== 'undefined' ? navigator.onLine : true);
 
         const hasEncryptedVault = ref(false);
         const isUnlocked = ref(false);
@@ -2266,7 +2258,13 @@ async def index():
         const tasks = ref([]);
         const users = ref([]);
 
-        const notificationPermission = ref(typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'denied');
+        const notificationPermission = ref('denied');
+        try {
+          if (typeof window !== 'undefined' && 'Notification' in window) {
+            notificationPermission.value = Notification.permission;
+          }
+        } catch(e) {}
+
         const activeToast = ref(null);
         let toastTimer = null;
 
@@ -2343,6 +2341,7 @@ async def index():
         });
 
         const selectedAssigneesObjects = computed(() => {
+          if (!teamManageForm.value.assignee_ids) return [];
           return employeesOnly.value.filter(u => teamManageForm.value.assignee_ids.includes(u.id));
         });
 
@@ -2856,7 +2855,7 @@ async def index():
               const data = JSON.parse(event.data);
               if (data.event === "notify" && currentUser.value) {
                 if (data.sender_id && Number(data.sender_id) === Number(currentUser.value.id)) {
-                  // Автор действие совершил сам - пропускаем
+                  // Пропуск
                 } else {
                   const targetRoles = data.roles || [];
                   const targetUsers = (data.user_ids || []).map(Number);
@@ -3013,7 +3012,7 @@ async def index():
         const assignTask = async (id) => {
           const draft = editDrafts.value[id] || {};
           const fd = new FormData();
-          const leadId = draft.lead_id || employeesOnly.value[0]?.id || 3;
+          const leadId = draft.lead_id || (employeesOnly.value[0]?.id || 3);
           let assignees = Array.isArray(draft.assignee_ids) ? [...draft.assignee_ids] : [leadId];
           if (!assignees.includes(leadId)) assignees.push(leadId);
 
@@ -3537,7 +3536,6 @@ async def index():
           return '🔵 На будущее';
         };
 
-        // ВОССТАНОВЛЕННЫЕ ФУНКЦИИ
         const formatRoleName = (r) => (r === 'OWNER' ? 'Шеф' : r === 'DEPUTY' ? 'Директор' : 'Исполнитель');
         const formatTime = (s) => `${Math.floor((s || 0) / 60).toString().padStart(2, '0')}:${((s || 0) % 60).toString().padStart(2, '0')}`;
 
