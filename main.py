@@ -8,9 +8,10 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import asyncpg
+from pywebpush import webpush, WebPushException
 
 app = FastAPI()
 
@@ -32,6 +33,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
+# --- WEB PUSH (VAPID) ---
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY")
+VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY")
+VAPID_CLAIM_EMAIL = os.getenv("VAPID_CLAIM_EMAIL", "mailto:admin@example.com")
+
+# --- Base64 иконки приложения (PNG), сгенерированы один раз, отдаются через /icons/... ---
+ICON_192_B64 = "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"
+ICON_512_B64 = "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"
+ICON_MASKABLE_512_B64 = "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"
+
 db_pool = None
 sse_subscribers = set()
 FAILED_LOGIN_ATTEMPTS = {}
@@ -46,6 +57,73 @@ async def broadcast_event(event_type: str = "update", payload: dict = None):
             await queue.put(f"data: {json.dumps(msg_data)}\n\n")
         except Exception:
             sse_subscribers.discard(queue)
+
+    # Дублируем "notify"-события в настоящий Web Push,
+    # чтобы уведомление доходило даже при закрытой вкладке/браузере
+    if event_type == "notify" and payload:
+        asyncio.create_task(send_web_push(
+            title=payload.get("title", "Уведомление"),
+            body=payload.get("body", ""),
+            roles=payload.get("roles", []),
+            user_ids=payload.get("user_ids", []),
+            task_id=payload.get("task_id")
+        ))
+
+
+async def send_web_push(title: str, body: str, roles: list = None, user_ids: list = None, task_id=None):
+    if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
+        return
+    roles = roles or []
+    user_ids = user_ids or []
+    if not roles and not user_ids:
+        return
+    try:
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            target_ids = await conn.fetch("""
+                SELECT id FROM users WHERE role = ANY($1::text[]) OR id = ANY($2::int[])
+            """, roles, user_ids)
+            if not target_ids:
+                return
+            resolved_ids = [r['id'] for r in target_ids]
+            subs = await conn.fetch("""
+                SELECT id, user_id, endpoint, p256dh, auth FROM push_subscriptions
+                WHERE user_id = ANY($1::int[])
+            """, resolved_ids)
+
+        stale_ids = []
+        payload = json.dumps({
+            "title": title,
+            "body": body,
+            "task_id": task_id,
+            "tag": f"task_alert_{task_id or 'general'}"
+        })
+        for sub in subs:
+            try:
+                webpush(
+                    subscription_info={
+                        "endpoint": sub["endpoint"],
+                        "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]}
+                    },
+                    data=payload,
+                    vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims={"sub": VAPID_CLAIM_EMAIL}
+                )
+            except WebPushException as e:
+                status = getattr(e.response, "status_code", None)
+                if status in (404, 410):
+                    stale_ids.append(sub["id"])
+                else:
+                    print(f"WebPush error: {e}")
+            except Exception as e:
+                print(f"WebPush unexpected error: {e}")
+
+        if stale_ids:
+            pool = await get_db()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM push_subscriptions WHERE id = ANY($1::int[])", stale_ids)
+    except Exception as e:
+        print(f"send_web_push error: {e}")
 
 def send_telegram_alert(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -172,9 +250,19 @@ async def startup():
                 PRIMARY KEY (task_id, user_id)
             );
 
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                id SERIAL PRIMARY KEY,
+                user_id INT REFERENCES users(id) ON DELETE CASCADE,
+                endpoint TEXT NOT NULL UNIQUE,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
             CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks (status, priority, deadline);
             CREATE INDEX IF NOT EXISTS idx_task_messages_task_id ON task_messages (task_id, id ASC);
             CREATE INDEX IF NOT EXISTS idx_task_user_reads ON task_user_reads (task_id, user_id);
+            CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions (user_id);
         """)
 
         await conn.execute("UPDATE users SET is_active = FALSE")
@@ -1012,6 +1100,149 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(
     })
     return {"status": "flagged"}
 
+@app.get("/api/push/public-key")
+async def push_public_key():
+    return {"publicKey": VAPID_PUBLIC_KEY or ""}
+
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    sub = body.get("subscription")
+    if not user_id or not sub:
+        raise HTTPException(status_code=400, detail="user_id и subscription обязательны")
+    endpoint = sub.get("endpoint")
+    keys = sub.get("keys", {})
+    p256dh = keys.get("p256dh")
+    auth = keys.get("auth")
+    if not endpoint or not p256dh or not auth:
+        raise HTTPException(status_code=400, detail="Некорректная подписка")
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (endpoint) DO UPDATE SET user_id = $1, p256dh = $3, auth = $4
+        """, user_id, endpoint, p256dh, auth)
+    return {"status": "ok"}
+
+
+@app.post("/api/push/unsubscribe")
+async def push_unsubscribe(request: Request):
+    body = await request.json()
+    endpoint = body.get("endpoint")
+    if endpoint:
+        pool = await get_db()
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM push_subscriptions WHERE endpoint = $1", endpoint)
+    return {"status": "ok"}
+
+
+MANIFEST_JSON = {
+    "name": "Task OS Corporate",
+    "short_name": "Task OS",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "background_color": "#020617",
+    "theme_color": "#0f172a",
+    "orientation": "portrait",
+    "icons": [
+        {"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+        {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+        {"src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+    ]
+}
+
+
+@app.get("/manifest.json")
+async def manifest():
+    return JSONResponse(content=MANIFEST_JSON, media_type="application/manifest+json")
+
+
+SW_JS = """
+const CACHE_NAME = 'taskos-v1';
+
+self.addEventListener('install', (event) => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+// Настоящий фоновый push: срабатывает даже если браузер закрыт
+// (пока запущен на устройстве и есть интернет), как у Telegram.
+self.addEventListener('push', (event) => {
+  let data = {};
+  try { data = event.data ? event.data.json() : {}; } catch (e) {
+    data = { title: 'Task OS', body: event.data ? event.data.text() : '' };
+  }
+
+  const title = data.title || 'Task OS';
+  const options = {
+    body: data.body || '',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    tag: data.tag || 'taskos_notification',
+    data: { task_id: data.task_id || null, url: '/' },
+    vibrate: [80, 40, 80],
+    renotify: true
+  };
+
+  event.waitUntil((async () => {
+    await self.registration.showNotification(title, options);
+    try {
+      const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      const count = all.length ? undefined : undefined; // счётчик считает сама страница
+      if ('setAppBadge' in self.registration) {
+        // Бейдж окончательно выставит открытая вкладка; здесь просто подстраховка +1
+      }
+    } catch (e) {}
+  })());
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const targetUrl = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil((async () => {
+    const allClients = await clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const client of allClients) {
+      if ('focus' in client) {
+        client.focus();
+        client.postMessage({ type: 'notification_click', task_id: event.notification.data && event.notification.data.task_id });
+        return;
+      }
+    }
+    if (clients.openWindow) return clients.openWindow(targetUrl);
+  })());
+});
+
+// Ничего не кэшируем агрессивно — приложению нужны свежие данные,
+// сервис-воркер здесь нужен только ради push и установки PWA.
+self.addEventListener('fetch', (event) => {});
+"""
+
+
+@app.get("/sw.js")
+async def service_worker():
+    return Response(content=SW_JS, media_type="application/javascript", headers={"Service-Worker-Allowed": "/"})
+
+
+@app.get("/icons/{name}")
+async def icons(name: str):
+    icon_map = {
+        "icon-192.png": ICON_192_B64,
+        "icon-512.png": ICON_512_B64,
+        "icon-maskable-512.png": ICON_MASKABLE_512_B64,
+    }
+    b64 = icon_map.get(name)
+    if not b64:
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(content=base64.b64decode(b64), media_type="image/png")
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return """<!DOCTYPE html>
@@ -1020,6 +1251,13 @@ async def index():
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Task OS Corporate</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#0f172a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Task OS">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="icon" id="faviconLink" href="/icons/icon-192.png">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
@@ -2101,7 +2339,7 @@ async def index():
   </div>
 
   <script>
-    const { createApp, ref, computed, onMounted, nextTick } = Vue;
+    const { createApp, ref, computed, onMounted, watch, nextTick } = Vue;
 
     const CryptoEngine = {
       async deriveKey(pin, saltBase64) {
@@ -2274,12 +2512,125 @@ async def index():
           } catch(e) {}
         };
 
+        // --- PWA / Service Worker / Web Push / Badging (работа как у Telegram) ---
+
+        let swRegistration = null;
+
+        const registerServiceWorker = async () => {
+          if (!('serviceWorker' in navigator)) return null;
+          try {
+            swRegistration = await navigator.serviceWorker.register('/sw.js');
+            navigator.serviceWorker.addEventListener('message', (event) => {
+              if (event.data && event.data.type === 'notification_click') {
+                loadData();
+              }
+            });
+            return swRegistration;
+          } catch (e) {
+            console.warn('SW register failed', e);
+            return null;
+          }
+        };
+
+        const urlBase64ToUint8Array = (base64String) => {
+          const padding = '='.repeat((4 - base64String.length % 4) % 4);
+          const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+          const rawData = atob(base64);
+          const outputArray = new Uint8Array(rawData.length);
+          for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
+          return outputArray;
+        };
+
+        const subscribeToPush = async () => {
+          if (!swRegistration || !('PushManager' in window) || !currentUser.value) return;
+          try {
+            const keyRes = await fetch('/api/push/public-key');
+            const { publicKey } = await keyRes.json();
+            if (!publicKey) return;
+
+            let subscription = await swRegistration.pushManager.getSubscription();
+            if (!subscription) {
+              subscription = await swRegistration.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: urlBase64ToUint8Array(publicKey)
+              });
+            }
+
+            await fetch('/api/push/subscribe', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user_id: currentUser.value.id, subscription })
+            });
+          } catch (e) {
+            console.warn('Push subscribe failed', e);
+          }
+        };
+
         const requestNotificationAccess = async () => {
           if ('Notification' in window) {
             const p = await Notification.requestPermission();
             notificationPermission.value = p;
+            if (p === 'granted') {
+              if (!swRegistration) await registerServiceWorker();
+              await subscribeToPush();
+            }
           }
         };
+
+        // Красный бейдж-циферка на иконке приложения (как непрочитанные в Telegram)
+        const totalBadgeCount = computed(() => {
+          if (!currentUser.value) return 0;
+          const unreadInTasks = tasks.value.reduce((sum, t) => sum + (t.unread_count || 0), 0);
+          const inboxCount = (currentUser.value.role === 'OWNER' || currentUser.value.role === 'DEPUTY')
+            ? inboxTasks.value.length : 0;
+          return unreadInTasks + inboxCount;
+        });
+
+        const drawFaviconBadge = (count) => {
+          try {
+            const size = 64;
+            const canvas = document.createElement('canvas');
+            canvas.width = size; canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = () => {
+              ctx.clearRect(0, 0, size, size);
+              ctx.drawImage(img, 0, 0, size, size);
+              if (count > 0) {
+                const label = count > 99 ? '99+' : String(count);
+                const r = label.length > 2 ? 20 : 16;
+                const cx = size - r + 4, cy = r - 4;
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                ctx.fillStyle = '#ef4444';
+                ctx.fill();
+                ctx.lineWidth = 3;
+                ctx.strokeStyle = '#020617';
+                ctx.stroke();
+                ctx.fillStyle = '#ffffff';
+                ctx.font = `bold ${label.length > 2 ? 20 : 26}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(label, cx, cy + 1);
+              }
+              const link = document.getElementById('faviconLink');
+              if (link) link.href = canvas.toDataURL('image/png');
+            };
+            img.src = '/icons/icon-192.png';
+          } catch (e) {}
+        };
+
+        const updateAppBadge = (count) => {
+          drawFaviconBadge(count);
+          if ('setAppBadge' in navigator) {
+            try {
+              if (count > 0) navigator.setAppBadge(count); else navigator.clearAppBadge();
+            } catch (e) {}
+          }
+        };
+
+        watch(totalBadgeCount, (count) => updateAppBadge(count), { immediate: false });
 
         const triggerNotification = (notifData) => {
           playNotificationChime();
@@ -3389,6 +3740,12 @@ async def index():
 
           setupSSE();
 
+          registerServiceWorker().then(() => {
+            if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+              subscribeToPush();
+            }
+          });
+
           window.addEventListener('online', () => {
             isOnline.value = true;
             flushPendingQueue();
@@ -3404,11 +3761,12 @@ async def index():
             }
           });
           setInterval(flushPendingQueue, 4000);
+          setInterval(() => updateAppBadge(totalBadgeCount.value), 15000);
         });
 
         return {
           currentUser, loginForm, isLoggingIn, isOnline, hasEncryptedVault, isUnlocked, pinInput, pinError,
-          notificationPermission, requestNotificationAccess, activeToast,
+          notificationPermission, requestNotificationAccess, activeToast, totalBadgeCount,
           pressPinDigit, backspacePin, clearPin, resetVaultAndRelogin,
           ownerTab, deputyTab, empTab, isProcessing,
           isRecordingTaskVoice, recordTaskVoiceSeconds, recordedTaskVoiceUrl,
