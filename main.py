@@ -37,7 +37,7 @@ sse_subscribers = set()
 FAILED_LOGIN_ATTEMPTS = {}
 DEADLINE_ALERTS_SENT = set()
 
-# PWA MANIFEST ДЛЯ УСТАНОВКИ НА РАБОЧИЙ СТОЛ ТЕЛЕФОНА/ПК
+# PWA MANIFEST ДЛЯ УСТАНОВКИ НА РАБОЧИЙ СТОЛ
 @app.get("/manifest.json")
 async def manifest():
     m = {
@@ -59,7 +59,7 @@ async def manifest():
     }
     return Response(content=json.dumps(m), media_type="application/manifest+json")
 
-# СЕРВИСНЫЙ ВОРКЕР (ВЫВОД КОНТЕКСТА В ШТОРКУ И УПРАВЛЕНИЕ БЕЙДЖЕМ)
+# СЕРВИСНЫЙ ВОРКЕР
 @app.get("/sw.js")
 async def service_worker():
     js = """
@@ -443,6 +443,7 @@ async def get_task_voice(task_id: int):
             mime = header.split(";")[0].replace("data:", "")
         return Response(content=base64.b64decode(encoded), media_type=mime)
 
+# СОЗДАНИЕ ГОЛОСОВОГО ПОРУЧЕНИЯ
 @app.post("/api/tasks/create-voice")
 async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1)):
     try:
@@ -492,6 +493,7 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# СОЗДАНИЕ ТЕКСТОВОГО ПОРУЧЕНИЯ
 @app.post("/api/tasks/create-text")
 async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
     try:
@@ -527,6 +529,7 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# УДАЛЕНИЕ ВХОДЯЩЕЙ ЗАДАЧИ
 @app.post("/api/tasks/{task_id}/delete")
 async def delete_task(task_id: int, user_id: int = Form(...)):
     pool = await get_db()
@@ -557,6 +560,7 @@ async def delete_task(task_id: int, user_id: int = Form(...)):
     })
     return {"status": "ok"}
 
+# НАЗНАЧЕНИЕ В РАБОТУ
 @app.post("/api/tasks/{task_id}/assign")
 async def assign_task(
     task_id: int, 
@@ -631,6 +635,7 @@ async def assign_task(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# ИЗМЕНЕНИЕ ПАРАМЕТРОВ ТЗ И ДЕДЛАЙНА
 @app.post("/api/tasks/{task_id}/update-details")
 async def update_task_details(
     task_id: int,
@@ -711,6 +716,7 @@ async def update_task_details(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ
 @app.post("/api/tasks/{task_id}/update-team")
 async def update_task_team(
     task_id: int,
@@ -779,6 +785,7 @@ async def update_task_team(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# СМЕНА ЭТАПА ДИРЕКТОРОМ
 @app.post("/api/tasks/{task_id}/set-stage")
 async def set_stage(
     task_id: int,
@@ -825,6 +832,7 @@ async def set_stage(
     })
     return {"status": "ok"}
 
+# ЗАПРОС ЭТАПА ЛИДОМ
 @app.post("/api/tasks/{task_id}/request-stage")
 async def request_stage(
     task_id: int,
@@ -859,6 +867,7 @@ async def request_stage(
     })
     return {"status": "ok"}
 
+# РЕШЕНИЕ ДИРЕКТОРА ПО ЗАПРОСУ ЭТАПА
 @app.post("/api/tasks/{task_id}/confirm-stage-request")
 async def confirm_stage_request(
     task_id: int,
@@ -1123,15 +1132,15 @@ async def index():
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
+  <!-- Быстрый и надежный CDN jsdelivr -->
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.4.21/dist/vue.global.prod.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <style>
-    [v-cloak] { display: none !important; }
     .overscroll-contain { overscroll-behavior: contain; }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased select-none">
-  <div id="app" v-cloak class="max-w-md mx-auto p-3.5 pb-24 relative">
+  <div id="app" class="max-w-md mx-auto p-3.5 pb-24 relative">
     
     <!-- ВСплывающий баннер УВЕДОМЛЕНИЯ (TOAST) -->
     <transition enter-active-class="transition duration-300 ease-out" enter-from-class="transform -translate-y-6 opacity-0" enter-to-class="transform translate-y-0 opacity-100" leave-active-class="transition duration-200 ease-in" leave-from-class="opacity-100" leave-to-class="opacity-0">
@@ -1640,8 +1649,8 @@ async def index():
               </div>
             </div>
 
-            <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ -->
-            <div v-if="t.status === 'DRAFT'" class="space-y-2.5 pt-1 border-t border-slate-800">
+            <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ (С БЕЗОПАСНЫМ РЕНДЕРИНГОМ) -->
+            <div v-if="t.status === 'DRAFT' && editDrafts[t.id]" class="space-y-2.5 pt-1 border-t border-slate-800">
               <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
               <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
               <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" placeholder="Критерии сдачи (DoD)" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
@@ -2243,7 +2252,6 @@ async def index():
 
     const app = createApp({
       setup() {
-        // 1. ВСЕ БАЗОВЫЕ РЕАКТИВНЫЕ ПЕРЕМЕННЫЕ
         const currentUser = ref(null);
         const loginForm = ref({ username: '', password: '', pin: '1234' });
         const isLoggingIn = ref(false);
@@ -2323,7 +2331,6 @@ async def index():
         let globalAudio = null;
         const voiceBlobCache = {};
 
-        // 2. ВЫЧИСЛЯЕМЫЕ СВОЙСТВА
         const roleBadgeTitle = computed(() => {
           if (!currentUser.value) return '';
           if (currentUser.value.role === 'OWNER') return 'Шеф (Владелец)';
@@ -2416,7 +2423,6 @@ async def index():
           }
         };
 
-        // 3. БЕЙДЖИ И PUSH
         const updateIconBadge = (count) => {
           if ('setAppBadge' in navigator) {
             if (count > 0) {
@@ -2516,7 +2522,6 @@ async def index():
           }
         };
 
-        // 4. ВСПОМОГАТЕЛЬНЫЕ ФОРМАТТЕРЫ
         const formatLocalDT = (isoStr) => {
           if (!isoStr) return '';
           const d = new Date(isoStr);
@@ -3532,8 +3537,9 @@ async def index():
           return '🔵 На будущее';
         };
 
+        // ВОССТАНОВЛЕННЫЕ ФУНКЦИИ
         const formatRoleName = (r) => (r === 'OWNER' ? 'Шеф' : r === 'DEPUTY' ? 'Директор' : 'Исполнитель');
-        const formatTime = (s) => `${Math.floor(s / 60).toString().padStart(2, '0')}:${(s % 60).toString().padStart(2, '0')}`;
+        const formatTime = (s) => `${Math.floor((s || 0) / 60).toString().padStart(2, '0')}:${((s || 0) % 60).toString().padStart(2, '0')}`;
 
         onMounted(() => {
           if ('serviceWorker' in navigator) {
@@ -3565,7 +3571,6 @@ async def index():
           setInterval(flushPendingQueue, 4000);
         });
 
-        // 5. ВОЗВРАТ ВСЕХ ПЕРЕМЕННЫХ И МЕТОДОВ В ШАБЛОН
         return {
           currentUser, loginForm, isLoggingIn, isOnline, hasEncryptedVault, isUnlocked, pinInput, pinError,
           notificationPermission, requestNotificationAccess, activeToast, totalUnreadCount,
@@ -3597,7 +3602,7 @@ async def index():
     });
 
     app.config.errorHandler = (err, vm, info) => {
-      console.error('Vue Runtime Error:', err, info);
+      console.error('Vue Error:', err, info);
     };
 
     app.mount('#app');
