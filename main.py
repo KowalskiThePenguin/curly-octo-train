@@ -37,7 +37,6 @@ sse_subscribers = set()
 FAILED_LOGIN_ATTEMPTS = {}
 DEADLINE_ALERTS_SENT = set()
 
-# СЕРВИСНЫЙ ВОРКЕР ДЛЯ МОБИЛЬНЫХ PUSH-УВЕДОМЛЕНИЙ (ANDROID / CHROME / SAFARI)
 @app.get("/sw.js")
 async def service_worker():
     js = """
@@ -106,7 +105,11 @@ async def keep_alive_worker():
         except Exception as e:
             print(f"Keep-alive error: {e}")
 
-# ФОНОВЫЙ СЕРВИС: ЕЖЕЧАСНЫЙ КОНТРОЛЬ ДЕДЛАЙНОВ ЗА 4 ЧАСА ДО СРОКА
+# ОЧИСТКА КЭША ДЕДЛАЙНОВ ДЛЯ КОНКРЕТНОЙ ЗАДАЧИ
+def clear_deadline_cache(task_id: int):
+    global DEADLINE_ALERTS_SENT
+    DEADLINE_ALERTS_SENT = {key for key in DEADLINE_ALERTS_SENT if key[0] != task_id}
+
 async def deadline_checker_worker():
     while True:
         await asyncio.sleep(60)
@@ -146,7 +149,8 @@ async def deadline_checker_worker():
                                     "body": body,
                                     "roles": ["OWNER", "DEPUTY"],
                                     "user_ids": list(targets),
-                                    "task_id": r['id']
+                                    "task_id": r['id'],
+                                    "sender_id": 0
                                 })
                                 send_telegram_alert(f"⏰ <b>Внимание! До дедлайна {bracket} {hours_word}!</b>\n<b>Задача #{r['id']}:</b> {r['title']}\n<b>Проект:</b> {r['project_group']}\n<b>Лид:</b> {r['lead_name']}")
         except Exception as e:
@@ -403,6 +407,7 @@ async def get_task_voice(task_id: int):
             mime = header.split(";")[0].replace("data:", "")
         return Response(content=base64.b64decode(encoded), media_type=mime)
 
+# СОЗДАНИЕ ГОЛОСОВОГО ПОРУЧЕНИЯ
 @app.post("/api/tasks/create-voice")
 async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1)):
     try:
@@ -423,6 +428,7 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         async with pool.acquire() as conn:
             creator = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
             creator_name = creator['full_name'] if creator else "Руководство"
+            creator_role = creator['role'] if creator else "OWNER"
 
             task_id = await conn.fetchval("""
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
@@ -437,19 +443,21 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
 
         send_telegram_alert(f"🎙 <b>Новое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         
-        target_roles = ["DEPUTY"] if creator.get('role') == 'OWNER' else ["OWNER"]
+        target_roles = ["DEPUTY"] if creator_role == 'OWNER' else ["OWNER"]
         await broadcast_event("notify", {
             "title": f"📋 Новое поручение #{task_id}",
             "body": f"{creator_name}: {parsed.get('title')}",
             "roles": target_roles,
             "user_ids": [],
-            "task_id": task_id
+            "task_id": task_id,
+            "sender_id": user_id
         })
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# СОЗДАНИЕ ТЕКСТОВОГО ПОРУЧЕНИЯ
 @app.post("/api/tasks/create-text")
 async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
     try:
@@ -460,6 +468,7 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
         async with pool.acquire() as conn:
             creator = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
             creator_name = creator['full_name'] if creator else "Руководство"
+            creator_role = creator['role'] if creator else "OWNER"
 
             task_id = await conn.fetchval("""
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
@@ -469,19 +478,21 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
 
         send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         
-        target_roles = ["DEPUTY"] if creator.get('role') == 'OWNER' else ["OWNER"]
+        target_roles = ["DEPUTY"] if creator_role == 'OWNER' else ["OWNER"]
         await broadcast_event("notify", {
             "title": f"📝 Новое поручение #{task_id}",
             "body": f"{creator_name}: {parsed.get('title')}",
             "roles": target_roles,
             "user_ids": [],
-            "task_id": task_id
+            "task_id": task_id,
+            "sender_id": user_id
         })
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# УДАЛЕНИЕ ВХОДЯЩЕЙ ЗАДАЧИ
 @app.post("/api/tasks/{task_id}/delete")
 async def delete_task(task_id: int, user_id: int = Form(...)):
     pool = await get_db()
@@ -494,11 +505,25 @@ async def delete_task(task_id: int, user_id: int = Form(...)):
         if task['status'] != 'DRAFT':
             raise HTTPException(status_code=400, detail="Удалять можно только поручения из раздела 'Входящие'.")
         
+        remover = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
+        remover_name = remover['full_name'] if remover else 'Пользователь'
+        remover_role = remover['role'] if remover else 'OWNER'
+
         await conn.execute("DELETE FROM tasks WHERE id = $1", task_id)
 
-    await broadcast_event("task_deleted")
+    clear_deadline_cache(task_id)
+    target_roles = ["DEPUTY"] if remover_role == 'OWNER' else ["OWNER"]
+    await broadcast_event("notify", {
+        "title": f"🗑 Поручение #{task_id} отозвано",
+        "body": f"{remover_name} удалил входящую задачу «{task['title']}»",
+        "roles": target_roles,
+        "user_ids": [],
+        "task_id": task_id,
+        "sender_id": user_id
+    })
     return {"status": "ok"}
 
+# НАЗНАЧЕНИЕ В РАБОТУ
 @app.post("/api/tasks/{task_id}/assign")
 async def assign_task(
     task_id: int, 
@@ -557,20 +582,23 @@ async def assign_task(
                 VALUES ($1, 2, 'DEPUTY', 'Жамолиддин', 'SYSTEM', $2)
             """, task_id, f"🚀 Задача утверждена и передана в работу.\n📁 Группа: {project_group}\n👑 Лид: {lead_name}\n👥 Команда: {team_str}")
 
+        clear_deadline_cache(task_id)
         send_telegram_alert(f"🚀 <b>Задача #{task_id} передана в работу</b>\n📁 <b>Группа:</b> {project_group}\n👑 <b>Лид:</b> {lead_name}\n<b>Приоритет:</b> {priority}")
         
         await broadcast_event("notify", {
-            "title": f"🚀 Назначена задача #{task_id}",
+            "title": f"🚀 Задача #{task_id} передана в работу",
             "body": f"Лид: {lead_name} | {title or 'В работе'}",
             "roles": ["OWNER"],
             "user_ids": parsed_assignees,
-            "task_id": task_id
+            "task_id": task_id,
+            "sender_id": 2
         })
         return {"status": "ok"}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# ИЗМЕНЕНИЕ ПАРАМЕТРОВ ТЗ И ДЕДЛАЙНА
 @app.post("/api/tasks/{task_id}/update-details")
 async def update_task_details(
     task_id: int,
@@ -612,7 +640,6 @@ async def update_task_details(
             """, title, ai_summary, definition_of_done, project_group, priority, dt_deadline, task_id)
 
             priority_map = {'URGENT': '🔴 Оперативно', 'NORMAL': '🟡 Умеренно', 'FUTURE': '🔵 На будущее'}
-            
             changes = []
             if old_task:
                 if old_task['title'] != title:
@@ -637,18 +664,21 @@ async def update_task_details(
             if old_task and old_task['lead_user_id']:
                 assignees.add(old_task['lead_user_id'])
 
+        clear_deadline_cache(task_id)
         await broadcast_event("notify", {
-            "title": f"✏️ Изменение параметров #{task_id}",
+            "title": f"✏️ Изменение ТЗ/Срока #{task_id}",
             "body": f"Директор обновил параметры задачи «{title}»",
             "roles": ["OWNER"],
             "user_ids": list(assignees),
-            "task_id": task_id
+            "task_id": task_id,
+            "sender_id": 2
         })
         return {"status": "ok"}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ С УВЕДОМЛЕНИЕМ СНЯТЫХ
 @app.post("/api/tasks/{task_id}/update-team")
 async def update_task_team(
     task_id: int,
@@ -666,7 +696,7 @@ async def update_task_team(
 
         pool = await get_db()
         async with pool.acquire() as conn:
-            old_task = await conn.fetchrow("SELECT lead_user_id FROM tasks WHERE id = $1", task_id)
+            old_task = await conn.fetchrow("SELECT title, lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
             old_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", old_task['lead_user_id']) if old_task else 'Не назначен'
             new_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
             
@@ -688,13 +718,30 @@ async def update_task_team(
                 VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
             """, task_id, user_name, sys_msg)
 
+            old_members = set(old_task['assignee_ids'] or []) if old_task else set()
+            removed_members = old_members - set(parsed_assignees)
+
+        # Пуш для действующих участников и Шефа
         await broadcast_event("notify", {
-            "title": f"👥 Смена состава команды #{task_id}",
-            "body": f"Лид: {new_lead_name} | Исполнители: {new_team_str}",
+            "title": f"👥 Обновлен состав #{task_id}",
+            "body": f"Лид: {new_lead_name} | Команда: {new_team_str}",
             "roles": ["OWNER"],
             "user_ids": parsed_assignees,
-            "task_id": task_id
+            "task_id": task_id,
+            "sender_id": 2
         })
+
+        # Отдельный пуш для снятых сотрудников
+        if removed_members:
+            await broadcast_event("notify", {
+                "title": f"ℹ️ Вы сняты с задачи #{task_id}",
+                "body": f"Директор изменил состав команды задачи «{old_task['title']}»",
+                "roles": [],
+                "user_ids": list(removed_members),
+                "task_id": task_id,
+                "sender_id": 2
+            })
+
         return {"status": "ok"}
     except HTTPException:
         raise
@@ -702,6 +749,7 @@ async def update_task_team(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
+# СМЕНА ЭТАПА ДИРЕКТОРОМ
 @app.post("/api/tasks/{task_id}/set-stage")
 async def set_stage(
     task_id: int,
@@ -718,6 +766,7 @@ async def set_stage(
                 WHERE id = $1
             """, task_id)
             sys_msg = f"🏁 Директор {user_name} утвердил и перевел задачу в архив."
+            clear_deadline_cache(task_id)
         else:
             prog_val = int(stage)
             await conn.execute("""
@@ -738,14 +787,16 @@ async def set_stage(
 
     label = "в архив" if stage == 'ARCHIVE' else f"{stage}%"
     await broadcast_event("notify", {
-        "title": f"⚡ Этап задачи #{task_id}: {label}",
+        "title": f"⚡ Прогресс задачи #{task_id}: {label}",
         "body": sys_msg,
         "roles": ["OWNER"],
         "user_ids": list(targets),
-        "task_id": task_id
+        "task_id": task_id,
+        "sender_id": 2
     })
     return {"status": "ok"}
 
+# ЗАПРОС ЭТАПА ЛИДОМ
 @app.post("/api/tasks/{task_id}/request-stage")
 async def request_stage(
     task_id: int,
@@ -775,10 +826,12 @@ async def request_stage(
         "body": f"Лид {user_name} запросил {target_str}",
         "roles": ["DEPUTY", "OWNER"],
         "user_ids": [],
-        "task_id": task_id
+        "task_id": task_id,
+        "sender_id": user_id
     })
     return {"status": "ok"}
 
+# РЕШЕНИЕ ДИРЕКТОРА ПО ЗАПРОСУ ЭТАПА
 @app.post("/api/tasks/{task_id}/confirm-stage-request")
 async def confirm_stage_request(
     task_id: int,
@@ -804,9 +857,10 @@ async def confirm_stage_request(
         if approve:
             if req_stage == 'ARCHIVE':
                 await conn.execute("UPDATE tasks SET status = 'ARCHIVED', progress = 100, completed_at = NOW(), pending_request = NULL WHERE id = $1", task_id)
+                clear_deadline_cache(task_id)
             else:
                 await conn.execute("UPDATE tasks SET progress = $1, pending_request = NULL WHERE id = $2", int(req_stage), task_id)
-            sys_msg = f"✅ Директор {user_name} подтвердил запрос (Лид {lead_name}: {target_str})."
+            sys_msg = f"✅ Директор {user_name} утвердил запрос (Лид {lead_name}: {target_str})."
             push_title = f"✅ Запрос утвержден (#{task_id})"
         else:
             await conn.execute("UPDATE tasks SET pending_request = NULL WHERE id = $1", task_id)
@@ -827,7 +881,8 @@ async def confirm_stage_request(
         "body": sys_msg,
         "roles": ["OWNER"],
         "user_ids": list(targets),
-        "task_id": task_id
+        "task_id": task_id,
+        "sender_id": 2
     })
     return {"status": "ok"}
 
@@ -893,8 +948,8 @@ async def send_text_msg(
         recipients = set(task['assignee_ids'] or []) if task else set()
         if task and task['lead_user_id']:
             recipients.add(task['lead_user_id'])
-        recipients.add(1)
-        recipients.add(2)
+        recipients.add(1) # Шеф
+        recipients.add(2) # Директор
         recipients.discard(sender_id)
 
     await broadcast_event("notify", {
@@ -902,7 +957,8 @@ async def send_text_msg(
         "body": f"{sender_name}: {content[:60]}",
         "roles": [],
         "user_ids": list(recipients),
-        "task_id": task_id
+        "task_id": task_id,
+        "sender_id": sender_id
     })
     return {"status": "ok", "id": msg_id}
 
@@ -946,7 +1002,8 @@ async def send_voice_msg(
         "body": f"{sender_name} отправил голосовое сообщение",
         "roles": [],
         "user_ids": list(recipients),
-        "task_id": task_id
+        "task_id": task_id,
+        "sender_id": sender_id
     })
     return {"status": "ok", "id": msg_id}
 
@@ -990,7 +1047,8 @@ async def send_image_msg(
         "body": f"{sender_name} прикрепил изображение",
         "roles": [],
         "user_ids": list(recipients),
-        "task_id": task_id
+        "task_id": task_id,
+        "sender_id": sender_id
     })
     return {"status": "ok", "id": msg_id}
 
@@ -1019,7 +1077,8 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(
         "body": f"{sender_name}: {reason}",
         "roles": ["OWNER", "DEPUTY"],
         "user_ids": [],
-        "task_id": task_id
+        "task_id": task_id,
+        "sender_id": sender_id
     })
     return {"status": "flagged"}
 
@@ -2286,10 +2345,14 @@ async def index():
           } catch(e) {}
         };
 
-        // ПРЯМОЙ СИНХРОННЫЙ ЗАПРОС РАЗРЕШЕНИЯ ПО КЛИКУ ПОЛЬЗОВАТЕЛЯ
         const requestNotificationAccess = () => {
           if (!('Notification' in window)) {
-            alert('Ваш браузер не поддерживает Push-уведомления. Откройте приложение в Google Chrome.');
+            alert('Ваш браузер не поддерживает Push-уведомления. Откройте сайт в Google Chrome.');
+            return;
+          }
+
+          if (Notification.permission === 'denied') {
+            alert('⚠️ Уведомления были заблокированы в вашем браузере.\nНажмите на замочек 🔒 слева от адресной строки и переключите Уведомления в положение «Разрешить».');
             return;
           }
 
@@ -2298,15 +2361,12 @@ async def index():
             if (permission === 'granted') {
               triggerNotification({
                 title: "✅ Уведомления включены!",
-                body: "Теперь вы будете получать важные события и сигналы дедлайнов."
+                body: "Теперь вы будете вовремя получать важные события и сигналы дедлайнов."
               });
-            } else {
-              alert('Разрешение отклонено. Включите уведомления в настройках сайта в браузере.');
             }
           });
         };
 
-        // ОТПРАВКА СИСТЕМНОГО PUSH-УВЕДОМЛЕНИЯ ЧЕРЕЗ SERVICE WORKER
         const triggerNotification = async (notifData) => {
           playNotificationChime();
 
@@ -2321,12 +2381,13 @@ async def index():
             try {
               if ('serviceWorker' in navigator) {
                 const reg = await navigator.serviceWorker.ready;
-                await reg.showNotification(notifData.title, {
-                  body: notifData.body,
-                  tag: 'task_' + (notifData.task_id || Date.now()),
-                  vibrate: [200, 100, 200]
-                });
-                return;
+                if (reg && reg.showNotification) {
+                  await reg.showNotification(notifData.title, {
+                    body: notifData.body,
+                    tag: 'task_' + (notifData.task_id || Date.now())
+                  });
+                  return;
+                }
               }
             } catch(e) {}
 
@@ -2525,7 +2586,6 @@ async def index():
           };
 
           globalAudio.play().catch(e => {
-            console.error("Audio playback error:", e);
             isAudioPlaying.value = false;
           });
         };
@@ -2734,11 +2794,16 @@ async def index():
             try {
               const data = JSON.parse(event.data);
               if (data.event === "notify" && currentUser.value) {
-                const targetRoles = data.roles || [];
-                const targetUsers = data.user_ids || [];
-                const isTarget = targetRoles.includes(currentUser.value.role) || targetUsers.includes(currentUser.value.id);
-                if (isTarget) {
-                  triggerNotification(data);
+                // Исключаем уведомление автора о его собственном действии
+                if (data.sender_id && Number(data.sender_id) === Number(currentUser.value.id)) {
+                  // Автор действия пуш не получает
+                } else {
+                  const targetRoles = data.roles || [];
+                  const targetUsers = (data.user_ids || []).map(Number);
+                  const isTarget = targetRoles.includes(currentUser.value.role) || targetUsers.includes(Number(currentUser.value.id));
+                  if (isTarget) {
+                    triggerNotification(data);
+                  }
                 }
               }
             } catch(e) {}
@@ -3416,9 +3481,8 @@ async def index():
         const formatTime = (s) => `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
 
         onMounted(() => {
-          // РЕГИСТРАЦИЯ СЕРВИСНОГО ВОРКЕРА ДЛЯ МОБИЛЬНЫХ УВЕДОМЛЕНИЙ
           if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW error:', err));
+            navigator.serviceWorker.register('/sw.js').catch(() => {});
           }
 
           const salt = localStorage.getItem('task_vault_salt');
