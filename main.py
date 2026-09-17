@@ -37,60 +37,6 @@ sse_subscribers = set()
 FAILED_LOGIN_ATTEMPTS = {}
 DEADLINE_ALERTS_SENT = set()
 
-@app.get("/manifest.json")
-async def manifest():
-    m = {
-        "name": "Task OS Corporate",
-        "short_name": "Task OS",
-        "description": "Корпоративная операционная система контроля задач",
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#020617",
-        "theme_color": "#4f46e5",
-        "icons": [
-            {
-                "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='128' fill='%234f46e5'/><path fill='%23ffffff' d='M256 128c-70.7 0-128 57.3-128 128s57.3 128 128 128 128-57.3 128-128-57.3-128-128-128zm-20 196l-60-60 28.3-28.3 31.7 31.7 75.7-75.7 28.3 28.3-104 104z'/></svg>",
-                "sizes": "512x512",
-                "type": "image/svg+xml",
-                "purpose": "any maskable"
-            }
-        ]
-    }
-    return Response(content=json.dumps(m), media_type="application/manifest+json")
-
-@app.get("/sw.js")
-async def service_worker():
-    js = """
-    self.addEventListener('install', (e) => self.skipWaiting());
-    self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
-
-    self.addEventListener('message', (event) => {
-        if (event.data && event.data.type === 'SET_BADGE') {
-            const count = event.data.count || 0;
-            if (self.navigator && 'setAppBadge' in self.navigator) {
-                if (count > 0) {
-                    self.navigator.setAppBadge(count).catch(() => {});
-                } else {
-                    self.navigator.clearAppBadge().catch(() => {});
-                }
-            }
-        }
-    });
-
-    self.addEventListener('notificationclick', (e) => {
-        e.notification.close();
-        e.waitUntil(
-            clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
-                for (let client of windowClients) {
-                    if (client.url && 'focus' in client) return client.focus();
-                }
-                if (clients.openWindow) return clients.openWindow('/');
-            })
-        );
-    });
-    """
-    return Response(content=js, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
-
 async def broadcast_event(event_type: str = "update", payload: dict = None):
     msg_data = {"event": event_type}
     if payload:
@@ -140,10 +86,7 @@ async def keep_alive_worker():
         except Exception as e:
             print(f"Keep-alive error: {e}")
 
-def clear_deadline_cache(task_id: int):
-    global DEADLINE_ALERTS_SENT
-    DEADLINE_ALERTS_SENT = {key for key in DEADLINE_ALERTS_SENT if key[0] != task_id}
-
+# ФОНОВЫЙ СЕРВИС: ЕЖЕЧАСНЫЙ КОНТРОЛЬ ДЕДЛАЙНОВ ЗА 4 ЧАСА ДО СРОКА
 async def deadline_checker_worker():
     while True:
         await asyncio.sleep(60)
@@ -169,6 +112,7 @@ async def deadline_checker_worker():
                             alert_key = (r['id'], bracket)
                             if alert_key not in DEADLINE_ALERTS_SENT:
                                 DEADLINE_ALERTS_SENT.add(alert_key)
+                                
                                 targets = set(r['assignee_ids'] or [])
                                 if r['lead_user_id']:
                                     targets.add(r['lead_user_id'])
@@ -182,8 +126,7 @@ async def deadline_checker_worker():
                                     "body": body,
                                     "roles": ["OWNER", "DEPUTY"],
                                     "user_ids": list(targets),
-                                    "task_id": r['id'],
-                                    "sender_id": 0
+                                    "task_id": r['id']
                                 })
                                 send_telegram_alert(f"⏰ <b>Внимание! До дедлайна {bracket} {hours_word}!</b>\n<b>Задача #{r['id']}:</b> {r['title']}\n<b>Проект:</b> {r['project_group']}\n<b>Лид:</b> {r['lead_name']}")
         except Exception as e:
@@ -237,7 +180,7 @@ async def startup():
         await conn.execute("UPDATE users SET is_active = FALSE")
 
         team_users = [
-            (1, 'khurshid', 'Хуршид', 'OWNER', 'Дирекция', 'khurshid', 'treds5'),
+            (1, 'Zernovoy Put', 'Зерновой Путь', 'OWNER', 'Дирекция', 'zernovoy put', 'treds5'),
             (2, 'zhamoliddin', 'Жамолиддин', 'DEPUTY', 'Управление', 'zhamoliddin', 'tru1'),
             (3, 'marat', 'Марат', 'EMPLOYEE', 'Исполнитель', 'marat', 'fruti9'),
             (4, 'sagynay', 'Сагынай', 'EMPLOYEE', 'Исполнитель', 'sagynay', 'reet3'),
@@ -460,7 +403,6 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         async with pool.acquire() as conn:
             creator = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
             creator_name = creator['full_name'] if creator else "Руководство"
-            creator_role = creator['role'] if creator else "OWNER"
 
             task_id = await conn.fetchval("""
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
@@ -475,14 +417,14 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
 
         send_telegram_alert(f"🎙 <b>Новое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         
-        target_roles = ["DEPUTY"] if creator_role == 'OWNER' else ["OWNER"]
+        # PUSH: уведомление для Директора / Шефа
+        target_roles = ["DEPUTY"] if creator.get('role') == 'OWNER' else ["OWNER"]
         await broadcast_event("notify", {
-            "title": f"🎙 Поручение #{task_id} от {creator_name}",
-            "body": f"Тема: {parsed.get('title')}\nТЗ: {parsed.get('ai_summary')}",
+            "title": f"📋 Новое поручение #{task_id}",
+            "body": f"{creator_name}: {parsed.get('title')}",
             "roles": target_roles,
             "user_ids": [],
-            "task_id": task_id,
-            "sender_id": user_id
+            "task_id": task_id
         })
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
@@ -499,25 +441,22 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
         async with pool.acquire() as conn:
             creator = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
             creator_name = creator['full_name'] if creator else "Руководство"
-            creator_role = creator['role'] if creator else "OWNER"
 
-            p_group = parsed.get("project_group", "Проект Кормовая Мука")
             task_id = await conn.fetchval("""
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), p_group, user_id, True)
+            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
 
-        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {p_group}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         
-        target_roles = ["DEPUTY"] if creator_role == 'OWNER' else ["OWNER"]
+        target_roles = ["DEPUTY"] if creator.get('role') == 'OWNER' else ["OWNER"]
         await broadcast_event("notify", {
-            "title": f"📝 Поручение #{task_id} от {creator_name}",
-            "body": f"Тема: {parsed.get('title')}\nТЗ: {parsed.get('ai_summary')}",
+            "title": f"📝 Новое поручение #{task_id}",
+            "body": f"{creator_name}: {parsed.get('title')}",
             "roles": target_roles,
             "user_ids": [],
-            "task_id": task_id,
-            "sender_id": user_id
+            "task_id": task_id
         })
         return {"status": "ok", "task_id": task_id}
     except Exception as e:
@@ -536,22 +475,9 @@ async def delete_task(task_id: int, user_id: int = Form(...)):
         if task['status'] != 'DRAFT':
             raise HTTPException(status_code=400, detail="Удалять можно только поручения из раздела 'Входящие'.")
         
-        remover = await conn.fetchrow("SELECT full_name, role FROM users WHERE id = $1", user_id)
-        remover_name = remover['full_name'] if remover else 'Пользователь'
-        remover_role = remover['role'] if remover else 'OWNER'
-
         await conn.execute("DELETE FROM tasks WHERE id = $1", task_id)
 
-    clear_deadline_cache(task_id)
-    target_roles = ["DEPUTY"] if remover_role == 'OWNER' else ["OWNER"]
-    await broadcast_event("notify", {
-        "title": f"🗑 Поручение #{task_id} отозвано",
-        "body": f"{remover_name} удалил входящую задачу «{task['title']}»",
-        "roles": target_roles,
-        "user_ids": [],
-        "task_id": task_id,
-        "sender_id": user_id
-    })
+    await broadcast_event("task_deleted")
     return {"status": "ok"}
 
 @app.post("/api/tasks/{task_id}/assign")
@@ -612,16 +538,15 @@ async def assign_task(
                 VALUES ($1, 2, 'DEPUTY', 'Жамолиддин', 'SYSTEM', $2)
             """, task_id, f"🚀 Задача утверждена и передана в работу.\n📁 Группа: {project_group}\n👑 Лид: {lead_name}\n👥 Команда: {team_str}")
 
-        clear_deadline_cache(task_id)
         send_telegram_alert(f"🚀 <b>Задача #{task_id} передана в работу</b>\n📁 <b>Группа:</b> {project_group}\n👑 <b>Лид:</b> {lead_name}\n<b>Приоритет:</b> {priority}")
         
+        # PUSH: уведомление для Шефа, Лида и команды
         await broadcast_event("notify", {
-            "title": f"🚀 Вам назначена задача #{task_id}",
-            "body": f"«{title or 'Поручение'}» | Лид: {lead_name} | Команда: {team_str}",
+            "title": f"🚀 Назначена задача #{task_id}",
+            "body": f"Лид: {lead_name} | {title or 'В работе'}",
             "roles": ["OWNER"],
             "user_ids": parsed_assignees,
-            "task_id": task_id,
-            "sender_id": 2
+            "task_id": task_id
         })
         return {"status": "ok"}
     except Exception as e:
@@ -669,6 +594,7 @@ async def update_task_details(
             """, title, ai_summary, definition_of_done, project_group, priority, dt_deadline, task_id)
 
             priority_map = {'URGENT': '🔴 Оперативно', 'NORMAL': '🟡 Умеренно', 'FUTURE': '🔵 На будущее'}
+            
             changes = []
             if old_task:
                 if old_task['title'] != title:
@@ -693,15 +619,13 @@ async def update_task_details(
             if old_task and old_task['lead_user_id']:
                 assignees.add(old_task['lead_user_id'])
 
-        clear_deadline_cache(task_id)
-        short_diff = ", ".join(changes[:2]) if changes else "Параметры обновлены"
+        # PUSH: уведомление об изменении ТЗ/срока
         await broadcast_event("notify", {
-            "title": f"✏️ Задача #{task_id}: параметры изменены",
-            "body": f"Директор {user_name} обновил «{title}»:\n{short_diff}",
+            "title": f"✏️ Изменение параметров #{task_id}",
+            "body": f"Директор обновил параметры задачи «{title}»",
             "roles": ["OWNER"],
             "user_ids": list(assignees),
-            "task_id": task_id,
-            "sender_id": 2
+            "task_id": task_id
         })
         return {"status": "ok"}
     except Exception as e:
@@ -725,7 +649,7 @@ async def update_task_team(
 
         pool = await get_db()
         async with pool.acquire() as conn:
-            old_task = await conn.fetchrow("SELECT title, lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+            old_task = await conn.fetchrow("SELECT lead_user_id FROM tasks WHERE id = $1", task_id)
             old_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", old_task['lead_user_id']) if old_task else 'Не назначен'
             new_lead_name = await conn.fetchval("SELECT full_name FROM users WHERE id = $1", lead_id)
             
@@ -747,28 +671,14 @@ async def update_task_team(
                 VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
             """, task_id, user_name, sys_msg)
 
-            old_members = set(old_task['assignee_ids'] or []) if old_task else set()
-            removed_members = old_members - set(parsed_assignees)
-
+        # PUSH: уведомление о смене команды
         await broadcast_event("notify", {
-            "title": f"👥 Состав задачи #{task_id} обновлен",
-            "body": f"«{old_task['title']}» | Лид: {new_lead_name} | Команда: {new_team_str}",
+            "title": f"👥 Смена состава команды #{task_id}",
+            "body": f"Лид: {new_lead_name} | Исполнители: {new_team_str}",
             "roles": ["OWNER"],
             "user_ids": parsed_assignees,
-            "task_id": task_id,
-            "sender_id": 2
+            "task_id": task_id
         })
-
-        if removed_members:
-            await broadcast_event("notify", {
-                "title": f"ℹ️ Вы сняты с задачи #{task_id}",
-                "body": f"Директор изменил исполнителей задачи «{old_task['title']}»",
-                "roles": [],
-                "user_ids": list(removed_members),
-                "task_id": task_id,
-                "sender_id": 2
-            })
-
         return {"status": "ok"}
     except HTTPException:
         raise
@@ -792,7 +702,6 @@ async def set_stage(
                 WHERE id = $1
             """, task_id)
             sys_msg = f"🏁 Директор {user_name} утвердил и перевел задачу в архив."
-            clear_deadline_cache(task_id)
         else:
             prog_val = int(stage)
             await conn.execute("""
@@ -811,14 +720,14 @@ async def set_stage(
         if task and task['lead_user_id']:
             targets.add(task['lead_user_id'])
 
+    # PUSH: обновление этапа
     label = "в архив" if stage == 'ARCHIVE' else f"{stage}%"
     await broadcast_event("notify", {
-        "title": f"⚡ Задача #{task_id}: этап {label}",
-        "body": f"«{task['title']}» | {sys_msg}",
+        "title": f"⚡ Этап задачи #{task_id}: {label}",
+        "body": sys_msg,
         "roles": ["OWNER"],
         "user_ids": list(targets),
-        "task_id": task_id,
-        "sender_id": 2
+        "task_id": task_id
     })
     return {"status": "ok"}
 
@@ -831,8 +740,8 @@ async def request_stage(
 ):
     pool = await get_db()
     async with pool.acquire() as conn:
-        task = await conn.fetchrow("SELECT title, lead_user_id FROM tasks WHERE id = $1", task_id)
-        if not task or task['lead_user_id'] != user_id:
+        lead_id = await conn.fetchval("SELECT lead_user_id FROM tasks WHERE id = $1", task_id)
+        if lead_id != user_id:
             raise HTTPException(status_code=403, detail="Только Лид команды имеет право отправлять запросы на утверждение этапов.")
 
         await conn.execute("UPDATE tasks SET pending_request = $1 WHERE id = $2", stage, task_id)
@@ -846,13 +755,13 @@ async def request_stage(
 
     send_telegram_alert(f"📌 <b>Задача #{task_id}: запрос подтверждения</b>\n👑 <b>Лид:</b> {user_name}\n<b>Запрос:</b> {target_str}")
     
+    # PUSH: уведомить Директора и Шефа
     await broadcast_event("notify", {
         "title": f"📌 Запрос подтверждения #{task_id}",
-        "body": f"Лид {user_name} запросил {target_str} по задаче «{task['title']}»",
+        "body": f"Лид {user_name} запросил {target_str}",
         "roles": ["DEPUTY", "OWNER"],
         "user_ids": [],
-        "task_id": task_id,
-        "sender_id": user_id
+        "task_id": task_id
     })
     return {"status": "ok"}
 
@@ -865,7 +774,7 @@ async def confirm_stage_request(
     pool = await get_db()
     async with pool.acquire() as conn:
         task = await conn.fetchrow("""
-            SELECT t.title, t.pending_request, t.lead_user_id, t.assignee_ids, u.full_name as lead_name 
+            SELECT t.pending_request, t.lead_user_id, t.assignee_ids, u.full_name as lead_name 
             FROM tasks t 
             LEFT JOIN users u ON u.id = t.lead_user_id 
             WHERE t.id = $1
@@ -881,10 +790,9 @@ async def confirm_stage_request(
         if approve:
             if req_stage == 'ARCHIVE':
                 await conn.execute("UPDATE tasks SET status = 'ARCHIVED', progress = 100, completed_at = NOW(), pending_request = NULL WHERE id = $1", task_id)
-                clear_deadline_cache(task_id)
             else:
                 await conn.execute("UPDATE tasks SET progress = $1, pending_request = NULL WHERE id = $2", int(req_stage), task_id)
-            sys_msg = f"✅ Директор {user_name} утвердил запрос (Лид {lead_name}: {target_str})."
+            sys_msg = f"✅ Директор {user_name} подтвердил запрос (Лид {lead_name}: {target_str})."
             push_title = f"✅ Запрос утвержден (#{task_id})"
         else:
             await conn.execute("UPDATE tasks SET pending_request = NULL WHERE id = $1", task_id)
@@ -900,13 +808,13 @@ async def confirm_stage_request(
         if task and task['lead_user_id']:
             targets.add(task['lead_user_id'])
 
+    # PUSH: результат рассмотрения этапа
     await broadcast_event("notify", {
         "title": push_title,
-        "body": f"«{task['title']}» | {sys_msg}",
+        "body": sys_msg,
         "roles": ["OWNER"],
         "user_ids": list(targets),
-        "task_id": task_id,
-        "sender_id": 2
+        "task_id": task_id
     })
     return {"status": "ok"}
 
@@ -968,21 +876,21 @@ async def send_text_msg(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-        task = await conn.fetchrow("SELECT title, lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
         recipients = set(task['assignee_ids'] or []) if task else set()
         if task and task['lead_user_id']:
             recipients.add(task['lead_user_id'])
-        recipients.add(1)
-        recipients.add(2)
+        recipients.add(1) # Шеф
+        recipients.add(2) # Директор
         recipients.discard(sender_id)
 
+    # PUSH: новое сообщение в чате
     await broadcast_event("notify", {
-        "title": f"💬 {sender_name} в задаче #{task_id}",
-        "body": f"«{task['title']}»: {content[:80]}",
+        "title": f"💬 Сообщение в задаче #{task_id}",
+        "body": f"{sender_name}: {content[:60]}",
         "roles": [],
         "user_ids": list(recipients),
-        "task_id": task_id,
-        "sender_id": sender_id
+        "task_id": task_id
     })
     return {"status": "ok", "id": msg_id}
 
@@ -1013,7 +921,7 @@ async def send_voice_msg(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-        task = await conn.fetchrow("SELECT title, lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
         recipients = set(task['assignee_ids'] or []) if task else set()
         if task and task['lead_user_id']:
             recipients.add(task['lead_user_id'])
@@ -1022,12 +930,11 @@ async def send_voice_msg(
         recipients.discard(sender_id)
 
     await broadcast_event("notify", {
-        "title": f"🎙 Голосовое от {sender_name} (#{task_id})",
-        "body": f"Новая аудиозапись в задаче «{task['title']}»",
+        "title": f"🎙 Голосовое в задаче #{task_id}",
+        "body": f"{sender_name} отправил голосовое сообщение",
         "roles": [],
         "user_ids": list(recipients),
-        "task_id": task_id,
-        "sender_id": sender_id
+        "task_id": task_id
     })
     return {"status": "ok", "id": msg_id}
 
@@ -1058,7 +965,7 @@ async def send_image_msg(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-        task = await conn.fetchrow("SELECT title, lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
         recipients = set(task['assignee_ids'] or []) if task else set()
         if task and task['lead_user_id']:
             recipients.add(task['lead_user_id'])
@@ -1067,12 +974,11 @@ async def send_image_msg(
         recipients.discard(sender_id)
 
     await broadcast_event("notify", {
-        "title": f"📷 Фото от {sender_name} (#{task_id})",
-        "body": f"Прикреплен документ/фото в задаче «{task['title']}»",
+        "title": f"📷 Фото в задаче #{task_id}",
+        "body": f"{sender_name} прикрепил изображение",
         "roles": [],
         "user_ids": list(recipients),
-        "task_id": task_id,
-        "sender_id": sender_id
+        "task_id": task_id
     })
     return {"status": "ok", "id": msg_id}
 
@@ -1080,7 +986,6 @@ async def send_image_msg(
 async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(1), sender_name: str = Form("Исполнитель")):
     pool = await get_db()
     async with pool.acquire() as conn:
-        task = await conn.fetchrow("SELECT title FROM tasks WHERE id = $1", task_id)
         await conn.execute("UPDATE tasks SET priority = 'URGENT', is_urgent = TRUE, risks_notes = $1 WHERE id = $2", f"🚨 RED FLAG: {reason}", task_id)
         msg_id = await conn.fetchval("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
@@ -1095,15 +1000,15 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-    send_telegram_alert(f"🚨🚨🚨 <b>RED FLAG на задаче #{task_id}!</b>\n<b>Задача:</b> {task['title']}\n<b>Исполнитель:</b> {sender_name}\n<b>Проблема:</b> {reason}")
+    send_telegram_alert(f"🚨🚨🚨 <b>RED FLAG на задаче #{task_id}!</b>\n<b>Исполнитель:</b> {sender_name}\n<b>Проблема:</b> {reason}")
     
+    # PUSH: экстренное уведомление для руководства
     await broadcast_event("notify", {
-        "title": f"🚨 RED FLAG: Блокер на задаче #{task_id}!",
-        "body": f"{sender_name} по задаче «{task['title']}»:\n{reason}",
+        "title": f"🚨 RED FLAG на задаче #{task_id}!",
+        "body": f"{sender_name}: {reason}",
         "roles": ["OWNER", "DEPUTY"],
         "user_ids": [],
-        "task_id": task_id,
-        "sender_id": sender_id
+        "task_id": task_id
     })
     return {"status": "flagged"}
 
@@ -1115,17 +1020,8 @@ async def index():
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Task OS Corporate</title>
-  <link rel="manifest" href="/manifest.json">
-  <meta name="theme-color" content="#4f46e5">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
-  <script>
-    if (!window.Vue) {
-      document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/vue/3.4.21/vue.global.prod.min.js"><\\/script>');
-    }
-  </script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <style>
     [v-cloak] { display: none !important; }
@@ -1143,7 +1039,7 @@ async def index():
         </div>
         <div class="flex-1 min-w-0">
           <h4 class="text-xs font-black text-white leading-tight truncate">{{ activeToast.title }}</h4>
-          <p class="text-[11px] text-indigo-200/90 leading-snug line-clamp-2 mt-0.5 whitespace-pre-line">{{ activeToast.body }}</p>
+          <p class="text-[11px] text-indigo-200/90 leading-snug line-clamp-2 mt-0.5">{{ activeToast.body }}</p>
         </div>
         <button @click="activeToast = null" class="text-slate-400 hover:text-white text-xs p-1">
           <i class="fa-solid fa-xmark"></i>
@@ -1241,7 +1137,7 @@ async def index():
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <button v-if="notificationPermission !== 'granted'" @click="requestNotificationAccess" class="text-[10px] font-bold text-amber-300 bg-amber-950/60 border border-amber-800/80 px-2.5 py-1.5 rounded-xl transition animate-pulse">
+          <button v-if="notificationPermission !== 'granted'" @click="requestNotificationAccess" class="text-[10px] font-bold text-amber-300 bg-amber-950/60 border border-amber-800/60 px-2.5 py-1.5 rounded-xl transition animate-pulse">
             🔔 Включить пуш
           </button>
           <button @click="handleLogout" class="text-[10px] font-bold text-red-400 bg-red-950/40 hover:bg-red-900/60 px-2.5 py-1.5 rounded-xl border border-red-800/50 transition">
@@ -1300,7 +1196,7 @@ async def index():
         </div>
       </div>
 
-      <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
+      <!-- 1. КАБИНЕТ ШЕФА (Зерновой Путь) -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
         <div class="bg-slate-900/90 border border-slate-800 p-4 rounded-3xl space-y-3.5 shadow-xl backdrop-blur-md">
           <div class="flex items-center justify-between">
@@ -1403,7 +1299,7 @@ async def index():
                 <i class="fa-solid fa-user-tie"></i>
                 <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
               </div>
-              <button v-if="t.status === 'DRAFT' && currentUser && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
+              <button v-if="t.status === 'DRAFT' && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
                 <i class="fa-solid fa-trash-can mr-1"></i> Удалить
               </button>
             </div>
@@ -1583,7 +1479,7 @@ async def index():
                 <i class="fa-solid fa-user-tie"></i>
                 <span>Поручение от: {{ t.creator_name || 'Шеф' }} ({{ formatRoleName(t.creator_role || 'OWNER') }})</span>
               </div>
-              <button v-if="t.status === 'DRAFT' && currentUser && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
+              <button v-if="t.status === 'DRAFT' && t.created_by === currentUser.id" @click="deleteTask(t.id)" class="text-red-400 hover:text-red-300 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded text-[10px] font-bold transition">
                 <i class="fa-solid fa-trash-can mr-1"></i> Удалить
               </button>
             </div>
@@ -1641,8 +1537,8 @@ async def index():
               </div>
             </div>
 
-            <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ (С БЕЗОПАСНЫМ РЕНДЕРИНГОМ) -->
-            <div v-if="t.status === 'DRAFT' && editDrafts[t.id]" class="space-y-2.5 pt-1 border-t border-slate-800">
+            <!-- НАЗНАЧЕНИЕ ВХОДЯЩИХ -->
+            <div v-if="t.status === 'DRAFT'" class="space-y-2.5 pt-1 border-t border-slate-800">
               <input v-model="editDrafts[t.id].title" placeholder="Заголовок" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-white font-bold outline-none focus:border-indigo-500">
               <textarea v-model="editDrafts[t.id].ai_summary" rows="2" placeholder="Суть ТЗ" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
               <textarea v-model="editDrafts[t.id].definition_of_done" rows="2" placeholder="Критерии сдачи (DoD)" class="w-full bg-slate-950 border border-slate-700 text-xs p-2 rounded-xl text-slate-200 outline-none focus:border-indigo-500"></textarea>
@@ -1842,7 +1738,7 @@ async def index():
             </div>
 
             <div class="text-xs space-y-0.5 px-1 font-semibold">
-              <p class="text-indigo-300">👑 Лид: {{ t.lead_name }} <span v-if="currentUser && t.lead_user_id === currentUser.id" class="text-amber-300 font-black">(Вы)</span></p>
+              <p class="text-indigo-300">👑 Лид: {{ t.lead_name }} <span v-if="t.lead_user_id === currentUser.id" class="text-amber-300 font-black">(Вы)</span></p>
               <p v-if="t.team_names" class="text-slate-400 text-[11px]">👥 Команда: {{ t.team_names }}</p>
             </div>
 
@@ -1862,7 +1758,7 @@ async def index():
             </div>
 
             <div v-if="t.status === 'IN_PROGRESS'" class="space-y-2 pt-1 border-t border-slate-800">
-              <div v-if="currentUser && t.lead_user_id === currentUser.id">
+              <div v-if="t.lead_user_id === currentUser.id">
                 <div v-if="t.pending_request" class="bg-amber-950/30 border border-amber-800/50 p-2 rounded-xl text-center text-xs text-amber-300 font-bold">
                   ⏳ Ваш запрос ({{ t.pending_request === 'ARCHIVE' ? 'Архив' : t.pending_request + '%' }}) ожидает решения Жамолиддина
                 </div>
@@ -2205,7 +2101,7 @@ async def index():
   </div>
 
   <script>
-    const { createApp, ref, computed, watch, onMounted, nextTick } = Vue;
+    const { createApp, ref, computed, onMounted, nextTick } = Vue;
 
     const CryptoEngine = {
       async deriveKey(pin, saltBase64) {
@@ -2242,29 +2138,22 @@ async def index():
       }
     };
 
-    const app = createApp({
+    createApp({
       setup() {
         const currentUser = ref(null);
         const loginForm = ref({ username: '', password: '', pin: '1234' });
         const isLoggingIn = ref(false);
-        const isOnline = ref(typeof navigator !== 'undefined' ? navigator.onLine : true);
+        const isOnline = ref(navigator.onLine);
 
+        // PIN & СЕЙФ
         const hasEncryptedVault = ref(false);
         const isUnlocked = ref(false);
         const pinInput = ref('');
         const pinError = ref(false);
         let currentVaultKey = null;
 
-        const tasks = ref([]);
-        const users = ref([]);
-
-        const notificationPermission = ref('denied');
-        try {
-          if (typeof window !== 'undefined' && 'Notification' in window) {
-            notificationPermission.value = Notification.permission;
-          }
-        } catch(e) {}
-
+        // ПУШ УВЕДОМЛЕНИЯ
+        const notificationPermission = ref(typeof Notification !== 'undefined' ? Notification.permission : 'denied');
         const activeToast = ref(null);
         let toastTimer = null;
 
@@ -2276,6 +2165,7 @@ async def index():
         const editDrafts = ref({});
         const sseConnected = ref(false);
 
+        // ГОЛОСОВОЙ КОНТРОЛЬ ДЛЯ СОЗДАНИЯ ЗАДАЧИ
         const isRecordingTaskVoice = ref(false);
         const recordTaskVoiceSeconds = ref(0);
         const recordedTaskVoiceBlob = ref(null);
@@ -2285,11 +2175,13 @@ async def index():
         let taskVoiceTimer = null;
         let taskVoiceStream = null;
 
+        // ФИЛЬТРЫ
         const filterProject = ref('ALL');
         const filterPriority = ref('ALL');
         const filterExecutor = ref('ALL');
         const filterUrgentOnly = ref(false);
 
+        // МОДАЛЬНЫЕ ОКНА
         const editingDetailsTask = ref(null);
         const editDetailsForm = ref({
           title: '', ai_summary: '', definition_of_done: '', project_group: '', priority: '', deadline: '', old_deadline_str: ''
@@ -2300,6 +2192,10 @@ async def index():
           lead_id: null, assignee_ids: []
         });
 
+        const tasks = ref([]);
+        const users = ref([]);
+
+        // ЧАТ
         const activeChatTask = ref(null);
         const chatMessages = ref([]);
         const chatInput = ref('');
@@ -2309,9 +2205,11 @@ async def index():
         const userScrolledUp = ref(false);
         const newMessagesBelowCount = ref(0);
 
+        // ОФЛАЙН ОЧЕРЕДЬ
         const pendingQueue = ref([]);
         let isFlushingQueue = false;
 
+        // ГОЛОС В ЧАТЕ
         const isRecordingVoice = ref(false);
         const recordVoiceSeconds = ref(0);
         const recordedVoiceBlob = ref(null);
@@ -2321,6 +2219,7 @@ async def index():
         let chatVoiceTimer = null;
         let chatVoiceStream = null;
 
+        // ЕДИНЫЙ ПЛЕЕР
         const activeAudioId = ref(null);
         const isAudioPlaying = ref(false);
         const audioCurrentTime = ref(0);
@@ -2336,12 +2235,9 @@ async def index():
           return 'Исполнитель команды';
         });
 
-        const employeesOnly = computed(() => {
-          return Array.isArray(users.value) ? users.value.filter(u => u.role === 'EMPLOYEE') : [];
-        });
+        const employeesOnly = computed(() => users.value.filter(u => u.role === 'EMPLOYEE'));
 
         const selectedAssigneesObjects = computed(() => {
-          if (!teamManageForm.value.assignee_ids) return [];
           return employeesOnly.value.filter(u => teamManageForm.value.assignee_ids.includes(u.id));
         });
 
@@ -2356,14 +2252,55 @@ async def index():
           filterUrgentOnly.value = false;
         };
 
-        const totalUnreadCount = computed(() => {
-          if (!tasks.value || !Array.isArray(tasks.value)) return 0;
-          return tasks.value.reduce((acc, t) => acc + (t.unread_count || 0), 0);
-        });
+        const playNotificationChime = () => {
+          try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const now = ctx.currentTime;
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(587.33, now);
+            osc.frequency.exponentialRampToValueAtTime(880, now + 0.12);
+            
+            gain.gain.setValueAtTime(0.18, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+            
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            
+            osc.start(now);
+            osc.stop(now + 0.3);
+          } catch(e) {}
+        };
 
-        const inboxTasks = computed(() => (Array.isArray(tasks.value) ? tasks.value.filter(t => t.status === 'DRAFT') : []));
-        const activeTasks = computed(() => (Array.isArray(tasks.value) ? tasks.value.filter(t => t.status === 'IN_PROGRESS') : []));
-        const archiveTasks = computed(() => (Array.isArray(tasks.value) ? tasks.value.filter(t => t.status === 'ARCHIVED') : []));
+        const requestNotificationAccess = async () => {
+          if ('Notification' in window) {
+            const p = await Notification.requestPermission();
+            notificationPermission.value = p;
+          }
+        };
+
+        const triggerNotification = (notifData) => {
+          playNotificationChime();
+
+          activeToast.value = {
+            title: notifData.title,
+            body: notifData.body
+          };
+          if (toastTimer) clearTimeout(toastTimer);
+          toastTimer = setTimeout(() => { activeToast.value = null; }, 5000);
+
+          if ('Notification' in window && Notification.permission === 'granted') {
+            try {
+              new Notification(notifData.title, {
+                body: notifData.body,
+                tag: 'task_alert_' + (notifData.task_id || Date.now()),
+                silent: true
+              });
+            } catch(e) {}
+          }
+        };
 
         const applyTaskFilters = (taskList) => {
           return taskList.filter(t => {
@@ -2383,6 +2320,10 @@ async def index():
           });
         };
 
+        const inboxTasks = computed(() => tasks.value.filter(t => t.status === 'DRAFT'));
+        const activeTasks = computed(() => tasks.value.filter(t => t.status === 'IN_PROGRESS'));
+        const archiveTasks = computed(() => tasks.value.filter(t => t.status === 'ARCHIVED'));
+
         const displayedOwnerTasks = computed(() => {
           if (ownerTab.value === 'inbox') return inboxTasks.value;
           if (ownerTab.value === 'active') return activeTasks.value;
@@ -2397,18 +2338,22 @@ async def index():
         });
         const filteredDeputyTasks = computed(() => applyTaskFilters(displayedDeputyTasks.value));
 
-        const myTasks = computed(() => {
-          if (!currentUser.value || !Array.isArray(tasks.value)) return [];
-          return tasks.value.filter(t => t.lead_user_id === currentUser.value.id || (t.assignee_ids && t.assignee_ids.includes(currentUser.value.id)));
-        });
+        const myTasks = computed(() => tasks.value.filter(t => {
+          if (!currentUser.value) return false;
+          return t.lead_user_id === currentUser.value.id || (t.assignee_ids && t.assignee_ids.includes(currentUser.value.id));
+        }));
         const myActiveTasks = computed(() => myTasks.value.filter(t => t.status === 'IN_PROGRESS'));
         const myArchiveTasks = computed(() => myTasks.value.filter(t => t.status === 'ARCHIVED'));
 
-        const displayedEmpTasks = computed(() => (empTab.value === 'active' ? myActiveTasks.value : myArchiveTasks.value));
+        const displayedEmpTasks = computed(() => {
+          if (empTab.value === 'active') return myActiveTasks.value;
+          return myArchiveTasks.value;
+        });
         const filteredEmpTasks = computed(() => applyTaskFilters(displayedEmpTasks.value));
 
         const isMyMessage = (m) => {
-          return currentUser.value && m.sender_id === currentUser.value.id;
+          if (!currentUser.value) return false;
+          return m.sender_id === currentUser.value.id;
         };
 
         const isPendingMessage = (m) => {
@@ -2419,105 +2364,6 @@ async def index():
           const draft = editDrafts.value[taskId];
           if (draft && draft.lead_id && !draft.assignee_ids.includes(draft.lead_id)) {
             draft.assignee_ids.push(draft.lead_id);
-          }
-        };
-
-        const updateIconBadge = (count) => {
-          if ('setAppBadge' in navigator) {
-            if (count > 0) {
-              navigator.setAppBadge(count).catch(() => {});
-            } else {
-              navigator.clearAppBadge().catch(() => {});
-            }
-          }
-          if (navigator.serviceWorker && navigator.serviceWorker.controller) {
-            navigator.serviceWorker.controller.postMessage({ type: 'SET_BADGE', count: count });
-          }
-          if (count > 0) {
-            document.title = `(${count}) 🔴 Task OS Corporate`;
-          } else {
-            document.title = 'Task OS Corporate';
-          }
-        };
-
-        watch(totalUnreadCount, (newVal) => {
-          updateIconBadge(newVal);
-        });
-
-        const playNotificationChime = () => {
-          try {
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const now = ctx.currentTime;
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            
-            osc.type = 'sine';
-            osc.frequency.setValueAtTime(587.33, now);
-            osc.frequency.exponentialRampToValueAtTime(880, now + 0.12);
-            
-            gain.gain.setValueAtTime(0.2, now);
-            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
-            
-            osc.connect(gain);
-            gain.connect(ctx.destination);
-            
-            osc.start(now);
-            osc.stop(now + 0.3);
-          } catch(e) {}
-        };
-
-        const requestNotificationAccess = () => {
-          if (!('Notification' in window)) {
-            alert('Ваш браузер не поддерживает Push-уведомления. Откройте сайт в Google Chrome.');
-            return;
-          }
-
-          if (Notification.permission === 'denied') {
-            alert('⚠️ Уведомления заблокированы в настройках браузера.\nНажмите на замочек 🔒 слева от адресной строки и переключите Уведомления в положение «Разрешить».');
-            return;
-          }
-
-          Notification.requestPermission().then((permission) => {
-            notificationPermission.value = permission;
-            if (permission === 'granted') {
-              triggerNotification({
-                title: "✅ Уведомления включены!",
-                body: "Теперь все важные события и дедлайны будут приходить в шторку."
-              });
-            }
-          });
-        };
-
-        const triggerNotification = async (notifData) => {
-          playNotificationChime();
-
-          activeToast.value = {
-            title: notifData.title,
-            body: notifData.body
-          };
-          if (toastTimer) clearTimeout(toastTimer);
-          toastTimer = setTimeout(() => { activeToast.value = null; }, 5000);
-
-          if (notificationPermission.value === 'granted') {
-            try {
-              if ('serviceWorker' in navigator) {
-                const reg = await navigator.serviceWorker.ready;
-                if (reg && reg.showNotification) {
-                  await reg.showNotification(notifData.title, {
-                    body: notifData.body,
-                    tag: 'task_' + (notifData.task_id || Date.now())
-                  });
-                  return;
-                }
-              }
-            } catch(e) {}
-
-            try {
-              new Notification(notifData.title, {
-                body: notifData.body,
-                tag: 'task_' + (notifData.task_id || Date.now())
-              });
-            } catch(e) {}
           }
         };
 
@@ -2642,6 +2488,7 @@ async def index():
           };
 
           globalAudio.play().catch(e => {
+            console.error("Audio playback error:", e);
             isAudioPlaying.value = false;
           });
         };
@@ -2715,9 +2562,9 @@ async def index():
             hasEncryptedVault.value = true;
             isUnlocked.value = true;
 
+            requestNotificationAccess();
             await loadData();
             await saveEncryptedVault({ user: data.user, tasks: tasks.value });
-            updateIconBadge(totalUnreadCount.value);
           } catch (e) {
             alert('❌ ' + e.message);
           } finally {
@@ -2768,8 +2615,8 @@ async def index():
               tasks.value = decryptedVault.tasks || [];
               isUnlocked.value = true;
 
+              requestNotificationAccess();
               loadData();
-              updateIconBadge(totalUnreadCount.value);
             } else {
               throw new Error("Invalid PIN");
             }
@@ -2788,7 +2635,6 @@ async def index():
           currentUser.value = null;
           pinInput.value = '';
           currentVaultKey = null;
-          updateIconBadge(0);
         };
 
         const handleLogout = () => {
@@ -2841,7 +2687,6 @@ async def index():
             if (currentVaultKey) {
               await saveEncryptedVault({ user: currentUser.value, tasks: tasks.value });
             }
-            updateIconBadge(totalUnreadCount.value);
           } catch (e) {
             console.error("Sync error:", e);
           }
@@ -2854,15 +2699,11 @@ async def index():
             try {
               const data = JSON.parse(event.data);
               if (data.event === "notify" && currentUser.value) {
-                if (data.sender_id && Number(data.sender_id) === Number(currentUser.value.id)) {
-                  // Пропуск
-                } else {
-                  const targetRoles = data.roles || [];
-                  const targetUsers = (data.user_ids || []).map(Number);
-                  const isTarget = targetRoles.includes(currentUser.value.role) || targetUsers.includes(Number(currentUser.value.id));
-                  if (isTarget) {
-                    triggerNotification(data);
-                  }
+                const targetRoles = data.roles || [];
+                const targetUsers = data.user_ids || [];
+                const isTarget = targetRoles.includes(currentUser.value.role) || targetUsers.includes(currentUser.value.id);
+                if (isTarget) {
+                  triggerNotification(data);
                 }
               }
             } catch(e) {}
@@ -3012,7 +2853,7 @@ async def index():
         const assignTask = async (id) => {
           const draft = editDrafts.value[id] || {};
           const fd = new FormData();
-          const leadId = draft.lead_id || (employeesOnly.value[0]?.id || 3);
+          const leadId = draft.lead_id || employeesOnly.value[0]?.id || 3;
           let assignees = Array.isArray(draft.assignee_ids) ? [...draft.assignee_ids] : [leadId];
           if (!assignees.includes(leadId)) assignees.push(leadId);
 
@@ -3536,14 +3377,10 @@ async def index():
           return '🔵 На будущее';
         };
 
-        const formatRoleName = (r) => (r === 'OWNER' ? 'Шеф' : r === 'DEPUTY' ? 'Директор' : 'Исполнитель');
-        const formatTime = (s) => `${Math.floor((s || 0) / 60).toString().padStart(2, '0')}:${((s || 0) % 60).toString().padStart(2, '0')}`;
+        const formatRoleName = (r) => r === 'OWNER' ? 'Шеф' : (r === 'DEPUTY' ? 'Директор' : 'Исполнитель');
+        const formatTime = (s) => `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
 
         onMounted(() => {
-          if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('/sw.js').catch(() => {});
-          }
-
           const salt = localStorage.getItem('task_vault_salt');
           const vault = localStorage.getItem('task_encrypted_vault');
           if (salt && vault) {
@@ -3571,7 +3408,7 @@ async def index():
 
         return {
           currentUser, loginForm, isLoggingIn, isOnline, hasEncryptedVault, isUnlocked, pinInput, pinError,
-          notificationPermission, requestNotificationAccess, activeToast, totalUnreadCount,
+          notificationPermission, requestNotificationAccess, activeToast,
           pressPinDigit, backspacePin, clearPin, resetVaultAndRelogin,
           ownerTab, deputyTab, empTab, isProcessing,
           isRecordingTaskVoice, recordTaskVoiceSeconds, recordedTaskVoiceUrl,
@@ -3597,13 +3434,7 @@ async def index():
           formatRoleName, formatTime
         };
       }
-    });
-
-    app.config.errorHandler = (err, vm, info) => {
-      console.error('Vue Error:', err, info);
-    };
-
-    app.mount('#app');
+    }).mount('#app');
   </script>
 </body>
 </html>"""
