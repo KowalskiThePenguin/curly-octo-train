@@ -37,11 +37,48 @@ sse_subscribers = set()
 FAILED_LOGIN_ATTEMPTS = {}
 DEADLINE_ALERTS_SENT = set()
 
+# PWA MANIFEST ДЛЯ УСТАНОВКИ НА РАБОЧИЙ СТОЛ ТЕЛЕФОНА/ПК
+@app.get("/manifest.json")
+async def manifest():
+    m = {
+        "name": "Task OS Corporate",
+        "short_name": "Task OS",
+        "description": "Корпоративная операционная система контроля задач",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#020617",
+        "theme_color": "#4f46e5",
+        "icons": [
+            {
+                "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='128' fill='%234f46e5'/><path fill='%23ffffff' d='M256 128c-70.7 0-128 57.3-128 128s57.3 128 128 128 128-57.3 128-128-57.3-128-128-128zm-20 196l-60-60 28.3-28.3 31.7 31.7 75.7-75.7 28.3 28.3-104 104z'/></svg>",
+                "sizes": "512x512",
+                "type": "image/svg+xml",
+                "purpose": "any maskable"
+            }
+        ]
+    }
+    return Response(content=json.dumps(m), media_type="application/manifest+json")
+
+# СЕРВИСНЫЙ ВОРКЕР (ВЫВОД КОНТЕКСТА В ШТОРКУ И УПРАВЛЕНИЕ БЕЙДЖЕМ)
 @app.get("/sw.js")
 async def service_worker():
     js = """
     self.addEventListener('install', (e) => self.skipWaiting());
     self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+
+    self.addEventListener('message', (event) => {
+        if (event.data && event.data.type === 'SET_BADGE') {
+            const count = event.data.count || 0;
+            if (self.navigator && 'setAppBadge' in self.navigator) {
+                if (count > 0) {
+                    self.navigator.setAppBadge(count).catch(() => {});
+                } else {
+                    self.navigator.clearAppBadge().catch(() => {});
+                }
+            }
+        }
+    });
+
     self.addEventListener('notificationclick', (e) => {
         e.notification.close();
         e.waitUntil(
@@ -105,7 +142,6 @@ async def keep_alive_worker():
         except Exception as e:
             print(f"Keep-alive error: {e}")
 
-# ОЧИСТКА КЭША ДЕДЛАЙНОВ ДЛЯ КОНКРЕТНОЙ ЗАДАЧИ
 def clear_deadline_cache(task_id: int):
     global DEADLINE_ALERTS_SENT
     DEADLINE_ALERTS_SENT = {key for key in DEADLINE_ALERTS_SENT if key[0] != task_id}
@@ -445,8 +481,8 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         
         target_roles = ["DEPUTY"] if creator_role == 'OWNER' else ["OWNER"]
         await broadcast_event("notify", {
-            "title": f"📋 Новое поручение #{task_id}",
-            "body": f"{creator_name}: {parsed.get('title')}",
+            "title": f"🎙 Поручение #{task_id} от {creator_name}",
+            "body": f"Тема: {parsed.get('title')}\nТЗ: {parsed.get('ai_summary')}",
             "roles": target_roles,
             "user_ids": [],
             "task_id": task_id,
@@ -474,14 +510,14 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
+            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), project_group := parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
 
-        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {project_group}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         
         target_roles = ["DEPUTY"] if creator_role == 'OWNER' else ["OWNER"]
         await broadcast_event("notify", {
-            "title": f"📝 Новое поручение #{task_id}",
-            "body": f"{creator_name}: {parsed.get('title')}",
+            "title": f"📝 Поручение #{task_id} от {creator_name}",
+            "body": f"Тема: {parsed.get('title')}\nТЗ: {parsed.get('ai_summary')}",
             "roles": target_roles,
             "user_ids": [],
             "task_id": task_id,
@@ -586,8 +622,8 @@ async def assign_task(
         send_telegram_alert(f"🚀 <b>Задача #{task_id} передана в работу</b>\n📁 <b>Группа:</b> {project_group}\n👑 <b>Лид:</b> {lead_name}\n<b>Приоритет:</b> {priority}")
         
         await broadcast_event("notify", {
-            "title": f"🚀 Задача #{task_id} передана в работу",
-            "body": f"Лид: {lead_name} | {title or 'В работе'}",
+            "title": f"🚀 Вам назначена задача #{task_id}",
+            "body": f"«{title or 'Поручение'}» | Лид: {lead_name} | Команда: {team_str}",
             "roles": ["OWNER"],
             "user_ids": parsed_assignees,
             "task_id": task_id,
@@ -665,9 +701,10 @@ async def update_task_details(
                 assignees.add(old_task['lead_user_id'])
 
         clear_deadline_cache(task_id)
+        short_diff = ", ".join(changes[:2]) if changes else "Параметры обновлены"
         await broadcast_event("notify", {
-            "title": f"✏️ Изменение ТЗ/Срока #{task_id}",
-            "body": f"Директор обновил параметры задачи «{title}»",
+            "title": f"✏️ Задача #{task_id}: параметры изменены",
+            "body": f"Директор {user_name} обновил «{title}»:\n{short_diff}",
             "roles": ["OWNER"],
             "user_ids": list(assignees),
             "task_id": task_id,
@@ -678,7 +715,7 @@ async def update_task_details(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ С УВЕДОМЛЕНИЕМ СНЯТЫХ
+# ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ
 @app.post("/api/tasks/{task_id}/update-team")
 async def update_task_team(
     task_id: int,
@@ -721,21 +758,19 @@ async def update_task_team(
             old_members = set(old_task['assignee_ids'] or []) if old_task else set()
             removed_members = old_members - set(parsed_assignees)
 
-        # Пуш для действующих участников и Шефа
         await broadcast_event("notify", {
-            "title": f"👥 Обновлен состав #{task_id}",
-            "body": f"Лид: {new_lead_name} | Команда: {new_team_str}",
+            "title": f"👥 Состав задачи #{task_id} обновлен",
+            "body": f"«{old_task['title']}» | Лид: {new_lead_name} | Команда: {new_team_str}",
             "roles": ["OWNER"],
             "user_ids": parsed_assignees,
             "task_id": task_id,
             "sender_id": 2
         })
 
-        # Отдельный пуш для снятых сотрудников
         if removed_members:
             await broadcast_event("notify", {
                 "title": f"ℹ️ Вы сняты с задачи #{task_id}",
-                "body": f"Директор изменил состав команды задачи «{old_task['title']}»",
+                "body": f"Директор изменил исполнителей задачи «{old_task['title']}»",
                 "roles": [],
                 "user_ids": list(removed_members),
                 "task_id": task_id,
@@ -787,8 +822,8 @@ async def set_stage(
 
     label = "в архив" if stage == 'ARCHIVE' else f"{stage}%"
     await broadcast_event("notify", {
-        "title": f"⚡ Прогресс задачи #{task_id}: {label}",
-        "body": sys_msg,
+        "title": f"⚡ Задача #{task_id}: этап {label}",
+        "body": f"«{task['title']}» | {sys_msg}",
         "roles": ["OWNER"],
         "user_ids": list(targets),
         "task_id": task_id,
@@ -806,8 +841,8 @@ async def request_stage(
 ):
     pool = await get_db()
     async with pool.acquire() as conn:
-        lead_id = await conn.fetchval("SELECT lead_user_id FROM tasks WHERE id = $1", task_id)
-        if lead_id != user_id:
+        task = await conn.fetchrow("SELECT title, lead_user_id FROM tasks WHERE id = $1", task_id)
+        if not task or task['lead_user_id'] != user_id:
             raise HTTPException(status_code=403, detail="Только Лид команды имеет право отправлять запросы на утверждение этапов.")
 
         await conn.execute("UPDATE tasks SET pending_request = $1 WHERE id = $2", stage, task_id)
@@ -823,7 +858,7 @@ async def request_stage(
     
     await broadcast_event("notify", {
         "title": f"📌 Запрос подтверждения #{task_id}",
-        "body": f"Лид {user_name} запросил {target_str}",
+        "body": f"Лид {user_name} запросил {target_str} по задаче «{task['title']}»",
         "roles": ["DEPUTY", "OWNER"],
         "user_ids": [],
         "task_id": task_id,
@@ -841,7 +876,7 @@ async def confirm_stage_request(
     pool = await get_db()
     async with pool.acquire() as conn:
         task = await conn.fetchrow("""
-            SELECT t.pending_request, t.lead_user_id, t.assignee_ids, u.full_name as lead_name 
+            SELECT t.title, t.pending_request, t.lead_user_id, t.assignee_ids, u.full_name as lead_name 
             FROM tasks t 
             LEFT JOIN users u ON u.id = t.lead_user_id 
             WHERE t.id = $1
@@ -878,7 +913,7 @@ async def confirm_stage_request(
 
     await broadcast_event("notify", {
         "title": push_title,
-        "body": sys_msg,
+        "body": f"«{task['title']}» | {sys_msg}",
         "roles": ["OWNER"],
         "user_ids": list(targets),
         "task_id": task_id,
@@ -944,7 +979,7 @@ async def send_text_msg(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+        task = await conn.fetchrow("SELECT title, lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
         recipients = set(task['assignee_ids'] or []) if task else set()
         if task and task['lead_user_id']:
             recipients.add(task['lead_user_id'])
@@ -953,8 +988,8 @@ async def send_text_msg(
         recipients.discard(sender_id)
 
     await broadcast_event("notify", {
-        "title": f"💬 Сообщение в задаче #{task_id}",
-        "body": f"{sender_name}: {content[:60]}",
+        "title": f"💬 {sender_name} в задаче #{task_id}",
+        "body": f"«{task['title']}»: {content[:80]}",
         "roles": [],
         "user_ids": list(recipients),
         "task_id": task_id,
@@ -989,7 +1024,7 @@ async def send_voice_msg(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+        task = await conn.fetchrow("SELECT title, lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
         recipients = set(task['assignee_ids'] or []) if task else set()
         if task and task['lead_user_id']:
             recipients.add(task['lead_user_id'])
@@ -998,8 +1033,8 @@ async def send_voice_msg(
         recipients.discard(sender_id)
 
     await broadcast_event("notify", {
-        "title": f"🎙 Голосовое в задаче #{task_id}",
-        "body": f"{sender_name} отправил голосовое сообщение",
+        "title": f"🎙 Голосовое от {sender_name} (#{task_id})",
+        "body": f"Новая аудиозапись в задаче «{task['title']}»",
         "roles": [],
         "user_ids": list(recipients),
         "task_id": task_id,
@@ -1034,7 +1069,7 @@ async def send_image_msg(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-        task = await conn.fetchrow("SELECT lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
+        task = await conn.fetchrow("SELECT title, lead_user_id, assignee_ids FROM tasks WHERE id = $1", task_id)
         recipients = set(task['assignee_ids'] or []) if task else set()
         if task and task['lead_user_id']:
             recipients.add(task['lead_user_id'])
@@ -1043,8 +1078,8 @@ async def send_image_msg(
         recipients.discard(sender_id)
 
     await broadcast_event("notify", {
-        "title": f"📷 Фото в задаче #{task_id}",
-        "body": f"{sender_name} прикрепил изображение",
+        "title": f"📷 Фото от {sender_name} (#{task_id})",
+        "body": f"Прикреплен документ/фото в задаче «{task['title']}»",
         "roles": [],
         "user_ids": list(recipients),
         "task_id": task_id,
@@ -1056,6 +1091,7 @@ async def send_image_msg(
 async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(1), sender_name: str = Form("Исполнитель")):
     pool = await get_db()
     async with pool.acquire() as conn:
+        task = await conn.fetchrow("SELECT title FROM tasks WHERE id = $1", task_id)
         await conn.execute("UPDATE tasks SET priority = 'URGENT', is_urgent = TRUE, risks_notes = $1 WHERE id = $2", f"🚨 RED FLAG: {reason}", task_id)
         msg_id = await conn.fetchval("""
             INSERT INTO task_messages (task_id, sender_id, sender_role, sender_name, message_type, content, created_at)
@@ -1070,11 +1106,11 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(
             SET last_read_msg_id = GREATEST(task_user_reads.last_read_msg_id, EXCLUDED.last_read_msg_id)
         """, task_id, sender_id, msg_id)
 
-    send_telegram_alert(f"🚨🚨🚨 <b>RED FLAG на задаче #{task_id}!</b>\n<b>Исполнитель:</b> {sender_name}\n<b>Проблема:</b> {reason}")
+    send_telegram_alert(f"🚨🚨🚨 <b>RED FLAG на задаче #{task_id}!</b>\n<b>Задача:</b> {task['title']}\n<b>Исполнитель:</b> {sender_name}\n<b>Проблема:</b> {reason}")
     
     await broadcast_event("notify", {
-        "title": f"🚨 RED FLAG на задаче #{task_id}!",
-        "body": f"{sender_name}: {reason}",
+        "title": f"🚨 RED FLAG: Блокер на задаче #{task_id}!",
+        "body": f"{sender_name} по задаче «{task['title']}»:\n{reason}",
         "roles": ["OWNER", "DEPUTY"],
         "user_ids": [],
         "task_id": task_id,
@@ -1090,6 +1126,10 @@ async def index():
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>Task OS Corporate</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#4f46e5">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
@@ -1109,7 +1149,7 @@ async def index():
         </div>
         <div class="flex-1 min-w-0">
           <h4 class="text-xs font-black text-white leading-tight truncate">{{ activeToast.title }}</h4>
-          <p class="text-[11px] text-indigo-200/90 leading-snug line-clamp-2 mt-0.5">{{ activeToast.body }}</p>
+          <p class="text-[11px] text-indigo-200/90 leading-snug line-clamp-2 mt-0.5 whitespace-pre-line">{{ activeToast.body }}</p>
         </div>
         <button @click="activeToast = null" class="text-slate-400 hover:text-white text-xs p-1">
           <i class="fa-solid fa-xmark"></i>
@@ -1207,7 +1247,7 @@ async def index():
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <!-- КНОПКА ЗАПРОСА РАЗРЕШЕНИЯ С ПРЯМЫМ СИНХРОННЫМ КЛИКОМ -->
+          <!-- КНОПКА ВКЛЮЧЕНИЯ ПУШ-УВЕДОМЛЕНИЙ -->
           <button v-if="notificationPermission !== 'granted'" @click="requestNotificationAccess" class="text-[10px] font-bold text-amber-300 bg-amber-950/60 border border-amber-800/80 px-2.5 py-1.5 rounded-xl transition animate-pulse">
             🔔 Включить пуш
           </button>
@@ -2172,7 +2212,7 @@ async def index():
   </div>
 
   <script>
-    const { createApp, ref, computed, onMounted, nextTick } = Vue;
+    const { createApp, ref, computed, watch, onMounted, nextTick } = Vue;
 
     const CryptoEngine = {
       async deriveKey(pin, saltBase64) {
@@ -2223,7 +2263,7 @@ async def index():
         const pinError = ref(false);
         let currentVaultKey = null;
 
-        // ПУШ УВЕДОМЛЕНИЯ
+        // ПУШ УВЕДОМЛЕНИЯ И ЗНАЧОК С ЦИФРОЙ НА ИКОНКЕ
         const notificationPermission = ref(typeof Notification !== 'undefined' ? Notification.permission : 'denied');
         const activeToast = ref(null);
         let toastTimer = null;
@@ -2236,7 +2276,7 @@ async def index():
         const editDrafts = ref({});
         const sseConnected = ref(false);
 
-        // ГОЛОСОВОЙ КОНТРОЛЬ ДЛЯ СОЗДАНИЯ ЗАДАЧИ
+        // ГОЛОС ДЛЯ СОЗДАНИЯ ЗАДАЧИ
         const isRecordingTaskVoice = ref(false);
         const recordTaskVoiceSeconds = ref(0);
         const recordedTaskVoiceBlob = ref(null);
@@ -2323,6 +2363,37 @@ async def index():
           filterUrgentOnly.value = false;
         };
 
+        // ПОДСЧЕТ ОБЩЕГО ЧИСЛА НЕПРОЧИТАННЫХ ДЛЯ КРАСНОГО КРУЖКА (1, 2, 3) НА ИКОНКЕ
+        const totalUnreadCount = computed(() => {
+          return tasks.value.reduce((acc, t) => acc + (t.unread_count || 0), 0);
+        });
+
+        // СИНХРОНИЗАЦИЯ КРАСНОЙ ТОЧКИ/ЦИФРЫ НА ИКОНКЕ ПРИЛОЖЕНИЯ И ВКЛАДКЕ
+        const updateIconBadge = (count) => {
+          // 1. Системный бейдж на иконке рабочего стола / панели задач
+          if ('setAppBadge' in navigator) {
+            if (count > 0) {
+              navigator.setAppBadge(count).catch(() => {});
+            } else {
+              navigator.clearAppBadge().catch(() => {});
+            }
+          }
+          // Передача в Service Worker
+          if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+            navigator.serviceWorker.controller.postMessage({ type: 'SET_BADGE', count: count });
+          }
+          // 2. Индикация в заголовке браузера
+          if (count > 0) {
+            document.title = `(${count}) 🔴 Task OS Corporate`;
+          } else {
+            document.title = 'Task OS Corporate';
+          }
+        };
+
+        watch(totalUnreadCount, (newVal) => {
+          updateIconBadge(newVal);
+        });
+
         const playNotificationChime = () => {
           try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -2334,7 +2405,7 @@ async def index():
             osc.frequency.setValueAtTime(587.33, now);
             osc.frequency.exponentialRampToValueAtTime(880, now + 0.12);
             
-            gain.gain.setValueAtTime(0.18, now);
+            gain.gain.setValueAtTime(0.2, now);
             gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
             
             osc.connect(gain);
@@ -2345,6 +2416,7 @@ async def index():
           } catch(e) {}
         };
 
+        // СИНХРОННЫЙ ЗАПРОС РАЗРЕШЕНИЯ ПО КЛИКУ ПОЛЬЗОВАТЕЛЯ
         const requestNotificationAccess = () => {
           if (!('Notification' in window)) {
             alert('Ваш браузер не поддерживает Push-уведомления. Откройте сайт в Google Chrome.');
@@ -2352,7 +2424,7 @@ async def index():
           }
 
           if (Notification.permission === 'denied') {
-            alert('⚠️ Уведомления были заблокированы в вашем браузере.\nНажмите на замочек 🔒 слева от адресной строки и переключите Уведомления в положение «Разрешить».');
+            alert('⚠️ Уведомления заблокированы в настройках браузера.\nНажмите на замочек 🔒 слева от адресной строки и переключите Уведомления в положение «Разрешить».');
             return;
           }
 
@@ -2361,12 +2433,13 @@ async def index():
             if (permission === 'granted') {
               triggerNotification({
                 title: "✅ Уведомления включены!",
-                body: "Теперь вы будете вовремя получать важные события и сигналы дедлайнов."
+                body: "Теперь все важные события и дедлайны будут приходить в шторку."
               });
             }
           });
         };
 
+        // ВЫВОД КОНТЕКСТА В СИСТЕМНУЮ ШТОРКУ
         const triggerNotification = async (notifData) => {
           playNotificationChime();
 
@@ -2384,7 +2457,8 @@ async def index():
                 if (reg && reg.showNotification) {
                   await reg.showNotification(notifData.title, {
                     body: notifData.body,
-                    tag: 'task_' + (notifData.task_id || Date.now())
+                    tag: 'task_' + (notifData.task_id || Date.now()),
+                    vibrate: [200, 100, 200]
                   });
                   return;
                 }
@@ -2586,6 +2660,7 @@ async def index():
           };
 
           globalAudio.play().catch(e => {
+            console.error("Audio playback error:", e);
             isAudioPlaying.value = false;
           });
         };
@@ -2661,6 +2736,7 @@ async def index():
 
             await loadData();
             await saveEncryptedVault({ user: data.user, tasks: tasks.value });
+            updateIconBadge(totalUnreadCount.value);
           } catch (e) {
             alert('❌ ' + e.message);
           } finally {
@@ -2712,6 +2788,7 @@ async def index():
               isUnlocked.value = true;
 
               loadData();
+              updateIconBadge(totalUnreadCount.value);
             } else {
               throw new Error("Invalid PIN");
             }
@@ -2730,6 +2807,7 @@ async def index():
           currentUser.value = null;
           pinInput.value = '';
           currentVaultKey = null;
+          updateIconBadge(0);
         };
 
         const handleLogout = () => {
@@ -2782,6 +2860,7 @@ async def index():
             if (currentVaultKey) {
               await saveEncryptedVault({ user: currentUser.value, tasks: tasks.value });
             }
+            updateIconBadge(totalUnreadCount.value);
           } catch (e) {
             console.error("Sync error:", e);
           }
@@ -2794,9 +2873,9 @@ async def index():
             try {
               const data = JSON.parse(event.data);
               if (data.event === "notify" && currentUser.value) {
-                // Исключаем уведомление автора о его собственном действии
+                // Автор не получает уведомление о собственном действии
                 if (data.sender_id && Number(data.sender_id) === Number(currentUser.value.id)) {
-                  // Автор действия пуш не получает
+                  // Пропуск
                 } else {
                   const targetRoles = data.roles || [];
                   const targetUsers = (data.user_ids || []).map(Number);
@@ -3513,6 +3592,7 @@ async def index():
         return {
           currentUser, loginForm, isLoggingIn, isOnline, hasEncryptedVault, isUnlocked, pinInput, pinError,
           notificationPermission, requestNotificationAccess, activeToast,
+          totalUnreadCount,
           pressPinDigit, backspacePin, clearPin, resetVaultAndRelogin,
           ownerTab, deputyTab, empTab, isProcessing,
           isRecordingTaskVoice, recordTaskVoiceSeconds, recordedTaskVoiceUrl,
