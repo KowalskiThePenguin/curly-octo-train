@@ -180,7 +180,7 @@ async def startup():
         await conn.execute("UPDATE users SET is_active = FALSE")
 
         team_users = [
-            (1, 'khurshid', 'Хуршид', 'OWNER', 'Дирекция', 'khurshid', 'treds5'),
+            (1, 'Zernovoy Put', 'Зерновой Путь', 'OWNER', 'Дирекция', 'zernovoy put', 'treds5'),
             (2, 'zhamoliddin', 'Жамолиддин', 'DEPUTY', 'Управление', 'zhamoliddin', 'tru1'),
             (3, 'marat', 'Марат', 'EMPLOYEE', 'Исполнитель', 'marat', 'fruti9'),
             (4, 'sagynay', 'Сагынай', 'EMPLOYEE', 'Исполнитель', 'sagynay', 'reet3'),
@@ -1196,7 +1196,7 @@ async def index():
         </div>
       </div>
 
-      <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
+      <!-- 1. КАБИНЕТ ШЕФА (Зерновой Путь) -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
         <div class="bg-slate-900/90 border border-slate-800 p-4 rounded-3xl space-y-3.5 shadow-xl backdrop-blur-md">
           <div class="flex items-center justify-between">
