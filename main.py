@@ -37,6 +37,26 @@ sse_subscribers = set()
 FAILED_LOGIN_ATTEMPTS = {}
 DEADLINE_ALERTS_SENT = set()
 
+# СЕРВИСНЫЙ ВОРКЕР ДЛЯ МОБИЛЬНЫХ PUSH-УВЕДОМЛЕНИЙ (ANDROID / CHROME / SAFARI)
+@app.get("/sw.js")
+async def service_worker():
+    js = """
+    self.addEventListener('install', (e) => self.skipWaiting());
+    self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+    self.addEventListener('notificationclick', (e) => {
+        e.notification.close();
+        e.waitUntil(
+            clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
+                for (let client of windowClients) {
+                    if (client.url && 'focus' in client) return client.focus();
+                }
+                if (clients.openWindow) return clients.openWindow('/');
+            })
+        );
+    });
+    """
+    return Response(content=js, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+
 async def broadcast_event(event_type: str = "update", payload: dict = None):
     msg_data = {"event": event_type}
     if payload:
@@ -180,7 +200,7 @@ async def startup():
         await conn.execute("UPDATE users SET is_active = FALSE")
 
         team_users = [
-            (1, 'Zernovoy Put', 'Зерновой Путь', 'OWNER', 'Дирекция', 'zernovoy put', 'treds5'),
+            (1, 'khurshid', 'Хуршид', 'OWNER', 'Дирекция', 'khurshid', 'treds5'),
             (2, 'zhamoliddin', 'Жамолиддин', 'DEPUTY', 'Управление', 'zhamoliddin', 'tru1'),
             (3, 'marat', 'Марат', 'EMPLOYEE', 'Исполнитель', 'marat', 'fruti9'),
             (4, 'sagynay', 'Сагынай', 'EMPLOYEE', 'Исполнитель', 'sagynay', 'reet3'),
@@ -417,7 +437,6 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
 
         send_telegram_alert(f"🎙 <b>Новое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {parsed.get('project_group', 'Кормовая Мука')}\n<b>Тема:</b> {parsed.get('title')}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         
-        # PUSH: уведомление для Директора / Шефа
         target_roles = ["DEPUTY"] if creator.get('role') == 'OWNER' else ["OWNER"]
         await broadcast_event("notify", {
             "title": f"📋 Новое поручение #{task_id}",
@@ -540,7 +559,6 @@ async def assign_task(
 
         send_telegram_alert(f"🚀 <b>Задача #{task_id} передана в работу</b>\n📁 <b>Группа:</b> {project_group}\n👑 <b>Лид:</b> {lead_name}\n<b>Приоритет:</b> {priority}")
         
-        # PUSH: уведомление для Шефа, Лида и команды
         await broadcast_event("notify", {
             "title": f"🚀 Назначена задача #{task_id}",
             "body": f"Лид: {lead_name} | {title or 'В работе'}",
@@ -619,7 +637,6 @@ async def update_task_details(
             if old_task and old_task['lead_user_id']:
                 assignees.add(old_task['lead_user_id'])
 
-        # PUSH: уведомление об изменении ТЗ/срока
         await broadcast_event("notify", {
             "title": f"✏️ Изменение параметров #{task_id}",
             "body": f"Директор обновил параметры задачи «{title}»",
@@ -671,7 +688,6 @@ async def update_task_team(
                 VALUES ($1, 2, 'DEPUTY', $2, 'SYSTEM', $3, NOW())
             """, task_id, user_name, sys_msg)
 
-        # PUSH: уведомление о смене команды
         await broadcast_event("notify", {
             "title": f"👥 Смена состава команды #{task_id}",
             "body": f"Лид: {new_lead_name} | Исполнители: {new_team_str}",
@@ -720,7 +736,6 @@ async def set_stage(
         if task and task['lead_user_id']:
             targets.add(task['lead_user_id'])
 
-    # PUSH: обновление этапа
     label = "в архив" if stage == 'ARCHIVE' else f"{stage}%"
     await broadcast_event("notify", {
         "title": f"⚡ Этап задачи #{task_id}: {label}",
@@ -755,7 +770,6 @@ async def request_stage(
 
     send_telegram_alert(f"📌 <b>Задача #{task_id}: запрос подтверждения</b>\n👑 <b>Лид:</b> {user_name}\n<b>Запрос:</b> {target_str}")
     
-    # PUSH: уведомить Директора и Шефа
     await broadcast_event("notify", {
         "title": f"📌 Запрос подтверждения #{task_id}",
         "body": f"Лид {user_name} запросил {target_str}",
@@ -808,7 +822,6 @@ async def confirm_stage_request(
         if task and task['lead_user_id']:
             targets.add(task['lead_user_id'])
 
-    # PUSH: результат рассмотрения этапа
     await broadcast_event("notify", {
         "title": push_title,
         "body": sys_msg,
@@ -880,11 +893,10 @@ async def send_text_msg(
         recipients = set(task['assignee_ids'] or []) if task else set()
         if task and task['lead_user_id']:
             recipients.add(task['lead_user_id'])
-        recipients.add(1) # Шеф
-        recipients.add(2) # Директор
+        recipients.add(1)
+        recipients.add(2)
         recipients.discard(sender_id)
 
-    # PUSH: новое сообщение в чате
     await broadcast_event("notify", {
         "title": f"💬 Сообщение в задаче #{task_id}",
         "body": f"{sender_name}: {content[:60]}",
@@ -1002,7 +1014,6 @@ async def red_flag(task_id: int, reason: str = Form(...), sender_id: int = Form(
 
     send_telegram_alert(f"🚨🚨🚨 <b>RED FLAG на задаче #{task_id}!</b>\n<b>Исполнитель:</b> {sender_name}\n<b>Проблема:</b> {reason}")
     
-    # PUSH: экстренное уведомление для руководства
     await broadcast_event("notify", {
         "title": f"🚨 RED FLAG на задаче #{task_id}!",
         "body": f"{sender_name}: {reason}",
@@ -1137,7 +1148,8 @@ async def index():
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <button v-if="notificationPermission !== 'granted'" @click="requestNotificationAccess" class="text-[10px] font-bold text-amber-300 bg-amber-950/60 border border-amber-800/60 px-2.5 py-1.5 rounded-xl transition animate-pulse">
+          <!-- КНОПКА ЗАПРОСА РАЗРЕШЕНИЯ С ПРЯМЫМ СИНХРОННЫМ КЛИКОМ -->
+          <button v-if="notificationPermission !== 'granted'" @click="requestNotificationAccess" class="text-[10px] font-bold text-amber-300 bg-amber-950/60 border border-amber-800/80 px-2.5 py-1.5 rounded-xl transition animate-pulse">
             🔔 Включить пуш
           </button>
           <button @click="handleLogout" class="text-[10px] font-bold text-red-400 bg-red-950/40 hover:bg-red-900/60 px-2.5 py-1.5 rounded-xl border border-red-800/50 transition">
@@ -1196,7 +1208,7 @@ async def index():
         </div>
       </div>
 
-      <!-- 1. КАБИНЕТ ШЕФА (Зерновой Путь) -->
+      <!-- 1. КАБИНЕТ ШЕФА (ХУРШИД) -->
       <div v-if="currentUser.role === 'OWNER'" class="space-y-4">
         <div class="bg-slate-900/90 border border-slate-800 p-4 rounded-3xl space-y-3.5 shadow-xl backdrop-blur-md">
           <div class="flex items-center justify-between">
@@ -2274,14 +2286,28 @@ async def index():
           } catch(e) {}
         };
 
-        const requestNotificationAccess = async () => {
-          if ('Notification' in window) {
-            const p = await Notification.requestPermission();
-            notificationPermission.value = p;
+        // ПРЯМОЙ СИНХРОННЫЙ ЗАПРОС РАЗРЕШЕНИЯ ПО КЛИКУ ПОЛЬЗОВАТЕЛЯ
+        const requestNotificationAccess = () => {
+          if (!('Notification' in window)) {
+            alert('Ваш браузер не поддерживает Push-уведомления. Откройте приложение в Google Chrome.');
+            return;
           }
+
+          Notification.requestPermission().then((permission) => {
+            notificationPermission.value = permission;
+            if (permission === 'granted') {
+              triggerNotification({
+                title: "✅ Уведомления включены!",
+                body: "Теперь вы будете получать важные события и сигналы дедлайнов."
+              });
+            } else {
+              alert('Разрешение отклонено. Включите уведомления в настройках сайта в браузере.');
+            }
+          });
         };
 
-        const triggerNotification = (notifData) => {
+        // ОТПРАВКА СИСТЕМНОГО PUSH-УВЕДОМЛЕНИЯ ЧЕРЕЗ SERVICE WORKER
+        const triggerNotification = async (notifData) => {
           playNotificationChime();
 
           activeToast.value = {
@@ -2291,12 +2317,23 @@ async def index():
           if (toastTimer) clearTimeout(toastTimer);
           toastTimer = setTimeout(() => { activeToast.value = null; }, 5000);
 
-          if ('Notification' in window && Notification.permission === 'granted') {
+          if (notificationPermission.value === 'granted') {
+            try {
+              if ('serviceWorker' in navigator) {
+                const reg = await navigator.serviceWorker.ready;
+                await reg.showNotification(notifData.title, {
+                  body: notifData.body,
+                  tag: 'task_' + (notifData.task_id || Date.now()),
+                  vibrate: [200, 100, 200]
+                });
+                return;
+              }
+            } catch(e) {}
+
             try {
               new Notification(notifData.title, {
                 body: notifData.body,
-                tag: 'task_alert_' + (notifData.task_id || Date.now()),
-                silent: true
+                tag: 'task_' + (notifData.task_id || Date.now())
               });
             } catch(e) {}
           }
@@ -2562,7 +2599,6 @@ async def index():
             hasEncryptedVault.value = true;
             isUnlocked.value = true;
 
-            requestNotificationAccess();
             await loadData();
             await saveEncryptedVault({ user: data.user, tasks: tasks.value });
           } catch (e) {
@@ -2615,7 +2651,6 @@ async def index():
               tasks.value = decryptedVault.tasks || [];
               isUnlocked.value = true;
 
-              requestNotificationAccess();
               loadData();
             } else {
               throw new Error("Invalid PIN");
@@ -3381,6 +3416,11 @@ async def index():
         const formatTime = (s) => `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
 
         onMounted(() => {
+          // РЕГИСТРАЦИЯ СЕРВИСНОГО ВОРКЕРА ДЛЯ МОБИЛЬНЫХ УВЕДОМЛЕНИЙ
+          if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW error:', err));
+          }
+
           const salt = localStorage.getItem('task_vault_salt');
           const vault = localStorage.getItem('task_encrypted_vault');
           if (salt && vault) {
