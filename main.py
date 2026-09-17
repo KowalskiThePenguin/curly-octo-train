@@ -443,7 +443,6 @@ async def get_task_voice(task_id: int):
             mime = header.split(";")[0].replace("data:", "")
         return Response(content=base64.b64decode(encoded), media_type=mime)
 
-# СОЗДАНИЕ ГОЛОСОВОГО ПОРУЧЕНИЯ
 @app.post("/api/tasks/create-voice")
 async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1)):
     try:
@@ -493,7 +492,6 @@ async def create_task_voice(audio: UploadFile = File(...), user_id: int = Form(1
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# СОЗДАНИЕ ТЕКСТОВОГО ПОРУЧЕНИЯ
 @app.post("/api/tasks/create-text")
 async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
     try:
@@ -506,13 +504,14 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
             creator_name = creator['full_name'] if creator else "Руководство"
             creator_role = creator['role'] if creator else "OWNER"
 
+            p_group = parsed.get("project_group", "Проект Кормовая Мука")
             task_id = await conn.fetchval("""
                 INSERT INTO tasks (title, raw_input_text, ai_summary, definition_of_done, task_type, status, priority, project_group, created_by, is_urgent, created_at, progress)
                 VALUES ($1, $2, $3, $4, $5, 'DRAFT', $6, $7, $8, $9, NOW(), 0)
                 RETURNING id
-            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), project_group := parsed.get("project_group", "Проект Кормовая Мука"), user_id, True)
+            """, parsed.get("title", text[:30]), text, parsed.get("ai_summary", text), parsed.get("definition_of_done", "1. Выполнить задачу"), "SOLO", parsed.get("priority", "URGENT"), p_group, user_id, True)
 
-        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {project_group}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
+        send_telegram_alert(f"📝 <b>Новое текстовое поручение #{task_id} от {creator_name}</b>\n📁 <b>Проект:</b> {p_group}\n<b>Исходник:</b> {text}\n<b>ТЗ:</b> {parsed.get('ai_summary')}")
         
         target_roles = ["DEPUTY"] if creator_role == 'OWNER' else ["OWNER"]
         await broadcast_event("notify", {
@@ -528,7 +527,6 @@ async def create_task_text(text: str = Form(...), user_id: int = Form(1)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# УДАЛЕНИЕ ВХОДЯЩЕЙ ЗАДАЧИ
 @app.post("/api/tasks/{task_id}/delete")
 async def delete_task(task_id: int, user_id: int = Form(...)):
     pool = await get_db()
@@ -559,7 +557,6 @@ async def delete_task(task_id: int, user_id: int = Form(...)):
     })
     return {"status": "ok"}
 
-# НАЗНАЧЕНИЕ В РАБОТУ
 @app.post("/api/tasks/{task_id}/assign")
 async def assign_task(
     task_id: int, 
@@ -634,7 +631,6 @@ async def assign_task(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# ИЗМЕНЕНИЕ ПАРАМЕТРОВ ТЗ И ДЕДЛАЙНА
 @app.post("/api/tasks/{task_id}/update-details")
 async def update_task_details(
     task_id: int,
@@ -715,7 +711,6 @@ async def update_task_details(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# ИЗМЕНЕНИЕ СОСТАВА КОМАНДЫ
 @app.post("/api/tasks/{task_id}/update-team")
 async def update_task_team(
     task_id: int,
@@ -784,7 +779,6 @@ async def update_task_team(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
-# СМЕНА ЭТАПА ДИРЕКТОРОМ
 @app.post("/api/tasks/{task_id}/set-stage")
 async def set_stage(
     task_id: int,
@@ -831,7 +825,6 @@ async def set_stage(
     })
     return {"status": "ok"}
 
-# ЗАПРОС ЭТАПА ЛИДОМ
 @app.post("/api/tasks/{task_id}/request-stage")
 async def request_stage(
     task_id: int,
@@ -866,7 +859,6 @@ async def request_stage(
     })
     return {"status": "ok"}
 
-# РЕШЕНИЕ ДИРЕКТОРА ПО ЗАПРОСУ ЭТАПА
 @app.post("/api/tasks/{task_id}/confirm-stage-request")
 async def confirm_stage_request(
     task_id: int,
@@ -983,8 +975,8 @@ async def send_text_msg(
         recipients = set(task['assignee_ids'] or []) if task else set()
         if task and task['lead_user_id']:
             recipients.add(task['lead_user_id'])
-        recipients.add(1) # Шеф
-        recipients.add(2) # Директор
+        recipients.add(1)
+        recipients.add(2)
         recipients.discard(sender_id)
 
     await broadcast_event("notify", {
@@ -2249,22 +2241,24 @@ async def index():
       }
     };
 
-    createApp({
+    const app = createApp({
       setup() {
+        // 1. ВСЕ БАЗОВЫЕ РЕАКТИВНЫЕ ПЕРЕМЕННЫЕ
         const currentUser = ref(null);
         const loginForm = ref({ username: '', password: '', pin: '1234' });
         const isLoggingIn = ref(false);
         const isOnline = ref(navigator.onLine);
 
-        // PIN & СЕЙФ
         const hasEncryptedVault = ref(false);
         const isUnlocked = ref(false);
         const pinInput = ref('');
         const pinError = ref(false);
         let currentVaultKey = null;
 
-        // ПУШ УВЕДОМЛЕНИЯ И ЗНАЧОК С ЦИФРОЙ НА ИКОНКЕ
-        const notificationPermission = ref(typeof Notification !== 'undefined' ? Notification.permission : 'denied');
+        const tasks = ref([]);
+        const users = ref([]);
+
+        const notificationPermission = ref(typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'denied');
         const activeToast = ref(null);
         let toastTimer = null;
 
@@ -2276,7 +2270,6 @@ async def index():
         const editDrafts = ref({});
         const sseConnected = ref(false);
 
-        // ГОЛОС ДЛЯ СОЗДАНИЯ ЗАДАЧИ
         const isRecordingTaskVoice = ref(false);
         const recordTaskVoiceSeconds = ref(0);
         const recordedTaskVoiceBlob = ref(null);
@@ -2286,13 +2279,11 @@ async def index():
         let taskVoiceTimer = null;
         let taskVoiceStream = null;
 
-        // ФИЛЬТРЫ
         const filterProject = ref('ALL');
         const filterPriority = ref('ALL');
         const filterExecutor = ref('ALL');
         const filterUrgentOnly = ref(false);
 
-        // МОДАЛЬНЫЕ ОКНА
         const editingDetailsTask = ref(null);
         const editDetailsForm = ref({
           title: '', ai_summary: '', definition_of_done: '', project_group: '', priority: '', deadline: '', old_deadline_str: ''
@@ -2303,10 +2294,6 @@ async def index():
           lead_id: null, assignee_ids: []
         });
 
-        const tasks = ref([]);
-        const users = ref([]);
-
-        // ЧАТ
         const activeChatTask = ref(null);
         const chatMessages = ref([]);
         const chatInput = ref('');
@@ -2316,11 +2303,9 @@ async def index():
         const userScrolledUp = ref(false);
         const newMessagesBelowCount = ref(0);
 
-        // ОФЛАЙН ОЧЕРЕДЬ
         const pendingQueue = ref([]);
         let isFlushingQueue = false;
 
-        // ГОЛОС В ЧАТЕ
         const isRecordingVoice = ref(false);
         const recordVoiceSeconds = ref(0);
         const recordedVoiceBlob = ref(null);
@@ -2330,7 +2315,6 @@ async def index():
         let chatVoiceTimer = null;
         let chatVoiceStream = null;
 
-        // ЕДИНЫЙ ПЛЕЕР
         const activeAudioId = ref(null);
         const isAudioPlaying = ref(false);
         const audioCurrentTime = ref(0);
@@ -2339,6 +2323,7 @@ async def index():
         let globalAudio = null;
         const voiceBlobCache = {};
 
+        // 2. ВЫЧИСЛЯЕМЫЕ СВОЙСТВА
         const roleBadgeTitle = computed(() => {
           if (!currentUser.value) return '';
           if (currentUser.value.role === 'OWNER') return 'Шеф (Владелец)';
@@ -2346,7 +2331,9 @@ async def index():
           return 'Исполнитель команды';
         });
 
-        const employeesOnly = computed(() => users.value.filter(u => u.role === 'EMPLOYEE'));
+        const employeesOnly = computed(() => {
+          return Array.isArray(users.value) ? users.value.filter(u => u.role === 'EMPLOYEE') : [];
+        });
 
         const selectedAssigneesObjects = computed(() => {
           return employeesOnly.value.filter(u => teamManageForm.value.assignee_ids.includes(u.id));
@@ -2363,14 +2350,74 @@ async def index():
           filterUrgentOnly.value = false;
         };
 
-        // ПОДСЧЕТ ОБЩЕГО ЧИСЛА НЕПРОЧИТАННЫХ ДЛЯ КРАСНОГО КРУЖКА (1, 2, 3) НА ИКОНКЕ
         const totalUnreadCount = computed(() => {
+          if (!tasks.value || !Array.isArray(tasks.value)) return 0;
           return tasks.value.reduce((acc, t) => acc + (t.unread_count || 0), 0);
         });
 
-        // СИНХРОНИЗАЦИЯ КРАСНОЙ ТОЧКИ/ЦИФРЫ НА ИКОНКЕ ПРИЛОЖЕНИЯ И ВКЛАДКЕ
+        const inboxTasks = computed(() => (Array.isArray(tasks.value) ? tasks.value.filter(t => t.status === 'DRAFT') : []));
+        const activeTasks = computed(() => (Array.isArray(tasks.value) ? tasks.value.filter(t => t.status === 'IN_PROGRESS') : []));
+        const archiveTasks = computed(() => (Array.isArray(tasks.value) ? tasks.value.filter(t => t.status === 'ARCHIVED') : []));
+
+        const applyTaskFilters = (taskList) => {
+          return taskList.filter(t => {
+            if (filterProject.value !== 'ALL' && t.project_group !== filterProject.value) return false;
+            if (filterPriority.value !== 'ALL' && t.priority !== filterPriority.value) return false;
+            if (filterExecutor.value !== 'ALL') {
+              const execId = parseInt(filterExecutor.value);
+              const isMatch = t.lead_user_id === execId || (t.assignee_ids && t.assignee_ids.includes(execId));
+              if (!isMatch) return false;
+            }
+            if (filterUrgentOnly.value) {
+              if (!t.deadline) return false;
+              const diff = new Date(t.deadline).getTime() - Date.now();
+              if (diff > 4 * 3600 * 1000) return false;
+            }
+            return true;
+          });
+        };
+
+        const displayedOwnerTasks = computed(() => {
+          if (ownerTab.value === 'inbox') return inboxTasks.value;
+          if (ownerTab.value === 'active') return activeTasks.value;
+          return archiveTasks.value;
+        });
+        const filteredOwnerTasks = computed(() => applyTaskFilters(displayedOwnerTasks.value));
+
+        const displayedDeputyTasks = computed(() => {
+          if (deputyTab.value === 'inbox') return inboxTasks.value;
+          if (deputyTab.value === 'active') return activeTasks.value;
+          return archiveTasks.value;
+        });
+        const filteredDeputyTasks = computed(() => applyTaskFilters(displayedDeputyTasks.value));
+
+        const myTasks = computed(() => {
+          if (!currentUser.value || !Array.isArray(tasks.value)) return [];
+          return tasks.value.filter(t => t.lead_user_id === currentUser.value.id || (t.assignee_ids && t.assignee_ids.includes(currentUser.value.id)));
+        });
+        const myActiveTasks = computed(() => myTasks.value.filter(t => t.status === 'IN_PROGRESS'));
+        const myArchiveTasks = computed(() => myTasks.value.filter(t => t.status === 'ARCHIVED'));
+
+        const displayedEmpTasks = computed(() => (empTab.value === 'active' ? myActiveTasks.value : myArchiveTasks.value));
+        const filteredEmpTasks = computed(() => applyTaskFilters(displayedEmpTasks.value));
+
+        const isMyMessage = (m) => {
+          return currentUser.value && m.sender_id === currentUser.value.id;
+        };
+
+        const isPendingMessage = (m) => {
+          return m.status === 'pending' || String(m.id).startsWith('temp_');
+        };
+
+        const ensureLeadInAssignees = (taskId) => {
+          const draft = editDrafts.value[taskId];
+          if (draft && draft.lead_id && !draft.assignee_ids.includes(draft.lead_id)) {
+            draft.assignee_ids.push(draft.lead_id);
+          }
+        };
+
+        // 3. БЕЙДЖИ И PUSH
         const updateIconBadge = (count) => {
-          // 1. Системный бейдж на иконке рабочего стола / панели задач
           if ('setAppBadge' in navigator) {
             if (count > 0) {
               navigator.setAppBadge(count).catch(() => {});
@@ -2378,11 +2425,9 @@ async def index():
               navigator.clearAppBadge().catch(() => {});
             }
           }
-          // Передача в Service Worker
           if (navigator.serviceWorker && navigator.serviceWorker.controller) {
             navigator.serviceWorker.controller.postMessage({ type: 'SET_BADGE', count: count });
           }
-          // 2. Индикация в заголовке браузера
           if (count > 0) {
             document.title = `(${count}) 🔴 Task OS Corporate`;
           } else {
@@ -2416,7 +2461,6 @@ async def index():
           } catch(e) {}
         };
 
-        // СИНХРОННЫЙ ЗАПРОС РАЗРЕШЕНИЯ ПО КЛИКУ ПОЛЬЗОВАТЕЛЯ
         const requestNotificationAccess = () => {
           if (!('Notification' in window)) {
             alert('Ваш браузер не поддерживает Push-уведомления. Откройте сайт в Google Chrome.');
@@ -2439,7 +2483,6 @@ async def index():
           });
         };
 
-        // ВЫВОД КОНТЕКСТА В СИСТЕМНУЮ ШТОРКУ
         const triggerNotification = async (notifData) => {
           playNotificationChime();
 
@@ -2457,8 +2500,7 @@ async def index():
                 if (reg && reg.showNotification) {
                   await reg.showNotification(notifData.title, {
                     body: notifData.body,
-                    tag: 'task_' + (notifData.task_id || Date.now()),
-                    vibrate: [200, 100, 200]
+                    tag: 'task_' + (notifData.task_id || Date.now())
                   });
                   return;
                 }
@@ -2474,71 +2516,7 @@ async def index():
           }
         };
 
-        const applyTaskFilters = (taskList) => {
-          return taskList.filter(t => {
-            if (filterProject.value !== 'ALL' && t.project_group !== filterProject.value) return false;
-            if (filterPriority.value !== 'ALL' && t.priority !== filterPriority.value) return false;
-            if (filterExecutor.value !== 'ALL') {
-              const execId = parseInt(filterExecutor.value);
-              const isMatch = t.lead_user_id === execId || (t.assignee_ids && t.assignee_ids.includes(execId));
-              if (!isMatch) return false;
-            }
-            if (filterUrgentOnly.value) {
-              if (!t.deadline) return false;
-              const diff = new Date(t.deadline).getTime() - Date.now();
-              if (diff > 4 * 3600 * 1000) return false;
-            }
-            return true;
-          });
-        };
-
-        const inboxTasks = computed(() => tasks.value.filter(t => t.status === 'DRAFT'));
-        const activeTasks = computed(() => tasks.value.filter(t => t.status === 'IN_PROGRESS'));
-        const archiveTasks = computed(() => tasks.value.filter(t => t.status === 'ARCHIVED'));
-
-        const displayedOwnerTasks = computed(() => {
-          if (ownerTab.value === 'inbox') return inboxTasks.value;
-          if (ownerTab.value === 'active') return activeTasks.value;
-          return archiveTasks.value;
-        });
-        const filteredOwnerTasks = computed(() => applyTaskFilters(displayedOwnerTasks.value));
-
-        const displayedDeputyTasks = computed(() => {
-          if (deputyTab.value === 'inbox') return inboxTasks.value;
-          if (deputyTab.value === 'active') return activeTasks.value;
-          return archiveTasks.value;
-        });
-        const filteredDeputyTasks = computed(() => applyTaskFilters(displayedDeputyTasks.value));
-
-        const myTasks = computed(() => tasks.value.filter(t => {
-          if (!currentUser.value) return false;
-          return t.lead_user_id === currentUser.value.id || (t.assignee_ids && t.assignee_ids.includes(currentUser.value.id));
-        }));
-        const myActiveTasks = computed(() => myTasks.value.filter(t => t.status === 'IN_PROGRESS'));
-        const myArchiveTasks = computed(() => myTasks.value.filter(t => t.status === 'ARCHIVED'));
-
-        const displayedEmpTasks = computed(() => {
-          if (empTab.value === 'active') return myActiveTasks.value;
-          return myArchiveTasks.value;
-        });
-        const filteredEmpTasks = computed(() => applyTaskFilters(displayedEmpTasks.value));
-
-        const isMyMessage = (m) => {
-          if (!currentUser.value) return false;
-          return m.sender_id === currentUser.value.id;
-        };
-
-        const isPendingMessage = (m) => {
-          return m.status === 'pending' || String(m.id).startsWith('temp_');
-        };
-
-        const ensureLeadInAssignees = (taskId) => {
-          const draft = editDrafts.value[taskId];
-          if (draft && draft.lead_id && !draft.assignee_ids.includes(draft.lead_id)) {
-            draft.assignee_ids.push(draft.lead_id);
-          }
-        };
-
+        // 4. ВСПОМОГАТЕЛЬНЫЕ ФОРМАТТЕРЫ
         const formatLocalDT = (isoStr) => {
           if (!isoStr) return '';
           const d = new Date(isoStr);
@@ -2660,7 +2638,6 @@ async def index():
           };
 
           globalAudio.play().catch(e => {
-            console.error("Audio playback error:", e);
             isAudioPlaying.value = false;
           });
         };
@@ -2873,9 +2850,8 @@ async def index():
             try {
               const data = JSON.parse(event.data);
               if (data.event === "notify" && currentUser.value) {
-                // Автор не получает уведомление о собственном действии
                 if (data.sender_id && Number(data.sender_id) === Number(currentUser.value.id)) {
-                  // Пропуск
+                  // Автор действие совершил сам - пропускаем
                 } else {
                   const targetRoles = data.roles || [];
                   const targetUsers = (data.user_ids || []).map(Number);
@@ -3556,8 +3532,8 @@ async def index():
           return '🔵 На будущее';
         };
 
-        const formatRoleName = (r) => r === 'OWNER' ? 'Шеф' : (r === 'DEPUTY' ? 'Директор' : 'Исполнитель');
-        const formatTime = (s) => `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
+        const formatRoleName = (r) => (r === 'OWNER' ? 'Шеф' : r === 'DEPUTY' ? 'Директор' : 'Исполнитель');
+        const formatTime = (s) => `${Math.floor(s / 60).toString().padStart(2, '0')}:${(s % 60).toString().padStart(2, '0')}`;
 
         onMounted(() => {
           if ('serviceWorker' in navigator) {
@@ -3589,10 +3565,10 @@ async def index():
           setInterval(flushPendingQueue, 4000);
         });
 
+        // 5. ВОЗВРАТ ВСЕХ ПЕРЕМЕННЫХ И МЕТОДОВ В ШАБЛОН
         return {
           currentUser, loginForm, isLoggingIn, isOnline, hasEncryptedVault, isUnlocked, pinInput, pinError,
-          notificationPermission, requestNotificationAccess, activeToast,
-          totalUnreadCount,
+          notificationPermission, requestNotificationAccess, activeToast, totalUnreadCount,
           pressPinDigit, backspacePin, clearPin, resetVaultAndRelogin,
           ownerTab, deputyTab, empTab, isProcessing,
           isRecordingTaskVoice, recordTaskVoiceSeconds, recordedTaskVoiceUrl,
@@ -3618,7 +3594,13 @@ async def index():
           formatRoleName, formatTime
         };
       }
-    }).mount('#app');
+    });
+
+    app.config.errorHandler = (err, vm, info) => {
+      console.error('Vue Runtime Error:', err, info);
+    };
+
+    app.mount('#app');
   </script>
 </body>
 </html>"""
